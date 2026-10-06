@@ -10,6 +10,9 @@
 
     <title>Dashboard | Comité de Estudios Médicos</title>
 
+    <link rel="icon" href="{{ asset('favicon.png') }}?v=2" type="image/png">
+    <link rel="shortcut icon" href="{{ asset('favicon.ico') }}?v=2">
+
     {{-- Aplicar el tema antes de mostrar la página --}}
     <script>
         (function () {
@@ -945,11 +948,11 @@
                 <div class="page-heading">
 
                     <h1>
-                        Generador de Consolidado
+                        Inicio
                     </h1>
 
                     <p>
-                        Conversión de archivos JSON a Excel
+                        Selecciona un programa desde el menú
                     </p>
 
                 </div>
@@ -1016,114 +1019,12 @@
             </h2>
 
             <p>
-                Selecciona una de las opciones disponibles
-                para continuar.
+                Usa el menú de la izquierda para elegir el programa
+                que vas a ejecutar. La pantalla del programa se abrirá aquí.
             </p>
 
         </section>
 
-
-        {{-- =====================================================
-             OPCIONES PRINCIPALES
-        ====================================================== --}}
-
-        <section class="main-grid">
-
-
-            {{-- CONVERSOR --}}
-
-            <article class="main-card">
-
-                <div class="card-icon green">
-                    →
-                </div>
-
-                <h3>
-                    Conversor JSON → Excel
-                </h3>
-
-                <p>
-                    Carga tus archivos JSON correspondientes
-                    a los regímenes subsidiado y contributivo
-                    y genera el consolidado en Excel.
-                </p>
-
-                <a
-                    href="{{ route('json-excel') }}"
-                    class="card-button green"
-                >
-                    Abrir conversor
-                </a>
-
-            </article>
-
-
-            {{-- ADMINISTRACIÓN DE USUARIOS --}}
-
-            @if(auth()->user()->role === 'admin')
-
-                <article class="main-card">
-
-                    <div class="card-icon purple">
-                        ⚙
-                    </div>
-
-                    <h3>
-                        Administración
-                    </h3>
-
-                    <p>
-                        Gestiona usuarios, roles y estados
-                        de acceso al sistema.
-                    </p>
-
-                    <a
-                        href="{{ route('users.index') }}"
-                        class="card-button purple"
-                    >
-                        Administrar usuarios
-                    </a>
-
-                </article>
-
-
-                {{-- REGISTRO DE ACTIVIDAD --}}
-
-                <article class="main-card">
-
-                    <div class="card-icon blue">
-                        📋
-                    </div>
-
-                    <h3>
-                        Registro de actividad
-                    </h3>
-
-                    <p>
-                        Consulta el historial de acciones
-                        realizadas dentro del sistema,
-                        incluyendo inicios de sesión,
-                        conversiones y administración de usuarios.
-                    </p>
-
-                    <a
-                        href="{{ route('activity-logs.index') }}"
-                        class="card-button blue"
-                    >
-                        Ver registro de actividad
-                    </a>
-
-                </article>
-
-            @endif
-
-
-        </section>
-
-
-        {{-- =====================================================
-             RESUMEN DEL SISTEMA
-        ====================================================== --}}
 
         @if(auth()->user()->role === 'admin')
 
@@ -1137,6 +1038,7 @@
 
                     <p>
                         Estado actual de las cuentas registradas.
+                        La administración también está en el menú lateral.
                     </p>
 
                 </div>
@@ -1265,6 +1167,7 @@
     <script src="{{ asset('js/theme.js') }}"></script>
 
 
+@include('navigation')
 </body>
 
 </html>
