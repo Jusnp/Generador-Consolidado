@@ -1,0 +1,24 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        foreach (['codigo_cups', 'codigo_medicamentos', 'codigo_medicamentos_nt', 'codigo_insumos_nt'] as $table) {
+            Schema::table($table, function (Blueprint $blueprint): void {
+                $blueprint->string('hoja')->nullable()->index();
+            });
+        }
+    }
+
+    public function down(): void
+    {
+        foreach (['codigo_cups', 'codigo_medicamentos', 'codigo_medicamentos_nt', 'codigo_insumos_nt'] as $table) {
+            Schema::table($table, fn (Blueprint $blueprint) => $blueprint->dropColumn('hoja'));
+        }
+    }
+};

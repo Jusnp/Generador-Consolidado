@@ -427,7 +427,7 @@ class JsonExcelController extends Controller
     {
         $catalogo = [];
 
-        CodigoCups::orderBy('id')->get()->each(
+        CodigoCups::where('activo', true)->orderBy('id')->get()->each(
             function ($item) use (&$catalogo) {
                 $codigo = $this->normalizeCode($item->codigo);
 
@@ -452,7 +452,7 @@ class JsonExcelController extends Controller
     {
         $catalogo = [];
 
-        CodigoMedicamentoNt::orderBy('id')->get()->each(
+        CodigoMedicamentoNt::where('activo', true)->orderBy('id')->get()->each(
             function ($item) use (&$catalogo) {
                 $cums = $this->normalizeCode($item->cums);
 
@@ -477,7 +477,7 @@ class JsonExcelController extends Controller
     {
         $catalogo = [];
 
-        CodigoMedicamento::orderBy('id')->get()->each(
+        CodigoMedicamento::where('activo', true)->orderBy('id')->get()->each(
             function ($item) use (&$catalogo) {
                 $codigo = $this->normalizeCode($item->codigo);
 
@@ -532,7 +532,7 @@ class JsonExcelController extends Controller
     {
         $catalogo = [];
 
-        CodigoInsumoNt::orderBy('id')->get()->each(
+        CodigoInsumoNt::where('activo', true)->orderBy('id')->get()->each(
             function ($item) use (&$catalogo) {
                 $codigo = $this->normalizeCode($item->codigo);
 

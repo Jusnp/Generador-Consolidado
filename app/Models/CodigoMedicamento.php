@@ -15,10 +15,13 @@ class CodigoMedicamento extends Model
         'cums_homologo',
         'tarifa_unitario',
         'divide_por_duplicados',
+        'activo',
+        'hoja',
     ];
 
     protected $casts = [
         'tarifa_unitario' => 'float',
         'divide_por_duplicados' => 'boolean',
+        'activo' => 'boolean',
     ];
 }
