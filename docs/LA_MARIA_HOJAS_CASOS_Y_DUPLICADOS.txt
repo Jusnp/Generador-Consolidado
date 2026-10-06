@@ -1,0 +1,75 @@
+LA MARÍA — Por qué existen estas dos hojas del Excel
+====================================================
+
+Fecha: 2026-09-28
+Programa: La María (Próstata / Cérvix)
+
+
+1) CASOS A REVISAR
+------------------
+
+Para qué sirve
+  Separar pacientes/servicios que NO quedan listos para el
+  seguimiento “limpio” de DETALLE RIPS. No se borran: se
+  conservan para corregir o auditar.
+
+Cuándo entra un caso
+  - Ruta SIN_RUTA_DEFINIDA: en ese paciente + mes no hubo
+    diagnóstico principal C61 (próstata) ni C53 (cérvix).
+  - Ruta DOBLE_RUTA_REVISAR: en el mismo mes aparecen C61 y C53.
+  - Sexo incompatible con la ejecución (ej. hombre en Cérvix
+    o mujer en Próstata): se conserva aunque la ruta sea otra
+    o no esté definida.
+  - Falta tipo/número de documento o no se pudo asignar mes
+    de atención.
+
+Qué NO es
+  No es un error del Excel. Es control de calidad sobre el
+  RIPS / la clasificación de ruta.
+
+Columna útil
+  MOTIVO DE REVISION: explica en texto por qué quedó aquí
+  (ej. “No se detectó diagnóstico C61 ni C53 en el mes.”).
+
+
+2) REPETICIONES Y DUPLICADOS
+----------------------------
+
+Para qué sirve
+  Avisar cuando el mismo servicio aparece más de una vez en
+  DETALLE RIPS (solo filas con estado LISTO). No elimina
+  filas: solo señala posibles duplicados o atenciones
+  repetidas a validar.
+
+Cómo se detecta (llave exacta)
+  paciente + factura + fecha de atención + tipo de servicio
+  + código + cantidad
+
+  Si esa combinación se repite 2 o más veces → entra a la hoja.
+
+Clasificación automática
+  - POSIBLE_DUPLICADO_ENTRE_ARCHIVOS
+      La misma llave viene de más de un archivo JSON.
+  - DUPLICADO_MEDICAMENTO_MISMA_FECHA
+      Medicamento repetido (mismo archivo).
+  - REPETICION_PROCEDIMIENTO_VALIDAR
+      Procedimiento repetido.
+  - DUPLICADO_EXACTO_POTENCIAL
+      Consultas, otros servicios, etc.
+
+Qué hacer con ella
+  Revisar si es:
+  - duplicado real del RIPS (cargar de más / mismo evento
+    en dos archivos), o
+  - atención repetida legítima (mismo código el mismo día).
+
+
+Resumen
+-------
+  CASOS A REVISAR     → problemas de clasificación / calidad
+                        (ruta, sexo, identidad, fecha).
+  REPETICIONES…       → misma atención listada varias veces
+                        en el detalle listo.
+
+Ambas hojas son de control. El seguimiento operativo “limpio”
+sigue en DETALLE RIPS y SEGUIMIENTO PACIENTE / MENSUAL.
