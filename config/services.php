@@ -36,7 +36,7 @@ return [
     ],
 
     'authentik' => [
-        'enabled' => (bool) env('AUTHENTIK_ENABLED', false),
+        'enabled' => filter_var(env('AUTHENTIK_ENABLED', false), FILTER_VALIDATE_BOOLEAN),
         'base_url' => rtrim((string) env('AUTHENTIK_BASE_URL', ''), '/'),
         'client_id' => env('AUTHENTIK_CLIENT_ID'),
         'client_secret' => env('AUTHENTIK_CLIENT_SECRET'),
