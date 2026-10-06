@@ -13,9 +13,12 @@ class CodigoCups extends Model
         'tipo_servicio',
         'descripcion',
         'tarifa_2025',
+        'activo',
+        'hoja',
     ];
 
     protected $casts = [
         'tarifa_2025' => 'decimal:4',
+        'activo' => 'boolean',
     ];
 }

@@ -13,9 +13,12 @@ class CodigoMedicamentoNt extends Model
         'nombre_estandar',
         'pertenece_nt',
         'tarifa_nt',
+        'activo',
+        'hoja',
     ];
 
     protected $casts = [
         'tarifa_nt' => 'decimal:4',
+        'activo' => 'boolean',
     ];
 }

@@ -1,0 +1,28 @@
+@extends('layouts.app')
+@section('title', $label)
+@section('header_title', $label)
+@section('header_subtitle', 'Editor de tarifario contractual de Autoinmunes')
+@section('content')
+<style>
+.sheet-panel{margin:20px 0;padding:20px;background:var(--bg-card);border:1px solid var(--border);border-radius:12px}
+.sheet-scroll{height:68vh;overflow:auto;border:1px solid var(--border)}
+.sheet-grid{border-collapse:separate;border-spacing:0;min-width:1250px;width:100%;font-size:13px}.sheet-grid th,.sheet-grid td{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:9px;text-align:left}.sheet-grid th{position:sticky;top:0;background:var(--bg-card);z-index:2}.sheet-grid input{width:100%;box-sizing:border-box;padding:8px;border:1px solid var(--border);background:transparent;color:var(--text-primary)}.sheet-grid button,.sheet-tools button{display:block;min-width:120px;min-height:38px;margin-top:7px;padding:8px 12px;border:1px solid var(--green);border-radius:6px;background:var(--green);color:#fff;font-weight:700;cursor:pointer}.sheet-grid td:last-child{min-width:220px}.sheet-grid .toggle{background:transparent;color:var(--red);border:1px solid var(--red)}.sheet-grid .inactive{opacity:.55}.sheet-grid .status{display:block;font-weight:700;color:var(--green)}.sheet-grid .status.inactive{color:var(--red)}.sheet-tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 18px}.sheet-tools input{padding:8px}.sheet-selector{padding:14px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);margin:4px 0 24px}.sheet-selector select{min-width:220px;padding:9px;border:1px solid var(--border);border-radius:6px;background:var(--bg-card);color:var(--text-primary)}.sheet-status{min-height:25px;margin:12px 0}
+</style>
+<a href="{{ route('catalogos-referencia.index') }}" class="back-button">← Volver a catálogos y contratos</a>
+<section class="sheet-panel">
+<form class="sheet-tools" method="POST" action="{{ route('catalogos-referencia.consolidado.store-row') }}"><input type="hidden" name="source" value="{{ $records->first()['source'] ?? 'cups' }}"><input name="codigo" required placeholder="Código"><input name="nombre" placeholder="Nombre / descripción"><input name="detalle" placeholder="Detalle"><input name="tarifa" type="number" min="0" step="0.0001" placeholder="Tarifa"><button type="submit">Agregar fila</button></form>
+<form class="sheet-tools sheet-selector" method="GET"><label for="sheet">Hoja del Excel</label><select id="sheet" name="sheet" onchange="this.form.submit()"><option value="">Todas las hojas</option>@foreach($sheets as $sheet)<option value="{{ $sheet }}" @selected(request('sheet') === $sheet)>{{ $sheet }}</option>@endforeach</select></form>
+<h2>{{ $label }}</h2><p>Esta es la tabla usada por Autoinmunes. Puedes corregir nombre y tarifa por fila; el cambio se aplica al tarifario que consulta el informe.</p>
+<div class="sheet-tools"><input id="sheet-search" placeholder="Buscar código, nombre o detalle"><span>{{ $records->count() }} registros</span></div><div id="sheet-status" class="sheet-status" role="status"></div>
+<div class="sheet-scroll"><table class="sheet-grid"><thead><tr><th>#</th><th>Código</th><th>Nombre / descripción</th><th>Detalle</th><th>Tarifa</th><th>Acción</th></tr></thead><tbody>
+@foreach($records as $record)
+<tr class="{{ $record['activo'] ? '' : 'inactive' }}" data-search="{{ strtolower($record['codigo'].' '.$record['nombre'].' '.$record['detalle']) }}"><td>{{ $loop->iteration }}</td><td><input data-field="codigo" value="{{ $record['codigo'] }}"></td><td><input data-field="nombre" value="{{ $record['nombre'] }}"></td><td><input data-field="detalle" value="{{ $record['detalle'] }}"></td><td><input data-field="tarifa" type="number" min="0" step="0.0001" value="{{ $record['tarifa'] }}"></td><td><span class="status {{ $record['activo'] ? '' : 'inactive' }}">{{ $record['activo'] ? 'ACTIVO' : 'INACTIVO' }}</span><button type="button" data-url="{{ route('catalogos-referencia.consolidado.update', [$record['source'], $record['id']]) }}">Guardar</button><button type="button" class="toggle" data-toggle-url="{{ route('catalogos-referencia.consolidado.toggle', [$record['source'], $record['id']]) }}">{{ $record['activo'] ? 'Inactivar' : 'Activar' }}</button></td></tr>
+@endforeach
+</tbody></table></div></section>
+<script>
+const statusBox=document.getElementById('sheet-status');
+document.getElementById('sheet-search').addEventListener('input',e=>{const value=e.target.value.toLowerCase();document.querySelectorAll('.sheet-grid tbody tr').forEach(row=>row.hidden=!row.dataset.search.includes(value));});
+document.querySelectorAll('.sheet-grid button').forEach(button=>button.addEventListener('click',async()=>{const row=button.closest('tr');const inputs=[...row.querySelectorAll('input')];const body=Object.fromEntries(inputs.map(input=>[input.dataset.field,input.value===''?null:input.value]));button.disabled=true;statusBox.textContent='Guardando…';try{const response=await fetch(button.dataset.url,{method:'PATCH',headers:{'Content-Type':'application/json','Accept':'application/json','X-CSRF-TOKEN':@json(csrf_token())},body:JSON.stringify(body)});const result=await response.json();if(!response.ok)throw new Error(result.message||'No se pudo guardar');statusBox.textContent=result.message;}catch(error){statusBox.textContent=error.message;}finally{button.disabled=false;}}));
+document.querySelectorAll('.toggle').forEach(button=>button.addEventListener('click',async()=>{const response=await fetch(button.dataset.toggleUrl,{method:'PATCH',headers:{'Accept':'application/json','X-CSRF-TOKEN':@json(csrf_token())}});if(response.ok)window.location.reload();}));
+</script>
+@endsection
