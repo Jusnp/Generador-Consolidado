@@ -14,6 +14,8 @@
         Generador de Consolidado | Comité de Estudios Médicos
     </title>
 
+    <link rel="icon" href="{{ asset('favicon.png') }}?v=2" type="image/png">
+    <link rel="shortcut icon" href="{{ asset('favicon.ico') }}?v=2">
 
     <style>
 
@@ -1813,6 +1815,7 @@
     </script>
 
 
+@include('navigation')
 </body>
 
 </html>

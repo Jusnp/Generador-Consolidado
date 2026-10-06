@@ -12,6 +12,9 @@
 
     <title>Editar usuario | JSON → Excel</title>
 
+    <link rel="icon" href="{{ asset('favicon.png') }}?v=2" type="image/png">
+    <link rel="shortcut icon" href="{{ asset('favicon.ico') }}?v=2">
+
     <script>
 
         (function () {
@@ -851,12 +854,8 @@
 
 
         .status-options {
-
-            display:
-                grid;
-
-            grid-template-columns:
-                1fr 1fr;
+            display: flex;
+            flex-wrap: wrap;
 
             gap:
                 12px;
@@ -877,8 +876,9 @@
 
         .status-label {
 
-            min-height:
-                52px;
+            min-height: 52px;
+            min-width: 170px;
+            width: max-content;
 
             padding:
                 0 16px;
@@ -912,6 +912,16 @@
 
         }
 
+        .status-label.status-active-label {
+            border-color: rgba(22, 163, 74, .45);
+            background: rgba(22, 163, 74, .08);
+        }
+
+        .status-label.status-inactive-label {
+            border-color: rgba(239, 68, 68, .45);
+            background: rgba(239, 68, 68, .08);
+        }
+
 
         .status-option input:checked + .status-label {
 
@@ -921,6 +931,18 @@
             background:
                 rgba(22,163,74,.08);
 
+        }
+
+        .status-option input:checked + .status-label.status-active-label {
+            border-color: var(--green);
+            background: rgba(22, 163, 74, .18);
+            box-shadow: 0 0 0 2px rgba(22, 163, 74, .15);
+        }
+
+        .status-option input:checked + .status-label.status-inactive-label {
+            border-color: var(--red);
+            background: rgba(239, 68, 68, .18);
+            box-shadow: 0 0 0 2px rgba(239, 68, 68, .15);
         }
 
 
@@ -934,6 +956,9 @@
 
             border-radius:
                 50%;
+
+            display: inline-block;
+            flex: 0 0 9px;
 
         }
 
@@ -1544,7 +1569,7 @@
 
                                         <label
                                             for="active_yes"
-                                            class="status-label"
+                                            class="status-label status-active-label"
                                         >
 
                                             <span class="dot green"></span>
@@ -1570,7 +1595,7 @@
 
                                         <label
                                             for="active_no"
-                                            class="status-label"
+                                            class="status-label status-inactive-label"
                                         >
 
                                             <span class="dot red"></span>
@@ -1650,6 +1675,7 @@
 <script src="{{ asset('js/theme.js') }}"></script>
 
 
+@include('navigation')
 </body>
 
 </html>
