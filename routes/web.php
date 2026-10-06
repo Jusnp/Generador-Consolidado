@@ -1,16 +1,21 @@
 <?php
 
-use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\ActivityLogController;
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\JsonExcelController;
 use App\Http\Controllers\UserController;
-use App\Http\Controllers\ActivityLogController;
+use Illuminate\Support\Facades\Route;
+
+Route::redirect('/', '/login');
 
 Route::get('/login', [AuthController::class, 'showLogin'])
     ->name('login');
 
-Route::post('/login', [AuthController::class, 'login'])
-    ->name('login.authenticate');
+Route::get('/auth/authentik/redirect', [AuthController::class, 'redirectToAuthentik'])
+    ->name('authentik.redirect');
+
+Route::get('/auth/authentik/callback', [AuthController::class, 'authentikCallback'])
+    ->name('authentik.callback');
 
 Route::middleware('auth')->group(function () {
 

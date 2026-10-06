@@ -3,62 +3,83 @@
 namespace App\Http\Controllers;
 
 use App\Services\ActivityLogger;
+use App\Services\AuthentikAuthenticator;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Str;
+use Illuminate\View\View;
 
 class AuthController extends Controller
 {
-    public function showLogin()
+    public function showLogin(): View
     {
         return view('auth.login');
     }
 
-    public function login(
+    public function redirectToAuthentik(
         Request $request,
+        AuthentikAuthenticator $authentikAuthenticator
+    ): RedirectResponse {
+        if (! $authentikAuthenticator->isConfigured()) {
+            return redirect()
+                ->route('login')
+                ->withErrors(['email' => 'El acceso con Authentik aún no está configurado.']);
+        }
+
+        $state = Str::random(64);
+        $codeVerifier = Str::random(96);
+
+        $request->session()->put('authentik_oauth_state', $state);
+        $request->session()->put('authentik_code_verifier', $codeVerifier);
+
+        return redirect()->away($authentikAuthenticator->authorizationUrl($state, $codeVerifier));
+    }
+
+    public function authentikCallback(
+        Request $request,
+        AuthentikAuthenticator $authentikAuthenticator,
         ActivityLogger $activityLogger
-    )
-    {
-        $credentials = $request->validate([
-            'email' => ['required', 'email'],
-            'password' => ['required', 'string'],
-        ], [
-            'email.required' => 'El correo electrónico es obligatorio.',
-            'email.email' => 'Ingresa un correo electrónico válido.',
-            'password.required' => 'La contraseña es obligatoria.',
-        ]);
+    ): RedirectResponse {
+        $state = $request->session()->pull('authentik_oauth_state');
+        $codeVerifier = $request->session()->pull('authentik_code_verifier');
+        $callbackState = $request->query('state');
+        $code = $request->query('code');
 
-        $user = \App\Models\User::where(
-            'email',
-            $credentials['email']
-        )->first();
-
-        if (!$user) {
-            return back()->withErrors([
-                'email' => 'Las credenciales no son correctas.',
-            ])->withInput($request->only('email'));
+        if (! is_string($state)
+            || ! is_string($codeVerifier)
+            || ! is_string($callbackState)
+            || ! hash_equals($state, $callbackState)
+            || ! is_string($code)
+            || $code === '') {
+            return redirect()
+                ->route('login')
+                ->withErrors(['email' => 'No fue posible validar la respuesta de Authentik. Intenta nuevamente.']);
         }
 
-        if (!$user->active) {
-            return back()->withErrors([
-                'email' => 'Tu usuario está inactivo. Contacta al administrador.',
-            ])->withInput($request->only('email'));
+        try {
+            $claims = $authentikAuthenticator->claimsForAuthorizationCode($code, $codeVerifier);
+            $user = $authentikAuthenticator->activeUserForClaims($claims);
+        } catch (\Throwable $exception) {
+            report($exception);
+
+            return redirect()
+                ->route('login')
+                ->withErrors(['email' => 'No fue posible iniciar sesión con Authentik. Intenta nuevamente.']);
         }
 
-        if (!Auth::attempt([
-            'email' => $credentials['email'],
-            'password' => $credentials['password'],
-        ])) {
-            return back()->withErrors([
-                'email' => 'Las credenciales no son correctas.',
-            ])->withInput($request->only('email'));
+        if ($user === null) {
+            return redirect()
+                ->route('login')
+                ->withErrors(['email' => 'Tu cuenta de Authentik no tiene un usuario activo autorizado en este sistema.']);
         }
 
+        Auth::login($user);
         $request->session()->regenerate();
 
-        // Registrar inicio de sesión exitoso.
         $activityLogger->log(
-            'login',
-            'Usuario inició sesión correctamente.'
+            'login_authentik',
+            'Usuario inició sesión correctamente mediante Authentik.'
         );
 
         return redirect()->route('dashboard');
@@ -67,8 +88,7 @@ class AuthController extends Controller
     public function logout(
         Request $request,
         ActivityLogger $activityLogger
-    )
-    {
+    ): RedirectResponse {
         // Registrar la actividad antes de cerrar la sesión,
         // porque todavía necesitamos identificar al usuario.
         if ($request->user()) {
