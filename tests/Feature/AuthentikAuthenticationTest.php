@@ -5,44 +5,50 @@ namespace Tests\Feature;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Route;
 use Tests\TestCase;
 
 class AuthentikAuthenticationTest extends TestCase
 {
     use RefreshDatabase;
 
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->configureAuthentik();
+    }
+
     public function test_login_page_displays_only_the_authentik_entry_point(): void
     {
-        $this->configureAuthentik();
-
         $this->get(route('login'))
             ->assertOk()
             ->assertSeeText('Iniciar sesión')
             ->assertSeeText('Ingresar con Authentik')
             ->assertSee(route('authentik.redirect'), false)
             ->assertDontSee('name="email"', false)
-            ->assertDontSee('name="password"', false);
-
-        $this->assertFalse(Route::has('login.authenticate'));
+            ->assertDontSee('name="password"', false)
+            ->assertDontSee('Correo electrónico')
+            ->assertDontSee('Contraseña');
     }
 
-    public function test_login_page_does_not_restore_local_access_when_authentik_is_disabled(): void
+    public function test_local_login_cannot_be_used_when_authentik_is_enabled(): void
     {
-        config(['services.authentik.enabled' => false]);
+        User::factory()->create([
+            'email' => 'persona@ejemplo.com',
+            'password' => 'password',
+            'active' => true,
+        ]);
 
-        $this->get(route('login'))
-            ->assertOk()
-            ->assertSeeText('Iniciar sesión')
-            ->assertSeeText('Ingresar con Authentik')
-            ->assertDontSee('name="email"', false)
-            ->assertDontSee('name="password"', false);
+        $this->post(route('login.authenticate'), [
+            'email' => 'persona@ejemplo.com',
+            'password' => 'password',
+        ])->assertNotFound();
+
+        $this->assertGuest();
     }
 
     public function test_redirect_to_authentik_uses_state_and_pkce(): void
     {
-        $this->configureAuthentik();
-
         $response = $this->get(route('authentik.redirect'));
 
         $response->assertRedirect();
@@ -59,9 +65,25 @@ class AuthentikAuthenticationTest extends TestCase
         $this->assertNotEmpty($query['code_challenge']);
     }
 
+    public function test_redirect_returns_controlled_message_when_authentik_is_incomplete(): void
+    {
+        config([
+            'services.authentik.enabled' => true,
+            'services.authentik.base_url' => '',
+            'services.authentik.client_id' => null,
+            'services.authentik.client_secret' => null,
+            'services.authentik.redirect_uri' => null,
+        ]);
+
+        $this->get(route('authentik.redirect'))
+            ->assertRedirectToRoute('login')
+            ->assertSessionHasErrors([
+                'email' => 'El acceso con Authentik aún no está configurado.',
+            ]);
+    }
+
     public function test_callback_rejects_a_mismatched_oauth_state_without_contacting_authentik(): void
     {
-        $this->configureAuthentik();
         Http::preventStrayRequests();
 
         $this->withSession([
@@ -80,7 +102,6 @@ class AuthentikAuthenticationTest extends TestCase
 
     public function test_callback_logs_in_active_matching_local_user_and_binds_authentik_subject(): void
     {
-        $this->configureAuthentik();
         $user = User::factory()->create([
             'email' => 'persona@ejemplo.com',
             'active' => true,
@@ -118,7 +139,6 @@ class AuthentikAuthenticationTest extends TestCase
 
     public function test_callback_refuses_authentik_identity_without_an_active_local_user(): void
     {
-        $this->configureAuthentik();
         Http::preventStrayRequests();
         Http::fake([
             'https://auth.example.test/application/o/token/' => Http::response([
@@ -148,7 +168,6 @@ class AuthentikAuthenticationTest extends TestCase
 
     public function test_callback_reconciles_a_changed_authentik_subject_by_trusted_email(): void
     {
-        $this->configureAuthentik();
         $user = User::factory()->create([
             'email' => 'CarlosPrueba@hotmail.com',
             'authentik_subject' => 'old-subject',
@@ -177,6 +196,21 @@ class AuthentikAuthenticationTest extends TestCase
 
         $this->assertAuthenticatedAs($user);
         $this->assertSame('new-subject-from-provider', $user->fresh()->authentik_subject);
+    }
+
+    public function test_logout_continues_working_when_authentik_is_enabled(): void
+    {
+        $user = User::factory()->create(['active' => true]);
+
+        $this->actingAs($user)
+            ->post(route('logout'))
+            ->assertRedirectToRoute('login');
+
+        $this->assertGuest();
+        $this->assertDatabaseHas('activity_logs', [
+            'user_id' => $user->id,
+            'action' => 'logout',
+        ]);
     }
 
     private function configureAuthentik(): void

@@ -14,6 +14,14 @@ Route::redirect('/', '/login');
 Route::get('/login', [AuthController::class, 'showLogin'])
     ->name('login');
 
+/*
+| El modo activo se decide en runtime con config('services.authentik.enabled').
+| Las rutas existen en ambos modos; AuthController rechaza el camino incorrecto
+| para impedir bypass cuando Authentik está habilitado.
+*/
+Route::post('/login', [AuthController::class, 'login'])
+    ->name('login.authenticate');
+
 Route::get('/auth/authentik/redirect', [AuthController::class, 'redirectToAuthentik'])
     ->name('authentik.redirect');
 

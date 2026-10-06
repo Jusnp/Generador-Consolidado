@@ -269,6 +269,40 @@
             background: var(--accent-soft);
         }
 
+        .login-form {
+            display: grid;
+            gap: 16px;
+        }
+
+        .login-field {
+            display: grid;
+            gap: 7px;
+        }
+
+        .login-field label {
+            color: var(--text);
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        .login-field input {
+            width: 100%;
+            min-height: 46px;
+            padding: 12px 14px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            background: var(--bg);
+            font: inherit;
+            font-size: 14px;
+            transition: border-color 0.2s ease, background 0.2s ease;
+        }
+
+        .login-field input:focus {
+            outline: none;
+            border-color: var(--green);
+        }
+
         .login-button {
             width: 100%;
             min-height: 48px;
@@ -282,9 +316,6 @@
             font-weight: 800;
             cursor: pointer;
             transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
-        }
-
-        .login-button {
             border: 0;
             color: #ffffff;
             background: var(--green);
@@ -410,7 +441,13 @@
                     <div class="login-heading">
                         <div class="login-icon" aria-hidden="true">🔐</div>
                         <h2 id="login-title">Iniciar sesión</h2>
-                        <p>Valida tu identidad con tu cuenta institucional.</p>
+                        <p>
+                            @if ($authentikEnabled)
+                                Valida tu identidad con tu cuenta institucional.
+                            @else
+                                Ingresa con tu correo y contraseña del sistema.
+                            @endif
+                        </p>
                     </div>
 
                     @if ($errors->any())
@@ -425,13 +462,51 @@
                         <div class="success" role="status">{{ session('success') }}</div>
                     @endif
 
-                    <a class="login-button authentik-login-button" href="{{ route('authentik.redirect') }}">
-                        Ingresar con Authentik
-                    </a>
+                    @if ($authentikEnabled)
+                        <a class="login-button authentik-login-button" href="{{ route('authentik.redirect') }}">
+                            Ingresar con Authentik
+                        </a>
 
-                    <p class="authentik-note">
-                        El acceso es habilitado por un administrador y queda registrado para auditoría.
-                    </p>
+                        <p class="authentik-note">
+                            El acceso es habilitado por un administrador y queda registrado para auditoría.
+                        </p>
+                    @else
+                        <form class="login-form" method="POST" action="{{ route('login.authenticate') }}">
+                            @csrf
+
+                            <div class="login-field">
+                                <label for="email">Correo electrónico</label>
+                                <input
+                                    id="email"
+                                    type="email"
+                                    name="email"
+                                    value="{{ old('email') }}"
+                                    autocomplete="username"
+                                    required
+                                    autofocus
+                                >
+                            </div>
+
+                            <div class="login-field">
+                                <label for="password">Contraseña</label>
+                                <input
+                                    id="password"
+                                    type="password"
+                                    name="password"
+                                    autocomplete="current-password"
+                                    required
+                                >
+                            </div>
+
+                            <button class="login-button" type="submit">
+                                Iniciar sesión
+                            </button>
+                        </form>
+
+                        <p class="authentik-note">
+                            El acceso queda registrado para auditoría.
+                        </p>
+                    @endif
                 </section>
 
                 <div class="footer">SIRUTA · Comité de Estudios Médicos</div>
