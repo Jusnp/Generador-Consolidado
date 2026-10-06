@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\ActivityLogController;
 use App\Http\Controllers\AuthController;
+use App\Http\Controllers\CatalogoReferenciaController;
 use App\Http\Controllers\JsonExcelController;
 use App\Http\Controllers\UserController;
 use Illuminate\Support\Facades\Route;
