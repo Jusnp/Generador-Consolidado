@@ -8,6 +8,9 @@
         @yield('title', 'Comité de Estudios Médicos')
     </title>
 
+    <link rel="icon" href="{{ asset('favicon.png') }}?v=2" type="image/png">
+    <link rel="shortcut icon" href="{{ asset('favicon.ico') }}?v=2">
+
     <style>
         /* =========================================================
            VARIABLES DE TEMA
@@ -533,7 +536,7 @@
     ========================================================== --}}
     <script>
         (function () {
-            const savedTheme = localStorage.getItem('comite-theme');
+            const savedTheme = localStorage.getItem('json-excel-theme');
 
             if (savedTheme === 'light' || savedTheme === 'dark') {
                 document.documentElement.setAttribute(
@@ -676,16 +679,24 @@
                     newTheme
                 );
 
-                localStorage.setItem(
-                    'comite-theme',
-                    newTheme
-                );
+                localStorage.setItem('json-excel-theme', newTheme);
 
+                updateThemeButton();
+            });
+
+            window.addEventListener('storage', function (event) {
+                if (event.key !== 'json-excel-theme') {
+                    return;
+                }
+
+                const newTheme = event.newValue === 'light' ? 'light' : 'dark';
+                html.setAttribute('data-theme', newTheme);
                 updateThemeButton();
             });
 
         });
     </script>
 
+@include('navigation')
 </body>
 </html>
