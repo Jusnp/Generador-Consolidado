@@ -9,6 +9,9 @@
 
     <title>Usuarios | JSON → Excel</title>
 
+    <link rel="icon" href="{{ asset('favicon.png') }}?v=2" type="image/png">
+    <link rel="shortcut icon" href="{{ asset('favicon.ico') }}?v=2">
+
     <script>
         (function () {
             const theme =
@@ -1228,6 +1231,7 @@
 </script>
 
 
+@include('navigation')
 </body>
 
 </html>

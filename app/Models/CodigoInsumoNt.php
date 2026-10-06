@@ -13,9 +13,12 @@ class CodigoInsumoNt extends Model
         'descripcion',
         'nt',
         'tarifa_unitario',
+        'activo',
+        'hoja',
     ];
 
     protected $casts = [
         'tarifa_unitario' => 'decimal:4',
+        'activo' => 'boolean',
     ];
 }

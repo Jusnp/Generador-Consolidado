@@ -4,8 +4,10 @@ namespace App\Http\Controllers;
 
 use App\Models\User;
 use App\Services\ActivityLogger;
+use App\Services\AuthentikUserProvisioner;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
+use RuntimeException;
 
 class UserController extends Controller
 {
@@ -23,7 +25,8 @@ class UserController extends Controller
 
     public function store(
         Request $request,
-        ActivityLogger $activityLogger
+        ActivityLogger $activityLogger,
+        AuthentikUserProvisioner $authentikUserProvisioner
     ) {
         $validated = $request->validate([
             'name' => ['required', 'string', 'min:2', 'max:100'],
@@ -47,9 +50,22 @@ class UserController extends Controller
             'active.boolean' => 'El estado seleccionado no es válido.',
         ]);
 
+        try {
+            $authentikUser = $authentikUserProvisioner->provision(
+                $validated['name'],
+                $validated['email'],
+                $validated['password']
+            );
+        } catch (RuntimeException $exception) {
+            return back()
+                ->withInput($request->except('password', 'password_confirmation'))
+                ->withErrors(['email' => $exception->getMessage()]);
+        }
+
         $user = User::create([
             'name' => $validated['name'],
             'email' => $validated['email'],
+            'authentik_subject' => $authentikUser['uuid'],
             'password' => $validated['password'],
             'role' => $validated['role'],
             'active' => (bool) $validated['active'],
@@ -80,7 +96,8 @@ class UserController extends Controller
     public function update(
         Request $request,
         User $user,
-        ActivityLogger $activityLogger
+        ActivityLogger $activityLogger,
+        AuthentikUserProvisioner $authentikUserProvisioner
     ) {
         $validated = $request->validate([
             'name' => ['required', 'string', 'min:2', 'max:100'],
@@ -116,12 +133,38 @@ class UserController extends Controller
             'active' => $user->active,
         ];
 
+        $authentikSubject = $user->authentik_subject;
+
+        if ($authentikSubject === null && empty($validated['password'])) {
+            return back()
+                ->withInput($request->except('password', 'password_confirmation'))
+                ->withErrors([
+                    'password' => 'Define una contraseña para crear esta cuenta en Authentik.',
+                ]);
+        }
+
+        if (! empty($validated['password'])) {
+            try {
+                $authentikUser = $authentikUserProvisioner->provision(
+                    $validated['name'],
+                    $validated['email'],
+                    $validated['password']
+                );
+                $authentikSubject = $authentikUser['uuid'];
+            } catch (RuntimeException $exception) {
+                return back()
+                    ->withInput($request->except('password', 'password_confirmation'))
+                    ->withErrors(['email' => $exception->getMessage()]);
+            }
+        }
+
         $user->name = $validated['name'];
         $user->email = $validated['email'];
+        $user->authentik_subject = $authentikSubject;
         $user->role = $validated['role'];
         $user->active = (bool) $validated['active'];
 
-        if (!empty($validated['password'])) {
+        if (! empty($validated['password'])) {
             $user->password = $validated['password'];
         }
 
@@ -140,7 +183,7 @@ class UserController extends Controller
                     'role' => $user->role,
                     'active' => $user->active,
                 ],
-                'password_changed' => !empty($validated['password']),
+                'password_changed' => ! empty($validated['password']),
             ]
         );
 
@@ -164,7 +207,7 @@ class UserController extends Controller
 
         $oldStatus = $user->active;
 
-        $user->active = !$user->active;
+        $user->active = ! $user->active;
         $user->save();
 
         $status = $user->active ? 'activado' : 'desactivado';

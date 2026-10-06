@@ -1,1103 +1,519 @@
 <!DOCTYPE html>
 <html lang="es">
-
 <head>
-
     <meta charset="UTF-8">
-
-    <meta
-        name="viewport"
-        content="width=device-width, initial-scale=1.0"
-    >
-
-    <title>
-        Iniciar sesión | Comité de Estudios Médicos
-    </title>
-
-
-    {{-- =========================================================
-         APLICAR TEMA ANTES DE MOSTRAR LA PÁGINA
-    ========================================================== --}}
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SIRUTA | Comité de Estudios Médicos</title>
+    <link rel="icon" href="{{ asset('favicon.png') }}?v=2" type="image/png">
+    <link rel="shortcut icon" href="{{ asset('favicon.ico') }}?v=2">
 
     <script>
-
         (function () {
-
-            const theme =
-                localStorage.getItem('json-excel-theme') || 'dark';
-
-            document.documentElement.setAttribute(
-                'data-theme',
-                theme
-            );
-
+            const theme = localStorage.getItem('json-excel-theme') || 'dark';
+            document.documentElement.setAttribute('data-theme', theme);
         })();
-
     </script>
 
-
     <style>
-
-        /* =========================================================
-           TEMA OSCURO
-        ========================================================= */
-
         :root {
-
             --bg: #0d1218;
-
             --header: #151c25;
-
             --card: #19222d;
-
             --card-hover: #202b37;
-
             --border: #334252;
-
             --text: #f4f7fa;
-
             --muted: #8fa9c2;
-
             --green: #16a34a;
-
             --green-hover: #15803d;
-
             --red: #ef4444;
-
             --input: #202b37;
-
-            --shadow:
-                0 20px 45px rgba(0, 0, 0, .22);
-
+            --accent-soft: rgba(22, 163, 74, 0.12);
+            --shadow: 0 20px 45px rgba(0, 0, 0, 0.22);
         }
 
-
-        /* =========================================================
-           TEMA CLARO
-        ========================================================== */
-
-        html[data-theme="light"] {
-
+        html[data-theme='light'] {
             --bg: #f4f7f6;
-
             --header: #ffffff;
-
             --card: #ffffff;
-
             --card-hover: #f8faf9;
-
             --border: #d8e0e5;
-
             --text: #142033;
-
             --muted: #60758c;
-
             --green: #16a34a;
-
             --green-hover: #15803d;
-
             --red: #ef4444;
-
             --input: #ffffff;
-
-            --shadow:
-                0 18px 40px rgba(15, 23, 42, .09);
-
+            --accent-soft: rgba(22, 163, 74, 0.1);
+            --shadow: 0 18px 40px rgba(15, 23, 42, 0.09);
         }
-
-
-        /* =========================================================
-           GENERAL
-        ========================================================== */
 
         * {
             box-sizing: border-box;
         }
 
-
         html,
         body {
-
-            margin: 0;
-
-            padding: 0;
-
             min-height: 100%;
-
+            margin: 0;
+            padding: 0;
         }
-
 
         body {
-
-            font-family:
-                Inter,
-                ui-sans-serif,
-                system-ui,
-                -apple-system,
-                BlinkMacSystemFont,
-                "Segoe UI",
-                sans-serif;
-
-            background:
-                var(--bg);
-
-            color:
-                var(--text);
-
-            transition:
-                background .25s ease,
-                color .25s ease;
-
+            background: var(--bg);
+            color: var(--text);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            transition: background 0.25s ease, color 0.25s ease;
         }
-
 
         .page {
-
             min-height: 100vh;
-
-            background:
-                var(--bg);
-
         }
-
-
-        /* =========================================================
-           HEADER
-        ========================================================== */
 
         .header {
-
-            border-bottom:
-                1px solid var(--border);
-
-            background:
-                var(--header);
-
-            transition:
-                background .25s ease,
-                border-color .25s ease;
-
+            border-bottom: 1px solid var(--border);
+            background: var(--header);
+            transition: background 0.25s ease, border-color 0.25s ease;
         }
-
 
         .header-inner {
-
-            width:
-                min(1260px, calc(100% - 48px));
-
-            min-height:
-                116px;
-
-            margin:
-                0 auto;
-
-            display:
-                flex;
-
-            align-items:
-                center;
-
-            justify-content:
-                space-between;
-
-            gap:
-                30px;
-
+            width: min(1260px, calc(100% - 48px));
+            min-height: 116px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 30px;
+            margin: 0 auto;
         }
-
-
-        /* =========================================================
-           MARCA
-        ========================================================== */
 
         .brand-area {
-
-            display:
-                flex;
-
-            align-items:
-                center;
-
-            gap:
-                28px;
-
+            display: flex;
+            align-items: center;
+            gap: 28px;
         }
-
 
         .brand {
-
-            width:
-                205px;
-
-            font-size:
-                21px;
-
-            line-height:
-                1.12;
-
-            letter-spacing:
-                5px;
-
-            font-weight:
-                500;
-
-            color:
-                var(--text);
-
+            width: 205px;
+            color: var(--text);
+            font-size: 21px;
+            font-weight: 500;
+            letter-spacing: 5px;
+            line-height: 1.12;
         }
-
 
         .brand-divider {
-
-            width:
-                1px;
-
-            height:
-                62px;
-
-            background:
-                var(--border);
-
+            width: 1px;
+            height: 62px;
+            background: var(--border);
         }
-
 
         .page-heading h1 {
-
-            margin:
-                0 0 5px;
-
-            font-size:
-                31px;
-
-            line-height:
-                1.15;
-
-            font-weight:
-                800;
-
-            color:
-                var(--text);
-
+            margin: 0 0 5px;
+            color: var(--text);
+            font-size: 31px;
+            font-weight: 800;
+            line-height: 1.15;
         }
-
 
         .page-heading p {
-
-            margin:
-                0;
-
-            color:
-                var(--muted);
-
-            font-size:
-                15px;
-
+            margin: 0;
+            color: var(--muted);
+            font-size: 15px;
         }
-
-
-        /* =========================================================
-           HEADER ACTIONS
-        ========================================================== */
 
         .header-actions {
-
-            display:
-                flex;
-
-            align-items:
-                center;
-
-            gap:
-                14px;
-
+            display: flex;
+            align-items: center;
+            gap: 14px;
         }
-
-
-        /* =========================================================
-           BOTÓN DE TEMA
-        ========================================================== */
 
         .theme-button {
-
-            width:
-                36px;
-
-            height:
-                36px;
-
-            display:
-                flex;
-
-            align-items:
-                center;
-
-            justify-content:
-                center;
-
-            border:
-                1px solid var(--border);
-
-            border-radius:
-                50%;
-
-            background:
-                transparent;
-
-            color:
-                var(--text);
-
-            font-size:
-                16px;
-
-            cursor:
-                pointer;
-
-            transition:
-                background .2s ease,
-                transform .2s ease;
-
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--text);
+            transition: background 0.2s ease, transform 0.2s ease;
         }
-
 
         .theme-button:hover {
-
-            background:
-                var(--card-hover);
-
-            transform:
-                scale(1.04);
-
+            background: var(--card-hover);
+            transform: scale(1.04);
         }
-
-
-        /* =========================================================
-           CONTENIDO
-        ========================================================== */
 
         .content {
-
-            width:
-                min(1260px, calc(100% - 48px));
-
-            min-height:
-                calc(100vh - 116px);
-
-            margin:
-                0 auto;
-
-            display:
-                flex;
-
-            align-items:
-                center;
-
-            justify-content:
-                center;
-
-            padding:
-                45px 0 60px;
-
+            width: min(1080px, calc(100% - 48px));
+            min-height: calc(100vh - 116px);
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(360px, 0.82fr);
+            align-items: center;
+            gap: clamp(52px, 10vw, 150px);
+            margin: 0 auto;
+            padding: 45px 0 60px;
         }
 
+        .welcome {
+            max-width: 510px;
+        }
 
-        /* =========================================================
-           TARJETA LOGIN
-        ========================================================== */
+        .welcome-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            color: var(--green);
+            background: var(--accent-soft);
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        .welcome-label::before {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--green);
+            content: '';
+        }
+
+        .welcome h2 {
+            max-width: 11ch;
+            margin: 22px 0 15px;
+            color: var(--text);
+            font-size: clamp(38px, 5vw, 60px);
+            font-weight: 800;
+            letter-spacing: -0.055em;
+            line-height: 0.98;
+        }
+
+        .welcome h2 span {
+            color: var(--green);
+        }
+
+        .welcome p {
+            max-width: 490px;
+            margin: 0;
+            color: var(--muted);
+            font-size: 16px;
+            line-height: 1.7;
+        }
+
+        .login-area {
+            width: 100%;
+            max-width: 400px;
+            justify-self: end;
+        }
 
         .login-card {
-
-            width:
-                min(460px, 100%);
-
-            padding:
-                36px;
-
-            border:
-                1px solid var(--border);
-
-            border-radius:
-                18px;
-
-            background:
-                var(--card);
-
-            box-shadow:
-                var(--shadow);
-
-            transition:
-                background .25s ease,
-                border-color .25s ease;
-
+            width: 100%;
+            padding: 36px;
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            background: var(--card);
+            box-shadow: var(--shadow);
+            transition: background 0.25s ease, border-color 0.25s ease;
         }
-
-
-        /* =========================================================
-           ICONO
-        ========================================================== */
 
         .login-icon {
-
-            width:
-                58px;
-
-            height:
-                58px;
-
-            margin:
-                0 auto 18px;
-
-            display:
-                flex;
-
-            align-items:
-                center;
-
-            justify-content:
-                center;
-
-            border-radius:
-                14px;
-
-            background:
-                rgba(22, 163, 74, .12);
-
-            color:
-                var(--green);
-
-            font-size:
-                28px;
-
+            width: 58px;
+            height: 58px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 18px;
+            border-radius: 14px;
+            color: var(--green);
+            background: var(--accent-soft);
+            font-size: 28px;
         }
-
-
-        /* =========================================================
-           TITULO
-        ========================================================== */
 
         .login-heading {
-
-            text-align:
-                center;
-
-            margin-bottom:
-                30px;
-
+            margin-bottom: 28px;
+            text-align: center;
         }
-
 
         .login-heading h2 {
-
-            margin:
-                0;
-
-            font-size:
-                27px;
-
-            line-height:
-                1.2;
-
-            font-weight:
-                800;
-
-            color:
-                var(--text);
-
+            margin: 0;
+            color: var(--text);
+            font-size: 27px;
+            font-weight: 800;
+            line-height: 1.2;
         }
-
 
         .login-heading p {
-
-            margin:
-                9px 0 0;
-
-            color:
-                var(--muted);
-
-            font-size:
-                14px;
-
+            margin: 9px 0 0;
+            color: var(--muted);
+            font-size: 14px;
         }
 
-
-        /* =========================================================
-           ERRORES
-        ========================================================== */
+        .errors,
+        .success {
+            margin-bottom: 22px;
+            padding: 14px 16px;
+            border-radius: 9px;
+            font-size: 14px;
+            line-height: 1.5;
+        }
 
         .errors {
-
-            margin-bottom:
-                22px;
-
-            padding:
-                14px 16px;
-
-            border:
-                1px solid rgba(239, 68, 68, .45);
-
-            border-radius:
-                9px;
-
-            background:
-                rgba(239, 68, 68, .10);
-
-            color:
-                #f87171;
-
-            font-size:
-                14px;
-
-            line-height:
-                1.5;
-
+            border: 1px solid rgba(239, 68, 68, 0.45);
+            color: #f87171;
+            background: rgba(239, 68, 68, 0.1);
         }
-
 
         .errors div {
-
-            margin:
-                3px 0;
-
+            margin: 3px 0;
         }
 
-
-        /* =========================================================
-           CAMPOS
-        ========================================================== */
-
-        .field {
-
-            margin-bottom:
-                20px;
-
+        .success {
+            border: 1px solid rgba(22, 163, 74, 0.35);
+            color: var(--green);
+            background: var(--accent-soft);
         }
 
-
-        .field label {
-
-            display:
-                block;
-
-            margin-bottom:
-                8px;
-
-            color:
-                var(--text);
-
-            font-size:
-                14px;
-
-            font-weight:
-                700;
-
+        .login-form {
+            display: grid;
+            gap: 16px;
         }
 
-
-        .required {
-
-            color:
-                var(--red);
-
+        .login-field {
+            display: grid;
+            gap: 7px;
         }
 
-
-        .field input {
-
-            width:
-                100%;
-
-            height:
-                48px;
-
-            padding:
-                0 14px;
-
-            border:
-                1px solid var(--border);
-
-            border-radius:
-                9px;
-
-            outline:
-                none;
-
-            background:
-                var(--input);
-
-            color:
-                var(--text);
-
-            font-size:
-                15px;
-
-            transition:
-                border-color .2s ease,
-                box-shadow .2s ease,
-                background .2s ease;
-
+        .login-field label {
+            color: var(--text);
+            font-size: 13px;
+            font-weight: 700;
         }
 
-
-        .field input::placeholder {
-
-            color:
-                var(--muted);
-
+        .login-field input {
+            width: 100%;
+            min-height: 46px;
+            padding: 12px 14px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            background: var(--bg);
+            font: inherit;
+            font-size: 14px;
+            transition: border-color 0.2s ease, background 0.2s ease;
         }
 
-
-        .field input:focus {
-
-            border-color:
-                var(--green);
-
-            box-shadow:
-                0 0 0 3px
-                rgba(22, 163, 74, .12);
-
+        .login-field input:focus {
+            outline: none;
+            border-color: var(--green);
         }
-
-
-        /* =========================================================
-           BOTÓN LOGIN
-        ========================================================== */
 
         .login-button {
-
-            width:
-                100%;
-
-            min-height:
-                48px;
-
-            border:
-                0;
-
-            border-radius:
-                8px;
-
-            background:
-                var(--green);
-
-            color:
-                #ffffff;
-
-            font-size:
-                15px;
-
-            font-weight:
-                800;
-
-            cursor:
-                pointer;
-
-            transition:
-                background .2s ease,
-                transform .2s ease;
-
+            width: 100%;
+            min-height: 48px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 8px;
+            text-decoration: none;
+            font: inherit;
+            font-size: 15px;
+            font-weight: 800;
+            cursor: pointer;
+            transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+            border: 0;
+            color: #ffffff;
+            background: var(--green);
         }
-
 
         .login-button:hover {
-
-            background:
-                var(--green-hover);
-
-            transform:
-                translateY(-1px);
-
+            background: var(--green-hover);
+            transform: translateY(-1px);
         }
 
-
-        /* =========================================================
-           FOOTER
-        ========================================================== */
+        .authentik-note {
+            margin: 20px 0 0;
+            color: var(--muted);
+            font-size: 12px;
+            line-height: 1.55;
+            text-align: center;
+        }
 
         .footer {
-
-            margin-top:
-                24px;
-
-            text-align:
-                center;
-
-            color:
-                var(--muted);
-
-            font-size:
-                12px;
-
+            margin-top: 24px;
+            color: var(--muted);
+            font-size: 12px;
+            text-align: center;
         }
-
-
-        /* =========================================================
-           RESPONSIVE
-        ========================================================== */
 
         @media (max-width: 900px) {
-
             .header-inner {
-
-                min-height:
-                    auto;
-
-                padding:
-                    22px 0;
-
-                align-items:
-                    flex-start;
-
-                flex-direction:
-                    column;
-
+                min-height: auto;
+                align-items: flex-start;
+                flex-direction: column;
+                padding: 22px 0;
             }
-
 
             .header-actions {
-
-                width:
-                    100%;
-
-                justify-content:
-                    flex-start;
-
+                width: 100%;
+                justify-content: flex-start;
             }
 
-        }
+            .content {
+                grid-template-columns: 1fr;
+                gap: 42px;
+                padding: 55px 0 60px;
+            }
 
+            .welcome {
+                max-width: 640px;
+            }
+
+            .login-area {
+                max-width: 460px;
+                justify-self: start;
+            }
+        }
 
         @media (max-width: 650px) {
-
             .header-inner,
             .content {
-
-                width:
-                    min(100% - 28px, 1260px);
-
+                width: min(100% - 28px, 1260px);
             }
-
 
             .brand-area {
-
-                gap:
-                    15px;
-
+                gap: 15px;
             }
-
 
             .brand {
-
-                width:
-                    auto;
-
-                font-size:
-                    16px;
-
-                letter-spacing:
-                    3px;
-
+                width: auto;
+                font-size: 16px;
+                letter-spacing: 3px;
             }
-
 
             .brand-divider {
-
-                display:
-                    none;
-
+                display: none;
             }
-
 
             .page-heading h1 {
-
-                font-size:
-                    23px;
-
+                font-size: 23px;
             }
-
 
             .page-heading p {
-
-                font-size:
-                    13px;
-
+                font-size: 13px;
             }
-
 
             .login-card {
-
-                padding:
-                    27px 21px;
-
+                padding: 27px 21px;
             }
-
         }
-
     </style>
-
 </head>
-
-
 <body>
-
-
-<div class="page">
-
-
-    <!-- =========================================================
-         HEADER
-    ========================================================== -->
-
-    <header class="header">
-
-        <div class="header-inner">
-
-
-            <div class="brand-area">
-
-
-                <div class="brand">
-
-                    COMITÉ DE<br>
-                    ESTUDIOS<br>
-                    MÉDICOS
-
+    <div class="page">
+        <header class="header">
+            <div class="header-inner">
+                <div class="brand-area">
+                    <div class="brand">
+                        COMITÉ DE<br>
+                        ESTUDIOS<br>
+                        MÉDICOS
+                    </div>
+                    <div class="brand-divider"></div>
+                    <div class="page-heading">
+                        <h1>SIRUTA</h1>
+                        <p>Sistema Integral de RIPS y Seguimiento de Rutas</p>
+                    </div>
                 </div>
 
-
-                <div class="brand-divider"></div>
-
-
-                <div class="page-heading">
-
-                    <h1>
-                        Sistema de acceso
-                    </h1>
-
-                    <p>
-                        Comité de Estudios Médicos
-                    </p>
-
+                <div class="header-actions">
+                    <button type="button" class="theme-button" data-theme-toggle aria-label="Cambiar tema" title="Cambiar tema">☀️</button>
                 </div>
-
-
             </div>
-
-
-            <div class="header-actions">
-
-
-                <!-- BOTÓN DE TEMA -->
-
-                <button
-                    type="button"
-                    class="theme-button"
-                    data-theme-toggle
-                    aria-label="Cambiar tema"
-                    title="Cambiar tema"
-                >
-                    ☀️
-                </button>
-
-
-            </div>
-
-        </div>
-
-    </header>
-
-
-
-    <!-- =========================================================
-         CONTENIDO
-    ========================================================== -->
-
-    <main class="content">
-
-
-        <div>
-
-
-            <!-- =================================================
-                 LOGIN
-            ================================================== -->
-
-            <section class="login-card">
-
-
-                <div class="login-heading">
-
-
-                    <div class="login-icon">
-                        🔐
-                    </div>
-
-
-                    <h2>
-                        Iniciar sesión
-                    </h2>
-
-
-                    <p>
-                        Ingresa tus credenciales para continuar.
-                    </p>
-
-
-                </div>
-
-
-
-                <!-- ERRORES -->
-
-                @if ($errors->any())
-
-                    <div class="errors">
-
-                        @foreach ($errors->all() as $error)
-
-                            <div>
-                                {{ $error }}
-                            </div>
-
-                        @endforeach
-
-                    </div>
-
-                @endif
-
-
-
-                <!-- MENSAJE DE ÉXITO -->
-
-                @if (session('success'))
-
-                    <div
-                        style="
-                            margin-bottom: 22px;
-                            padding: 14px 16px;
-                            border: 1px solid rgba(22, 163, 74, .35);
-                            border-radius: 9px;
-                            background: rgba(22, 163, 74, .10);
-                            color: var(--green);
-                            font-size: 14px;
-                        "
-                    >
-                        {{ session('success') }}
-                    </div>
-
-                @endif
-
-
-
-                <!-- FORMULARIO -->
-
-                <form
-                    method="POST"
-                    action="{{ route('login.authenticate') }}"
-                >
-
-                    @csrf
-
-
-                    <!-- CORREO -->
-
-                    <div class="field">
-
-                        <label for="email">
-
-                            Correo electrónico
-
-                            <span class="required">
-                                *
-                            </span>
-
-                        </label>
-
-
-                        <input
-                            type="email"
-                            id="email"
-                            name="email"
-                            value="{{ old('email') }}"
-                            placeholder="correo@ejemplo.com"
-                            autocomplete="email"
-                            required
-                            autofocus
-                        >
-
-                    </div>
-
-
-
-                    <!-- CONTRASEÑA -->
-
-                    <div class="field">
-
-                        <label for="password">
-
-                            Contraseña
-
-                            <span class="required">
-                                *
-                            </span>
-
-                        </label>
-
-
-                        <input
-                            type="password"
-                            id="password"
-                            name="password"
-                            placeholder="Ingresa tu contraseña"
-                            autocomplete="current-password"
-                            required
-                        >
-
-                    </div>
-
-
-
-                    <!-- BOTÓN -->
-
-                    <button
-                        type="submit"
-                        class="login-button"
-                    >
-                        Iniciar sesión
-                    </button>
-
-
-                </form>
-
-
+        </header>
+
+        <main class="content">
+            <section class="welcome" aria-labelledby="welcome-title">
+                <span class="welcome-label">Portal institucional</span>
+                <h2 id="welcome-title">RIPS y rutas, <span>en un mismo lugar.</span></h2>
+                <p>
+                    Accede a la consolidación de RIPS, al seguimiento de rutas y a los reportes institucionales desde un único lugar.
+                </p>
             </section>
 
+            <div class="login-area">
+                <section class="login-card" aria-labelledby="login-title">
+                    <div class="login-heading">
+                        <div class="login-icon" aria-hidden="true">🔐</div>
+                        <h2 id="login-title">Iniciar sesión</h2>
+                        <p>
+                            @if ($authentikEnabled)
+                                Valida tu identidad con tu cuenta institucional.
+                            @else
+                                Ingresa con tu correo y contraseña del sistema.
+                            @endif
+                        </p>
+                    </div>
 
+                    @if ($errors->any())
+                        <div class="errors" role="alert">
+                            @foreach ($errors->all() as $error)
+                                <div>{{ $error }}</div>
+                            @endforeach
+                        </div>
+                    @endif
 
-            <!-- FOOTER -->
+                    @if (session('success'))
+                        <div class="success" role="status">{{ session('success') }}</div>
+                    @endif
 
-            <div class="footer">
+                    @if ($authentikEnabled)
+                        <a class="login-button authentik-login-button" href="{{ route('authentik.redirect') }}">
+                            Ingresar con Authentik
+                        </a>
 
-                Sistema interno · Comité de Estudios Médicos
+                        <p class="authentik-note">
+                            El acceso es habilitado por un administrador y queda registrado para auditoría.
+                        </p>
+                    @else
+                        <form class="login-form" method="POST" action="{{ route('login.authenticate') }}">
+                            @csrf
 
+                            <div class="login-field">
+                                <label for="email">Correo electrónico</label>
+                                <input
+                                    id="email"
+                                    type="email"
+                                    name="email"
+                                    value="{{ old('email') }}"
+                                    autocomplete="username"
+                                    required
+                                    autofocus
+                                >
+                            </div>
+
+                            <div class="login-field">
+                                <label for="password">Contraseña</label>
+                                <input
+                                    id="password"
+                                    type="password"
+                                    name="password"
+                                    autocomplete="current-password"
+                                    required
+                                >
+                            </div>
+
+                            <button class="login-button" type="submit">
+                                Iniciar sesión
+                            </button>
+                        </form>
+
+                        <p class="authentik-note">
+                            El acceso queda registrado para auditoría.
+                        </p>
+                    @endif
+                </section>
+
+                <div class="footer">SIRUTA · Comité de Estudios Médicos</div>
             </div>
+        </main>
+    </div>
 
-
-        </div>
-
-
-    </main>
-
-
-</div>
-
-
-
-<!-- =============================================================
-     SISTEMA GLOBAL DE TEMA
-============================================================= -->
-
-<script src="{{ asset('js/theme.js') }}"></script>
-
-
+    <script src="{{ asset('js/theme.js') }}"></script>
 </body>
-
 </html>

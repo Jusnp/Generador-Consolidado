@@ -6,6 +6,9 @@
 
     <title>Detalle de actividad | Comité de Estudios Médicos</title>
 
+    <link rel="icon" href="{{ asset('favicon.png') }}?v=2" type="image/png">
+    <link rel="shortcut icon" href="{{ asset('favicon.ico') }}?v=2">
+
     <script>
         (function () {
             const savedTheme =
@@ -1155,5 +1158,6 @@
 
 <script src="{{ asset('js/theme.js') }}"></script>
 
+@include('navigation')
 </body>
 </html>

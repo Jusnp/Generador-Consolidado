@@ -3,6 +3,9 @@
 .env
 .env.backup
 .env.production
+/apps/authentik/.env
+/.claude/
+/.codex_spreadsheet/
 .phpactor.json
 .phpunit.result.cache
 /.codex
@@ -14,6 +17,7 @@
 /.zed
 /auth.json
 /node_modules
+/outputs/
 /public/build
 /public/fonts-manifest.dev.json
 /public/hot
@@ -25,3 +29,4 @@ _ide_helper.php
 Homestead.json
 Homestead.yaml
 Thumbs.db
+/gantt_siruta.png
