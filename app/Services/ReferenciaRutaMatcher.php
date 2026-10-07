@@ -5,6 +5,9 @@ namespace App\Services;
 use App\Models\CatalogoReferencia;
 use App\Models\CatalogoReferenciaItem;
 use App\Models\ReferenciaManual;
+use App\Programas\LaMaria\EstadoTarifario;
+use App\Programas\LaMaria\FormaCruce;
+use App\Programas\LaMaria\FuenteTarifa;
 use App\Programas\LaMaria\LaMariaPrograma;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
@@ -47,7 +50,10 @@ class ReferenciaRutaMatcher
     private array $medicationByCum = [];
 
     /**
-     * @var array<string, array<string, array<string, mixed>>>
+     * Todas las presentaciones de la nota técnica por principio activo, para
+     * no aplicar en silencio la primera tarifa cuando hay varias.
+     *
+     * @var array<string, array<string, array<int, array<string, mixed>>>>
      */
     private array $medicationByPrincipio = [];
 
@@ -171,11 +177,12 @@ class ReferenciaRutaMatcher
         $serviceType = (string) ($record['tipoServicio'] ?? '');
         $official = $this->officialReference($serviceType, $code);
         $technical = $this->technicalCodes[$route][$code] ?? null;
-        $cum = $serviceType === 'medicamentos' ? $this->cumReference($code) : null;
-        $dispensation = $serviceType === 'medicamentos'
+        $isMedication = $serviceType === 'medicamentos';
+        $cum = $isMedication ? $this->cumReference($code) : null;
+        $dispensation = $isMedication
             ? $this->dispensationReference($record, $route, $cum)
             : null;
-        $medicationNt = $serviceType === 'medicamentos'
+        $medicationLookup = $isMedication
             ? $this->medicationTechnicalReference(
                 $code,
                 (string) ($record['nombreServicio'] ?? ''),
@@ -183,8 +190,10 @@ class ReferenciaRutaMatcher
                 (string) ($cum['metadatos']['principio_activo'] ?? $cum['descripcion'] ?? '')
             )
             : null;
+        $medicationNt = $medicationLookup['entry'] ?? null;
+        $isAmbiguous = ($medicationLookup['forma'] ?? null) === FormaCruce::PrincipioAmbiguo->value;
         $manual = $this->manualReference($route, $serviceType, $code);
-        $oncologyScheme = $serviceType === 'medicamentos'
+        $oncologyScheme = $isMedication
             ? $this->oncologyScheme($route, (string) ($record['nombreServicio'] ?? ''), $cum)
             : '';
 
@@ -194,20 +203,8 @@ class ReferenciaRutaMatcher
             }
         }
 
-        $notaTecnica = $serviceType === 'medicamentos' ? $medicationNt : $technical;
+        $notaTecnica = $isMedication ? $medicationNt : $technical;
         $nombreNotaTecnica = (string) ($notaTecnica['descripcion'] ?? '');
-
-        if ($nombreNotaTecnica === '' && $serviceType === 'medicamentos') {
-            $nombreNotaTecnica = (string) ($record['nombreServicio'] ?? '');
-
-            if ($nombreNotaTecnica === '') {
-                $nombreNotaTecnica = (string) (
-                    $cum['metadatos']['principio_activo']
-                    ?? $cum['descripcion']
-                    ?? ''
-                );
-            }
-        }
 
         $description = $official['descripcion'] ?? $technical['descripcion'] ?? $cum['descripcion'] ?? '';
         $catalogNames = array_values(array_unique(array_filter([
@@ -217,13 +214,46 @@ class ReferenciaRutaMatcher
             $cum['catalogoLabel'] ?? '',
             $dispensation['catalogoLabel'] ?? '',
         ])));
-        $rate = $notaTecnica['tarifaReferencia']
-            ?? $technical['tarifaReferencia']
-            ?? $manual['tarifaReferencia']
-            ?? $dispensation['tarifaReferencia']
-            ?? null;
+        $isComplement = ($technical['categoria'] ?? null) === 'MEDICAMENTOS_NUEVOS';
+        [$rate, $rateSource, $matchForm] = match (true) {
+            ($notaTecnica['tarifaReferencia'] ?? null) !== null => [
+                $notaTecnica['tarifaReferencia'],
+                FuenteTarifa::NotaTecnica,
+                $isMedication ? $medicationLookup['forma'] : FormaCruce::CodigoExacto->value,
+            ],
+            ($technical['tarifaReferencia'] ?? null) !== null => [
+                $technical['tarifaReferencia'],
+                $isComplement ? FuenteTarifa::Complemento : FuenteTarifa::NotaTecnica,
+                $isMedication ? FormaCruce::CumExacto->value : FormaCruce::CodigoExacto->value,
+            ],
+            ($manual['tarifaReferencia'] ?? null) !== null => [
+                $manual['tarifaReferencia'],
+                FuenteTarifa::ReferenciaManual,
+                FormaCruce::ManualCodigo->value,
+            ],
+            ($dispensation['tarifaReferencia'] ?? null) !== null => [
+                $dispensation['tarifaReferencia'],
+                FuenteTarifa::Dispensacion,
+                FormaCruce::DocumentoCumMes->value,
+            ],
+            default => [
+                null,
+                FuenteTarifa::Ninguna,
+                match (true) {
+                    $isAmbiguous => FormaCruce::PrincipioAmbiguo->value,
+                    $medicationLookup !== null => $medicationLookup['forma'],
+                    $technical !== null => FormaCruce::CodigoExacto->value,
+                    default => FormaCruce::SinCruce->value,
+                },
+            ],
+        };
+        $tariffState = match (true) {
+            $rate !== null && $rate > 0 => EstadoTarifario::ConTarifa,
+            $isAmbiguous => EstadoTarifario::RevisarPresentacion,
+            default => EstadoTarifario::SinTarifa,
+        };
         $quantity = $this->numberOrDefault($record['cantidad'] ?? null, 1.0);
-        $estimatedCost = $rate === null ? 0.0 : round($rate * $quantity, 2);
+        $estimatedCost = $tariffState === EstadoTarifario::ConTarifa ? round($rate * $quantity, 2) : 0.0;
         $status = $dispensation !== null && $notaTecnica === null && $technical === null && $manual === null
             ? 'MEDICAMENTO_CON_DISPENSACION'
             : $this->statusFor($official, $notaTecnica ?? $technical ?? $manual, $cum, $serviceType);
@@ -252,16 +282,41 @@ class ReferenciaRutaMatcher
             'tarifaReferencia' => $rate ?? 0.0,
             'costoEstimadoReferencia' => $estimatedCost,
             'estadoCruce' => $status,
+            'estadoTarifario' => $tariffState->value,
+            'fuenteTarifa' => $rateSource->value,
+            'formaCruce' => $matchForm,
+            'enNotaTecnica' => $isMedication
+                ? $medicationLookup !== null
+                : $technical !== null && ! $isComplement,
+            'candidatosPresentacion' => $isAmbiguous
+                ? $this->presentationCandidates($medicationLookup['candidatos'])
+                : '',
             'cum' => $code !== '' && $serviceType === 'medicamentos'
                 ? $code
                 : ($cum === null ? '' : (string) $cum['codigo']),
             'principioActivo' => $medicationNt['metadatos']['principio_activo']
+                ?? $medicationLookup['candidatos'][0]['metadatos']['principio_activo']
                 ?? $cum['metadatos']['principio_activo']
                 ?? '',
             'atc' => $cum['metadatos']['atc'] ?? '',
             'esquemaOncologico' => $oncologyScheme,
             'tipoValorReferencia' => $referenceValueType,
         ];
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $candidates
+     */
+    private function presentationCandidates(array $candidates): string
+    {
+        return implode(' | ', array_values(array_unique(array_map(
+            static fn (array $entry): string => sprintf(
+                '%s (%s)',
+                $entry['descripcion'],
+                $entry['tarifaReferencia'] === null ? 'sin tarifa' : number_format((float) $entry['tarifaReferencia'], 2, '.', '')
+            ),
+            $candidates
+        ))));
     }
 
     private function manualReference(string $route, string $serviceType, string $code): ?array
@@ -640,13 +695,17 @@ class ReferenciaRutaMatcher
             $principio = $this->normalisePrincipio((string) $entry['descripcion']);
         }
 
-        if ($principio !== '' && ! isset($this->medicationByPrincipio[$scope][$principio])) {
-            $this->medicationByPrincipio[$scope][$principio] = $entry;
+        if ($principio !== '') {
+            $this->medicationByPrincipio[$scope][$principio][] = $entry;
         }
     }
 
     /**
-     * @return array<string, mixed>|null
+     * Busca el medicamento en la nota técnica: primero por CUM exacto y luego
+     * por principio activo. Por principio solo se acepta una tarifa cuando todas
+     * las presentaciones candidatas comparten el mismo valor.
+     *
+     * @return array{entry: array<string, mixed>|null, forma: string, candidatos: array<int, array<string, mixed>>}|null
      */
     private function medicationTechnicalReference(
         string $cum,
@@ -656,12 +715,49 @@ class ReferenciaRutaMatcher
     ): ?array {
         foreach ([$route, '*'] as $scope) {
             if ($cum !== '' && isset($this->medicationByCum[$scope][$cum])) {
-                return $this->medicationByCum[$scope][$cum];
+                return [
+                    'entry' => $this->medicationByCum[$scope][$cum],
+                    'forma' => FormaCruce::CumExacto->value,
+                    'candidatos' => [],
+                ];
             }
         }
 
-        $candidateSources = array_values(array_filter([$nombreServicio, $principioAlterno]));
+        $candidates = $this->medicationCandidatesByPrincipio(
+            array_values(array_filter([$nombreServicio, $principioAlterno])),
+            $route
+        );
 
+        if ($candidates === []) {
+            return null;
+        }
+
+        $rates = array_unique(array_map(
+            static fn (array $entry): string => number_format((float) $entry['tarifaReferencia'], 4, '.', ''),
+            array_filter($candidates, static fn (array $entry): bool => $entry['tarifaReferencia'] !== null)
+        ));
+
+        if (count($rates) > 1) {
+            return [
+                'entry' => null,
+                'forma' => FormaCruce::PrincipioAmbiguo->value,
+                'candidatos' => $candidates,
+            ];
+        }
+
+        return [
+            'entry' => $candidates[0],
+            'forma' => FormaCruce::PrincipioTarifaUnica->value,
+            'candidatos' => $candidates,
+        ];
+    }
+
+    /**
+     * @param  array<int, string>  $candidateSources
+     * @return array<int, array<string, mixed>>
+     */
+    private function medicationCandidatesByPrincipio(array $candidateSources, string $route): array
+    {
         foreach ($candidateSources as $source) {
             foreach ($this->principioCandidates($source) as $principio) {
                 foreach ([$route, '*'] as $scope) {
@@ -680,15 +776,15 @@ class ReferenciaRutaMatcher
             }
 
             foreach ([$route, '*'] as $scope) {
-                foreach ($this->medicationByPrincipio[$scope] ?? [] as $principio => $entry) {
+                foreach ($this->medicationByPrincipio[$scope] ?? [] as $principio => $entries) {
                     if (mb_strlen((string) $principio) >= 5 && str_contains($haystack, (string) $principio)) {
-                        return $entry;
+                        return $entries;
                     }
                 }
             }
         }
 
-        return null;
+        return [];
     }
 
     /**
