@@ -2,6 +2,15 @@
 
 namespace App\Services;
 
+use App\Programas\LaMaria\ClaseCosto;
+use App\Programas\LaMaria\CondicionArchivo;
+use App\Programas\LaMaria\EstadoClinico;
+use App\Programas\LaMaria\EstadoDuplicidad;
+use App\Programas\LaMaria\EstadoTarifario;
+use App\Programas\LaMaria\FormaCruce;
+use App\Programas\LaMaria\FuenteTarifa;
+use App\Programas\LaMaria\OrigenRuta;
+use App\Programas\LaMaria\RutaCalculo;
 use JsonMachine\Items;
 use JsonMachine\JsonDecoder\ExtJsonDecoder;
 
@@ -26,6 +35,109 @@ class SeguimientoRutaClassifier
         'hospitalizacion',
         'recienNacidos',
     ];
+
+    /**
+     * Diagnósticos que se conservan como evidencia clínica secundaria cuando
+     * aparecen como diagnóstico relacionado, de egreso o complicación.
+     *
+     * @var array<int, string>
+     */
+    private const SECONDARY_EVIDENCE_PREFIXES = ['C61', 'C53', 'D06', 'D07', 'C54', 'C55'];
+
+    /**
+     * Diagnósticos principales que no definen ruta pero se conservan como evidencia.
+     *
+     * @var array<int, string>
+     */
+    private const PRINCIPAL_SECONDARY_PREFIXES = ['D06', 'D07', 'C54', 'C55'];
+
+    /**
+     * @var array<int, string>
+     */
+    private const RELATED_DIAGNOSIS_FIELDS = [
+        'codDiagnosticoRelacionado',
+        'codDiagnosticoRelacionado1',
+        'codDiagnosticoRelacionado2',
+        'codDiagnosticoRelacionado3',
+        'codDiagnosticoPrincipalE',
+        'codDiagnosticoRelacionadoE1',
+        'codDiagnosticoRelacionadoE2',
+        'codDiagnosticoRelacionadoE3',
+        'codComplicacion',
+    ];
+
+    /**
+     * Identifica archivos idénticos (mismo hash) y facturas repetidas con
+     * contenido diferente antes de procesar. No descarta información: la
+     * condición queda en cada archivo para el control de cargue.
+     *
+     * @param  array<int, array{path: string, fileName: string}>  $files
+     * @return array<int, array<string, string>>
+     */
+    public function screenFiles(array $files): array
+    {
+        $screened = [];
+        $firstFileByHash = [];
+
+        foreach ($files as $file) {
+            $hash = (string) hash_file('sha256', $file['path']);
+            $entry = [
+                ...$file,
+                'hash' => $hash,
+                'factura' => $this->scalarFromJsonFile($file['path'], '/numFactura'),
+                'tipoNota' => $this->scalarFromJsonFile($file['path'], '/tipoNota'),
+                'numNota' => $this->scalarFromJsonFile($file['path'], '/numNota'),
+                'condicion' => CondicionArchivo::Unico->value,
+                'relacionados' => '',
+            ];
+
+            if (isset($firstFileByHash[$hash])) {
+                $entry['condicion'] = CondicionArchivo::ArchivoDuplicadoExcluido->value;
+                $entry['relacionados'] = $firstFileByHash[$hash];
+            } else {
+                $firstFileByHash[$hash] = $file['fileName'];
+            }
+
+            $screened[] = $entry;
+        }
+
+        $filesByInvoice = [];
+
+        foreach ($screened as $index => $entry) {
+            if ($entry['condicion'] === CondicionArchivo::Unico->value && $entry['factura'] !== '') {
+                $filesByInvoice[$entry['factura']][] = $index;
+            }
+        }
+
+        foreach ($filesByInvoice as $indexes) {
+            if (count($indexes) < 2) {
+                continue;
+            }
+
+            foreach ($indexes as $index) {
+                $screened[$index]['condicion'] = CondicionArchivo::FacturaRepetidaConDiferencias->value;
+                $screened[$index]['relacionados'] = implode(', ', array_map(
+                    static fn (int $other): string => $screened[$other]['fileName'],
+                    array_values(array_filter($indexes, static fn (int $other): bool => $other !== $index))
+                ));
+            }
+        }
+
+        return $screened;
+    }
+
+    /**
+     * @param  array<int, array<string, string>>  $files
+     * @return array<int, array<string, string>>
+     */
+    public function processableFiles(array $files): array
+    {
+        return array_values(array_filter(
+            $files,
+            static fn (array $file): bool => ($file['condicion'] ?? CondicionArchivo::Unico->value)
+                !== CondicionArchivo::ArchivoDuplicadoExcluido->value
+        ));
+    }
 
     /**
      * @param  array<int, array{path: string, fileName: string}>  $files
@@ -62,6 +174,10 @@ class SeguimientoRutaClassifier
                     $profile['diagnosticosReportados'][$record['diagnosticoPrincipal']] = true;
                 }
 
+                foreach ($record['evidenciaSecundaria'] as $evidence) {
+                    $profile['evidenciaSecundaria'][$evidence] = true;
+                }
+
                 if ($record['fechaAtencion'] !== '') {
                     $profile['primeraFechaAtencion'] = $this->earlierDate(
                         $profile['primeraFechaAtencion'],
@@ -85,20 +201,18 @@ class SeguimientoRutaClassifier
         }
 
         foreach ($profiles as &$profile) {
-            $diagnoses = array_keys($profile['routeEvidence']);
-            sort($diagnoses);
-
             $diagnosticosReportados = array_keys($profile['diagnosticosReportados'] ?? []);
             sort($diagnosticosReportados);
+
+            $evidenciaSecundaria = array_keys($profile['evidenciaSecundaria']);
+            sort($evidenciaSecundaria);
 
             $profile['facturas'] = array_keys($profile['facturas']);
             sort($profile['facturas']);
             $profile['cantidadFacturas'] = count($profile['facturas']);
             $profile['diagnosticosDetectados'] = implode(', ', $diagnosticosReportados);
-            $profile['rutaFinal'] = $this->routeForEvidence($diagnoses);
-            $profile['rutaCalculo'] = $this->routeForSex($profile['sexo'] ?? '');
-            $profile['estado'] = $this->profileStatus($profile);
-            $profile['motivoRevision'] = $this->reviewReason($profile);
+            $profile['evidenciaSecundaria'] = implode(', ', $evidenciaSecundaria);
+            $profile = [...$profile, ...$this->resolveRoute($profile)];
         }
         unset($profile);
 
@@ -119,9 +233,7 @@ class SeguimientoRutaClassifier
     }
 
     /**
-     * Filtra perfiles a una ejecución de La María por la ruta de cálculo.
-     * La ruta clínica se mantiene para trazabilidad, pero el costo se consolida
-     * según el sexo registrado para evitar que casos sin diagnóstico queden fuera.
+     * Perfiles que se procesan y suman dentro de una ejecución de La María.
      *
      * @param  array<int, array<string, mixed>>  $profiles
      * @return array<int, array<string, mixed>>
@@ -130,117 +242,154 @@ class SeguimientoRutaClassifier
     {
         return array_values(array_filter(
             $profiles,
-            static function (array $profile) use ($ruta): bool {
-                return $profile['rutaCalculo'] === $ruta
-                    || (($profile['sexo'] ?? '') === '' && $profile['rutaFinal'] === $ruta);
-            }
+            static fn (array $profile): bool => $profile['ruta'] === $ruta
         ));
     }
 
     /**
-     * Conserva los perfiles de la ruta contraria para que el supervisor pueda
-     * revisar los casos recibidos en el archivo de una ejecución distinta.
+     * Perfiles sin ruta asignable (doble ruta o sexo no reconocido). Se muestran
+     * en ambas ejecuciones como informativos y no suman en ninguna.
      *
      * @param  array<int, array<string, mixed>>  $profiles
      * @return array<int, array<string, mixed>>
      */
-    public function profilesForOppositeExecutionRoute(array $profiles, string $ruta): array
+    public function profilesNotAssignable(array $profiles): array
     {
-        return array_values(array_filter(
-            $profiles,
-            static fn (array $profile): bool => in_array(
-                $profile['rutaCalculo'],
-                ['PROSTATA', 'CERVIX'],
-                true
-            ) && $profile['rutaCalculo'] !== $ruta
-        ));
+        return $this->profilesForExecutionRoute($profiles, RutaCalculo::NoAsignable->value);
     }
 
     /**
-     * Aplica controles clínicos propios de la ejecución. Los registros no se
-     * eliminan: quedan marcados para corrección y trazabilidad en el Excel.
+     * Índice de coincidencias clínicas entre servicios: llave clínica →
+     * cantidad de servicios por factura. Las copias exactas no se cuentan.
      *
-     * @param  array<int, array<string, mixed>>  $profiles
-     * @return array<int, array<string, mixed>>
+     * @param  array<int, array{path: string, fileName: string}>  $files
+     * @return array<string, array<string, int>>
      */
-    public function validateRouteConsistency(array $profiles, string $ruta): array
+    public function duplicateIndexForFiles(array $files): array
     {
-        $expectedSex = $ruta === 'CERVIX' ? 'F' : 'M';
+        $index = [];
 
-        foreach ($profiles as &$profile) {
-            $profile['alertasClinicas'] ??= [];
-            if (($profile['sexo'] ?? '') !== '' && $profile['sexo'] !== $expectedSex) {
-                $sexoDescripcion = $profile['sexo'] === 'F' ? 'MUJER' : 'HOMBRE';
-                $profile['alertasClinicas'][] = sprintf(
-                    '%s recibido al generar %s; se conserva para revisión y su costo se asigna a %s.',
-                    $sexoDescripcion,
-                    $ruta,
-                    $profile['rutaCalculo']
-                );
-                $profile['estado'] = 'REVISAR';
-                $profile['motivoRevision'] = trim(
-                    $profile['motivoRevision'].' '.end($profile['alertasClinicas'])
-                );
+        foreach ($this->evaluableRecordsForFiles($files) as $record) {
+            if ($record['esDuplicadoExacto']) {
+                continue;
             }
+
+            $key = $this->clinicalKey($record);
+
+            if ($key === null) {
+                continue;
+            }
+
+            $index[$key][$record['factura']] = ($index[$key][$record['factura']] ?? 0) + 1;
         }
-        unset($profile);
 
-        return $profiles;
+        return $index;
     }
 
     /**
+     * Calcula costos por perfil separando lo que suma al resumen de lo potencial.
+     *
      * @param  array<int, array{path: string, fileName: string}>  $files
      * @param  array<int, array<string, mixed>>  $profiles
-     * @return array<int, array<string, mixed>>
+     * @param  array<string, array<string, int>>  $duplicateIndex
+     * @return array{profiles: array<int, array<string, mixed>>, archivos: array<string, array{costoPotencial: float}>, camposDiligenciados: array<string, true>}
      */
-    public function profilesWithReferenceCostsForFiles(
+    public function evaluateCostsForFiles(
         array $files,
         array $profiles,
         ReferenciaRutaMatcher $referenciaRutaMatcher,
-        ?string $rutaEjecucion = null
+        array $duplicateIndex = []
     ): array {
         $profilesByKey = [];
+        $archivos = [];
+        $filledFields = [];
 
         foreach ($profiles as $index => $profile) {
             $profilesByKey[$profile['profileKey']] = $index;
         }
 
         foreach ($files as $file) {
-            foreach ($this->recordsForFile($file) as $record) {
-                $profileIndex = $profilesByKey[$record['profileKey']] ?? null;
-
-                if ($profileIndex === null) {
-                    continue;
-                }
-
-                $reference = $referenciaRutaMatcher->match(
-                    $record,
-                    $this->matchRoute($profiles[$profileIndex]['rutaCalculo'], $rutaEjecucion)
-                );
-                $profiles[$profileIndex]['valorRipsReportado'] += $reference['valorRipsReportado'];
-                $profiles[$profileIndex]['costoEstimadoReferencia'] += $reference['costoEstimadoReferencia'];
-
-                if ($reference['tarifaReferencia'] > 0) {
-                    $profiles[$profileIndex]['serviciosConTarifa']++;
-                } else {
-                    $profiles[$profileIndex]['serviciosSinTarifa']++;
-                }
-            }
+            $archivos[$file['fileName']] = ['costoPotencial' => 0.0];
         }
 
-        return $profiles;
+        foreach ($this->evaluableRecordsForFiles($files) as $record) {
+            $profileIndex = $profilesByKey[$record['profileKey']] ?? null;
+
+            if ($profileIndex === null) {
+                continue;
+            }
+
+            foreach ([...$record['usuarioJson'], ...$record['servicioJson']] as $field => $value) {
+                if ($value !== null && $value !== '') {
+                    $filledFields[$field] = true;
+                }
+            }
+
+            $profile = &$profiles[$profileIndex];
+            $evaluation = $this->evaluateRecord(
+                $record,
+                $profile,
+                $referenciaRutaMatcher,
+                $duplicateIndex
+            );
+            $cost = (float) $evaluation['costoEstimadoReferencia'];
+
+            $profile['valorRipsReportado'] += $evaluation['valorRipsReportado'];
+            $profile['costoEstimadoReferencia'] += $cost;
+            $profile['costoPotencialProstata'] += (float) $evaluation['costoPotencialProstata'];
+            $profile['costoPotencialCervix'] += (float) $evaluation['costoPotencialCervix'];
+
+            if ($evaluation['tarifaReferencia'] > 0) {
+                $profile['serviciosConTarifa']++;
+            } else {
+                $profile['serviciosSinTarifa']++;
+            }
+
+            if ($evaluation['estadoTarifario'] === EstadoTarifario::SinTarifa->value) {
+                $profile['serviciosEstadoSinTarifa']++;
+            }
+
+            if ($evaluation['estadoTarifario'] === EstadoTarifario::RevisarPresentacion->value) {
+                $profile['serviciosRevisarPresentacion']++;
+            }
+
+            match ($evaluation['claseCosto']) {
+                ClaseCosto::Valido->value => $profile['costoValido'] += $cost,
+                ClaseCosto::ValidoConAlerta->value => $profile['costoValidoConAlerta'] += $cost,
+                ClaseCosto::PotencialNoSuma->value => $profile['costoPotencialNoSuma'] += $cost,
+                default => null,
+            };
+
+            if ($evaluation['sumaAlResumen'] === 'SI') {
+                $profile['serviciosQueSuman']++;
+            }
+
+            if ($evaluation['requiereRevision']) {
+                $profile['serviciosEnRevision']++;
+            }
+
+            if ($profile['ruta'] !== RutaCalculo::NoAsignable->value) {
+                $archivos[$record['archivoOrigen']]['costoPotencial'] = ($archivos[$record['archivoOrigen']]['costoPotencial'] ?? 0.0) + $cost;
+            }
+
+            unset($profile);
+        }
+
+        return ['profiles' => $profiles, 'archivos' => $archivos, 'camposDiligenciados' => $filledFields];
     }
 
     /**
      * @param  array<int, array{path: string, fileName: string}>  $files
      * @param  array<int, array<string, mixed>>  $profiles
-     * @return \Generator<int, array<string, int|float|string>, mixed, void>
+     * @param  array<string, array<string, int>>  $duplicateIndex
+     * @return \Generator<int, array<string, int|float|string|bool>, mixed, void>
      */
     public function detailRowsForFiles(
         array $files,
         array $profiles,
         ?ReferenciaRutaMatcher $referenciaRutaMatcher = null,
-        ?string $rutaEjecucion = null
+        ?string $rutaEjecucion = null,
+        array $duplicateIndex = []
     ): \Generator {
         $profilesByKey = [];
 
@@ -248,93 +397,98 @@ class SeguimientoRutaClassifier
             $profilesByKey[$profile['profileKey']] = $profile;
         }
 
-        foreach ($files as $file) {
-            foreach ($this->recordsForFile($file) as $record) {
-                $profile = $profilesByKey[$record['profileKey']] ?? null;
+        foreach ($this->evaluableRecordsForFiles($files) as $record) {
+            $profile = $profilesByKey[$record['profileKey']] ?? null;
 
-                if ($profile === null) {
-                    continue;
-                }
-
-                $reference = $referenciaRutaMatcher === null
-                    ? $this->defaultReferenceMatch($record)
-                    : $referenciaRutaMatcher->match(
-                        $record,
-                        $this->matchRoute($profile['rutaCalculo'], $rutaEjecucion)
-                    );
-
-                yield [
-                    'mesAtencion' => $record['mesAtencion'],
-                    'factura' => $record['factura'],
-                    'codPrestador' => $record['codPrestador'] ?? '',
-                    'tipoDocumentoIdentificacion' => $record['tipoDocumentoIdentificacion'],
-                    'numDocumentoIdentificacion' => $record['numDocumentoIdentificacion'],
-                    'sexo' => $profile['sexo'] ?? $record['sexo'] ?? '',
-                    'rutaFinal' => $profile['rutaFinal'],
-                    'rutaCalculo' => $profile['rutaCalculo'],
-                    'estado' => $profile['estado'],
-                    'motivoClasificacion' => $profile['motivoRevision'],
-                    'fechaAtencion' => $record['fechaAtencion'],
-                    'tipoServicio' => $record['tipoServicio'],
-                    'codigo' => $record['codigo'],
-                    'nombreServicio' => $record['nombreServicio'],
-                    'finalidadTecnologiaSalud' => $record['finalidadTecnologiaSalud'] ?? '',
-                    'causaMotivoAtencion' => $record['causaMotivoAtencion'] ?? '',
-                    'diagnosticoPrincipal' => $record['diagnosticoPrincipal'],
-                    'autorizacion' => $record['autorizacion'],
-                    'cantidad' => $record['cantidad'],
-                    'unidadMinDispensa' => $record['unidadMinDispensa'],
-                    'ambito' => $record['ambito'],
-                    'tipoUsuario' => $record['tipoUsuario'] ?? '',
-                    'codPaisOrigen' => $record['codPaisOrigen'] ?? '',
-                    'codPaisResidencia' => $record['codPaisResidencia'] ?? '',
-                    'incapacidad' => $record['incapacidad'] ?? '',
-                    'registroSiras' => $record['registroSiras'] ?? '',
-                    'consecutivoUsuario' => $record['consecutivoUsuario'] ?? '',
-                    'consecutivoRips' => $record['consecutivoRips'] ?? '',
-                    'idMipres' => $record['idMipres'] ?? '',
-                    'modalidadGrupoServicio' => $record['modalidadGrupoServicio'] ?? '',
-                    'grupoServicios' => $record['grupoServicios'] ?? '',
-                    'codServicio' => $record['codServicio'] ?? '',
-                    'viaIngresoServicio' => $record['viaIngresoServicio'] ?? '',
-                    'tipoMedicamento' => $record['tipoMedicamento'] ?? '',
-                    'tipoOtroServicio' => $record['tipoOtroServicio'] ?? '',
-                    'concentracionMedicamento' => $record['concentracionMedicamento'] ?? '',
-                    'unidadMedida' => $record['unidadMedida'] ?? '',
-                    'formaFarmaceutica' => $record['formaFarmaceutica'] ?? '',
-                    'diasTratamiento' => $record['diasTratamiento'] ?? '',
-                    'diagnosticoPrincipalCie11' => $record['diagnosticoPrincipalCie11'] ?? '',
-                    'nombreDiagnosticoPrincipalCie11' => $record['nombreDiagnosticoPrincipalCie11'] ?? '',
-                    'diagnosticosRelacionados' => $record['diagnosticosRelacionados'] ?? '',
-                    'diagnosticosRelacionadosCie11' => $record['diagnosticosRelacionadosCie11'] ?? '',
-                    'nombresDiagnosticosRelacionadosCie11' => $record['nombresDiagnosticosRelacionadosCie11'] ?? '',
-                    'tipoDiagnosticoPrincipal' => $record['tipoDiagnosticoPrincipal'] ?? '',
-                    'codComplicacion' => $record['codComplicacion'] ?? '',
-                    'codComplicacionCie11' => $record['codComplicacionCie11'] ?? '',
-                    'nombreComplicacionCie11' => $record['nombreComplicacionCie11'] ?? '',
-                    'valorUnitarioRips' => $record['valorUnitarioRips'] ?? '',
-                    'valorDispensacionRips' => $record['valorDispensacionRips'] ?? '',
-                    'conceptoRecaudo' => $record['conceptoRecaudo'] ?? '',
-                    'valorPagoModerador' => $record['valorPagoModerador'] ?? '',
-                    'numFevPagoModerador' => $record['numFevPagoModerador'] ?? '',
-                    'codigoVida' => $record['codigoVida'] ?? '',
-                    'computaEjecucion' => 'SI',
-                    'motivoExclusion' => '',
-                    'archivoOrigen' => $record['archivoOrigen'],
-                    ...$reference,
-                ];
+            if ($profile === null) {
+                continue;
             }
+
+            $evaluation = $this->evaluateRecord(
+                $record,
+                $profile,
+                $referenciaRutaMatcher,
+                $duplicateIndex,
+                $rutaEjecucion
+            );
+
+            yield [
+                'mesAtencion' => $record['mesAtencion'],
+                'factura' => $record['factura'],
+                'codPrestador' => $record['codPrestador'] ?? '',
+                'tipoDocumentoIdentificacion' => $record['tipoDocumentoIdentificacion'],
+                'numDocumentoIdentificacion' => $record['numDocumentoIdentificacion'],
+                'sexo' => $profile['sexo'] ?? $record['sexo'] ?? '',
+                'ruta' => $profile['ruta'],
+                'origenRuta' => $profile['origenRuta'],
+                'estadoClinico' => $profile['estadoClinico'],
+                'evidenciaSecundaria' => $profile['evidenciaSecundaria'],
+                'casoId' => $profile['casoId'],
+                'motivoClasificacion' => $profile['motivoClasificacion'],
+                'fechaAtencion' => $record['fechaAtencion'],
+                'tipoServicio' => $record['tipoServicio'],
+                'codigo' => $record['codigo'],
+                'nombreServicio' => $record['nombreServicio'],
+                'finalidadTecnologiaSalud' => $record['finalidadTecnologiaSalud'] ?? '',
+                'causaMotivoAtencion' => $record['causaMotivoAtencion'] ?? '',
+                'diagnosticoPrincipal' => $record['diagnosticoPrincipal'],
+                'autorizacion' => $record['autorizacion'],
+                'cantidad' => $record['cantidad'],
+                'unidadMinDispensa' => $record['unidadMinDispensa'],
+                'ambito' => $record['ambito'],
+                'tipoUsuario' => $record['tipoUsuario'] ?? '',
+                'codPaisOrigen' => $record['codPaisOrigen'] ?? '',
+                'codPaisResidencia' => $record['codPaisResidencia'] ?? '',
+                'incapacidad' => $record['incapacidad'] ?? '',
+                'registroSiras' => $record['registroSiras'] ?? '',
+                'consecutivoUsuario' => $record['consecutivoUsuario'] ?? '',
+                'consecutivoRips' => $record['consecutivoRips'] ?? '',
+                'idMipres' => $record['idMipres'] ?? '',
+                'modalidadGrupoServicio' => $record['modalidadGrupoServicio'] ?? '',
+                'grupoServicios' => $record['grupoServicios'] ?? '',
+                'codServicio' => $record['codServicio'] ?? '',
+                'viaIngresoServicio' => $record['viaIngresoServicio'] ?? '',
+                'tipoMedicamento' => $record['tipoMedicamento'] ?? '',
+                'tipoOtroServicio' => $record['tipoOtroServicio'] ?? '',
+                'concentracionMedicamento' => $record['concentracionMedicamento'] ?? '',
+                'unidadMedida' => $record['unidadMedida'] ?? '',
+                'formaFarmaceutica' => $record['formaFarmaceutica'] ?? '',
+                'diasTratamiento' => $record['diasTratamiento'] ?? '',
+                'diagnosticoPrincipalCie11' => $record['diagnosticoPrincipalCie11'] ?? '',
+                'nombreDiagnosticoPrincipalCie11' => $record['nombreDiagnosticoPrincipalCie11'] ?? '',
+                'diagnosticosRelacionados' => $record['diagnosticosRelacionados'] ?? '',
+                'diagnosticosRelacionadosCie11' => $record['diagnosticosRelacionadosCie11'] ?? '',
+                'nombresDiagnosticosRelacionadosCie11' => $record['nombresDiagnosticosRelacionadosCie11'] ?? '',
+                'tipoDiagnosticoPrincipal' => $record['tipoDiagnosticoPrincipal'] ?? '',
+                'codComplicacion' => $record['codComplicacion'] ?? '',
+                'codComplicacionCie11' => $record['codComplicacionCie11'] ?? '',
+                'nombreComplicacionCie11' => $record['nombreComplicacionCie11'] ?? '',
+                'valorUnitarioRips' => $record['valorUnitarioRips'] ?? '',
+                'valorDispensacionRips' => $record['valorDispensacionRips'] ?? '',
+                'conceptoRecaudo' => $record['conceptoRecaudo'] ?? '',
+                'valorPagoModerador' => $record['valorPagoModerador'] ?? '',
+                'numFevPagoModerador' => $record['numFevPagoModerador'] ?? '',
+                'codigoVida' => $record['codigoVida'] ?? '',
+                'computaEjecucion' => $evaluation['sumaAlResumen'],
+                'motivoExclusion' => $evaluation['motivoNoSuma'],
+                'archivoOrigen' => $record['archivoOrigen'],
+                'clinicalKey' => $this->clinicalKey($record) ?? '',
+                'usuarioJson' => $record['usuarioJson'],
+                'servicioJson' => $record['servicioJson'],
+                ...$evaluation,
+            ];
         }
     }
 
     /**
-     * @param  array<int, array{path: string, fileName: string}>  $files
+     * @param  array<int, array<string, mixed>>  $files
      * @return \Generator<int, array<string, int|string>, mixed, void>
      */
     public function controlRowsForFiles(array $files): \Generator
     {
         foreach ($files as $file) {
-            $factura = $this->invoiceFromJsonFile($file['path']);
+            $factura = $file['factura'] ?? $this->scalarFromJsonFile($file['path'], '/numFactura');
+            $condicion = $file['condicion'] ?? CondicionArchivo::Unico->value;
             $userCount = 0;
             $serviceCount = 0;
             $servicesWithoutDate = 0;
@@ -352,7 +506,8 @@ class SeguimientoRutaClassifier
                     $usuario,
                     $factura,
                     $file['fileName'],
-                    (string) $position
+                    (string) $position,
+                    $condicion
                 ) as $record) {
                     $serviceCount++;
 
@@ -369,6 +524,14 @@ class SeguimientoRutaClassifier
             }
 
             $observations = [];
+
+            if ($condicion === CondicionArchivo::ArchivoDuplicadoExcluido->value) {
+                $observations[] = 'Contenido idéntico a otro archivo cargado; no se procesa para evitar doble conteo.';
+            }
+
+            if ($condicion === CondicionArchivo::FacturaRepetidaConDiferencias->value) {
+                $observations[] = 'La misma factura llegó con contenido diferente; sus servicios no suman hasta definir el archivo válido.';
+            }
 
             if ($factura === '') {
                 $observations[] = 'Falta numFactura.';
@@ -396,24 +559,265 @@ class SeguimientoRutaClassifier
             yield [
                 'archivoOrigen' => $file['fileName'],
                 'factura' => $factura,
+                'hash' => $file['hash'] ?? (string) hash_file('sha256', $file['path']),
+                'tipoNota' => $file['tipoNota'] ?? '',
+                'numNota' => $file['numNota'] ?? '',
                 'userCount' => $userCount,
                 'serviceCount' => $serviceCount,
                 'servicesWithoutDate' => $servicesWithoutDate,
                 'firstMonth' => $months[0] ?? '',
                 'lastMonth' => $months === [] ? '' : $months[array_key_last($months)],
-                'estadoCargue' => $observations === [] ? 'PROCESADO' : 'REVISAR',
+                'condicion' => $condicion,
+                'relacionados' => $file['relacionados'] ?? '',
+                'estadoCargue' => match (true) {
+                    $condicion === CondicionArchivo::ArchivoDuplicadoExcluido->value => 'EXCLUIDO',
+                    $observations === [] => 'PROCESADO',
+                    default => 'REVISAR',
+                },
                 'observacion' => implode(' ', $observations),
             ];
         }
     }
 
     /**
-     * @param  array{path: string, fileName: string}  $file
+     * Decide si un servicio suma al resumen. Solo el costo con tarifa confiable,
+     * ruta asignada, mes de atención y sin copia exacta ni factura en conflicto
+     * suma; las alertas clínicas no excluyen el costo.
+     *
+     * @param  array<string, mixed>  $record
+     * @param  array<string, mixed>  $profile
+     * @param  array<string, array<string, int>>  $duplicateIndex
+     * @return array<string, mixed>
+     */
+    private function evaluateRecord(
+        array $record,
+        array $profile,
+        ?ReferenciaRutaMatcher $referenciaRutaMatcher,
+        array $duplicateIndex,
+        ?string $rutaEjecucion = null
+    ): array {
+        $isNotAssignable = $profile['ruta'] === RutaCalculo::NoAsignable->value;
+        $potentialProstata = '';
+        $potentialCervix = '';
+
+        if ($referenciaRutaMatcher === null) {
+            $reference = $this->defaultReferenceMatch($record);
+        } elseif ($isNotAssignable) {
+            $prostata = $referenciaRutaMatcher->match($record, RutaCalculo::Prostata->value);
+            $cervix = $referenciaRutaMatcher->match($record, RutaCalculo::Cervix->value);
+            $reference = $rutaEjecucion === RutaCalculo::Cervix->value ? $cervix : $prostata;
+            $potentialProstata = (float) $prostata['costoEstimadoReferencia'];
+            $potentialCervix = (float) $cervix['costoEstimadoReferencia'];
+        } else {
+            $reference = $referenciaRutaMatcher->match($record, $profile['ruta']);
+        }
+
+        $duplicidad = $this->duplicityState($record, $duplicateIndex);
+        $motivoNoSuma = match (true) {
+            $record['condicionArchivo'] === CondicionArchivo::FacturaRepetidaConDiferencias->value => CondicionArchivo::FacturaRepetidaConDiferencias->value,
+            $duplicidad === EstadoDuplicidad::DuplicadoExacto->value => EstadoDuplicidad::DuplicadoExacto->value,
+            $isNotAssignable && in_array(EstadoClinico::DobleRuta->value, $profile['estadosClinicos'], true) => EstadoClinico::DobleRuta->value,
+            $isNotAssignable => RutaCalculo::NoAsignable->value,
+            in_array(EstadoClinico::SinFecha->value, $profile['estadosClinicos'], true) => EstadoClinico::SinFecha->value,
+            $reference['estadoTarifario'] !== EstadoTarifario::ConTarifa->value => (string) $reference['estadoTarifario'],
+            default => '',
+        };
+        $hasAlert = $profile['estadosClinicos'] !== [EstadoClinico::Correcto->value]
+            || in_array($duplicidad, [
+                EstadoDuplicidad::PosibleDobleFacturacion->value,
+                EstadoDuplicidad::RepeticionMismaFactura->value,
+            ], true);
+        $hasPotentialCost = (float) $reference['costoEstimadoReferencia'] > 0
+            || (float) ($potentialProstata ?: 0) > 0
+            || (float) ($potentialCervix ?: 0) > 0;
+
+        return [
+            ...$reference,
+            'estadoDuplicidad' => $duplicidad,
+            'condicionArchivo' => $record['condicionArchivo'],
+            'sumaAlResumen' => $motivoNoSuma === '' ? 'SI' : 'NO',
+            'motivoNoSuma' => $motivoNoSuma,
+            'claseCosto' => match (true) {
+                $motivoNoSuma === '' && $hasAlert => ClaseCosto::ValidoConAlerta->value,
+                $motivoNoSuma === '' => ClaseCosto::Valido->value,
+                $hasPotentialCost => ClaseCosto::PotencialNoSuma->value,
+                default => ClaseCosto::SinCosto->value,
+            },
+            'costoPotencialProstata' => $potentialProstata,
+            'costoPotencialCervix' => $potentialCervix,
+            'requiereRevision' => $isNotAssignable
+                || $profile['estadosClinicos'] !== [EstadoClinico::Correcto->value]
+                || in_array($duplicidad, [
+                    EstadoDuplicidad::DuplicadoExacto->value,
+                    EstadoDuplicidad::PosibleDobleFacturacion->value,
+                ], true)
+                || $record['condicionArchivo'] !== CondicionArchivo::Unico->value
+                || $reference['estadoTarifario'] === EstadoTarifario::RevisarPresentacion->value,
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     * @param  array<string, array<string, int>>  $duplicateIndex
+     */
+    private function duplicityState(array $record, array $duplicateIndex): string
+    {
+        if ($record['esDuplicadoExacto']) {
+            return EstadoDuplicidad::DuplicadoExacto->value;
+        }
+
+        $key = $this->clinicalKey($record);
+        $invoices = $key === null ? [] : ($duplicateIndex[$key] ?? []);
+
+        return match (true) {
+            count($invoices) > 1 => EstadoDuplicidad::PosibleDobleFacturacion->value,
+            array_sum($invoices) > 1 => EstadoDuplicidad::RepeticionMismaFactura->value,
+            default => EstadoDuplicidad::Ninguno->value,
+        };
+    }
+
+    /**
+     * Llave clínica de comparación entre servicios del mismo paciente. Sin
+     * documento no se compara, porque no puede garantizarse que sea la misma persona.
+     *
+     * @param  array<string, mixed>  $record
+     */
+    private function clinicalKey(array $record): ?string
+    {
+        if ($record['hasMissingIdentity']) {
+            return null;
+        }
+
+        return implode('|', [
+            strtoupper((string) $record['tipoDocumentoIdentificacion']),
+            $record['numDocumentoIdentificacion'],
+            $record['fechaAtencion'],
+            $record['tipoServicio'],
+            $record['codigo'],
+            (string) $record['cantidad'],
+        ]);
+    }
+
+    /**
+     * Recorre los registros marcando como copia exacta la segunda aparición de
+     * un servicio idéntico (todos sus campos, incluido el consecutivo) del mismo
+     * usuario dentro del mismo archivo.
+     *
+     * @param  array<int, array{path: string, fileName: string}>  $files
+     * @return \Generator<int, array<string, mixed>, mixed, void>
+     */
+    private function evaluableRecordsForFiles(array $files): \Generator
+    {
+        foreach ($files as $file) {
+            $seen = [];
+
+            foreach ($this->recordsForFile($file) as $record) {
+                $exactKey = implode('|', [
+                    $record['posicionUsuario'],
+                    $record['tipoServicio'],
+                    $record['huellaServicio'],
+                ]);
+                $record['esDuplicadoExacto'] = isset($seen[$exactKey]);
+                $seen[$exactKey] = true;
+
+                yield $record;
+            }
+        }
+    }
+
+    /**
+     * Resuelve la ruta de cálculo de un paciente-mes: primero por diagnóstico
+     * principal C61/C53, luego por sexo. Nunca usa el sexo para desempatar una
+     * doble ruta.
+     *
+     * @param  array<string, mixed>  $profile
+     * @return array<string, mixed>
+     */
+    private function resolveRoute(array $profile): array
+    {
+        $hasProstate = isset($profile['routeEvidence']['C61']);
+        $hasCervix = isset($profile['routeEvidence']['C53']);
+        $sexo = (string) ($profile['sexo'] ?? '');
+        $estados = [];
+
+        if ($hasProstate && $hasCervix) {
+            $ruta = RutaCalculo::NoAsignable;
+            $origen = OrigenRuta::Ninguno;
+            $estados[] = EstadoClinico::DobleRuta;
+            $motivos = ['Se detectaron diagnósticos C61 y C53 en el mismo mes; no se asigna ruta hasta resolverlo.'];
+        } elseif ($hasProstate || $hasCervix) {
+            $ruta = $hasProstate ? RutaCalculo::Prostata : RutaCalculo::Cervix;
+            $origen = OrigenRuta::Diagnostico;
+            $motivos = [$hasProstate ? 'Diagnóstico C61 detectado.' : 'Diagnóstico C53 detectado.'];
+            $expectedSex = $hasProstate ? 'M' : 'F';
+
+            if (in_array($sexo, ['M', 'F'], true) && $sexo !== $expectedSex) {
+                $estados[] = EstadoClinico::InconsistenciaSexoRuta;
+                $motivos[] = sprintf(
+                    'Sexo %s incompatible con la ruta del diagnóstico; se conserva la ruta %s.',
+                    $sexo,
+                    $ruta->value
+                );
+            }
+        } elseif (in_array($sexo, ['M', 'F'], true)) {
+            $ruta = $sexo === 'M' ? RutaCalculo::Prostata : RutaCalculo::Cervix;
+            $origen = OrigenRuta::Sexo;
+            $estados[] = EstadoClinico::SinDiagnosticoRuta;
+            $motivos = ['No se detectó diagnóstico C61 ni C53 en el mes; ruta asignada por sexo.'];
+        } else {
+            $ruta = RutaCalculo::NoAsignable;
+            $origen = OrigenRuta::Ninguno;
+            $estados[] = EstadoClinico::SexoNoReconocido;
+            $estados[] = EstadoClinico::SinDiagnosticoRuta;
+            $motivos = ['No se detectó diagnóstico C61 ni C53 y el sexo no permite asignar una ruta.'];
+        }
+
+        if ($profile['hasMissingIdentity']) {
+            $estados[] = EstadoClinico::SinDocumento;
+            $motivos[] = 'Falta tipo o número de documento.';
+        }
+
+        if ($profile['hasMissingDate']) {
+            $estados[] = EstadoClinico::SinFecha;
+            $motivos[] = 'No se pudo asignar el registro a un mes de atención.';
+        }
+
+        $estadosClinicos = $estados === []
+            ? [EstadoClinico::Correcto->value]
+            : array_map(static fn (EstadoClinico $estado): string => $estado->value, $estados);
+
+        return [
+            'ruta' => $ruta->value,
+            'origenRuta' => $origen->value,
+            'estadosClinicos' => $estadosClinicos,
+            'estadoClinico' => implode(' + ', $estadosClinicos),
+            'motivoClasificacion' => implode(' ', $motivos),
+            'casoId' => $this->caseId($profile['profileKey']),
+        ];
+    }
+
+    /**
+     * Identificador interno y estable del paciente-mes, igual en ambas
+     * ejecuciones. No es un documento: sin identificación usa factura y posición.
+     */
+    private function caseId(string $profileKey): string
+    {
+        $parts = explode('|', $profileKey);
+
+        if ($parts[0] === 'SIN_IDENTIFICACION') {
+            return implode('-', ['SIN_DOCUMENTO', $parts[1], 'U'.((int) $parts[2] + 1), $parts[3]]);
+        }
+
+        return implode('-', array_slice($parts, 1));
+    }
+
+    /**
+     * @param  array<string, mixed>  $file
      * @return \Generator<int, array<string, int|float|string|bool>, mixed, void>
      */
     private function recordsForFile(array $file): \Generator
     {
-        $factura = $this->invoiceFromJsonFile($file['path']);
+        $factura = $file['factura'] ?? $this->scalarFromJsonFile($file['path'], '/numFactura');
 
         foreach ($this->usersForFile($file['path']) as $position => $usuario) {
             if (! is_array($usuario)) {
@@ -424,7 +828,8 @@ class SeguimientoRutaClassifier
                 $usuario,
                 $factura,
                 $file['fileName'],
-                (string) $position
+                (string) $position,
+                $file['condicion'] ?? CondicionArchivo::Unico->value
             ) as $record) {
                 yield $record;
             }
@@ -453,7 +858,8 @@ class SeguimientoRutaClassifier
         array $usuario,
         string $factura,
         string $archivoOrigen,
-        string $position
+        string $position,
+        string $condicionArchivo = 'UNICO'
     ): \Generator {
         $servicios = $usuario['servicios'] ?? [];
 
@@ -505,6 +911,7 @@ class SeguimientoRutaClassifier
         $codPrestadorUsuario = $this->stringValue($usuario['codPrestador'] ?? null);
         $hasMissingIdentity = $tipoDocumento === '' || $documento === '';
         $hospitalRanges = $this->hospitalizationRanges($servicios['hospitalizacion'] ?? []);
+        $usuarioJson = $this->scalarFields($usuario);
 
         foreach ($servicios as $tipoServicio => $listaServicios) {
             if (! is_array($listaServicios)) {
@@ -536,6 +943,9 @@ class SeguimientoRutaClassifier
                     ),
                     'factura' => $factura,
                     'archivoOrigen' => $archivoOrigen,
+                    'condicionArchivo' => $condicionArchivo,
+                    'posicionUsuario' => $position,
+                    'huellaServicio' => md5(json_encode($servicio, JSON_PARTIAL_OUTPUT_ON_ERROR) ?: ''),
                     'tipoDocumentoIdentificacion' => $tipoDocumento,
                     'numDocumentoIdentificacion' => $documento,
                     'sexo' => $sexo,
@@ -571,6 +981,7 @@ class SeguimientoRutaClassifier
                     ),
                     'diagnosticoPrincipal' => $diagnostico,
                     'routeEvidence' => $this->routeEvidence($diagnostico),
+                    'evidenciaSecundaria' => $this->secondaryEvidence($diagnostico, $servicio),
                     'fechaAtencion' => $fechaAtencion,
                     'autorizacion' => $this->firstStringValue(
                         $servicio,
@@ -668,6 +1079,8 @@ class SeguimientoRutaClassifier
                     ),
                     'codigoVida' => $this->stringValue($servicio['codigoVIDA'] ?? null),
                     'valorRips' => $this->reportedServiceValue($tipoServicio, $servicio),
+                    'usuarioJson' => $usuarioJson,
+                    'servicioJson' => $this->scalarFields($servicio),
                 ];
             }
         }
@@ -694,21 +1107,31 @@ class SeguimientoRutaClassifier
             'incapacidad' => $record['incapacidad'] ?? '',
             'registroSiras' => $record['registroSiras'] ?? '',
             'consecutivoUsuario' => $record['consecutivoUsuario'] ?? '',
+            'usuarioJson' => $record['usuarioJson'] ?? [],
+            'serviciosEnRevision' => 0,
             'facturas' => [],
             'routeEvidence' => [],
             'diagnosticosReportados' => [],
+            'evidenciaSecundaria' => [],
             'serviceCount' => 0,
             'serviciosConTarifa' => 0,
             'serviciosSinTarifa' => 0,
+            'serviciosQueSuman' => 0,
+            'serviciosEstadoSinTarifa' => 0,
+            'serviciosRevisarPresentacion' => 0,
             'valorRipsReportado' => 0.0,
             'costoEstimadoReferencia' => 0.0,
+            'costoValido' => 0.0,
+            'costoValidoConAlerta' => 0.0,
+            'costoPotencialNoSuma' => 0.0,
+            'costoPotencialProstata' => 0.0,
+            'costoPotencialCervix' => 0.0,
             'serviceCounts' => array_fill_keys(self::SERVICE_TYPES, 0),
             'primeraFechaAtencion' => '',
             'ultimaFechaAtencion' => '',
             'hasMissingIdentity' => $record['hasMissingIdentity'],
             'hasIdentityMismatch' => $record['hasIdentityMismatch'] ?? false,
             'hasMissingDate' => $record['hasMissingDate'],
-            'alertasClinicas' => [],
         ];
     }
 
@@ -729,86 +1152,18 @@ class SeguimientoRutaClassifier
     }
 
     /**
-     * @param  array<int, string>  $diagnoses
+     * Campos escalares tal como vienen en el JSON, para exportarlos sin
+     * transformarlos ni traducirlos.
+     *
+     * @param  array<string, mixed>  $data
+     * @return array<string, int|float|string|bool|null>
      */
-    private function routeForEvidence(array $diagnoses): string
+    private function scalarFields(array $data): array
     {
-        $hasProstate = in_array('C61', $diagnoses, true);
-        $hasCervix = in_array('C53', $diagnoses, true);
-
-        if ($hasProstate && $hasCervix) {
-            return 'DOBLE_RUTA_REVISAR';
-        }
-
-        if ($hasProstate) {
-            return 'PROSTATA';
-        }
-
-        if ($hasCervix) {
-            return 'CERVIX';
-        }
-
-        return 'SIN_RUTA_DEFINIDA';
-    }
-
-    private function routeForSex(string $sexo): string
-    {
-        return match (strtoupper(trim($sexo))) {
-            'M' => 'PROSTATA',
-            'F' => 'CERVIX',
-            default => 'SIN_RUTA_DEFINIDA',
-        };
-    }
-
-    /**
-     * @param  array<string, mixed>  $profile
-     */
-    private function profileStatus(array $profile): string
-    {
-        if (in_array($profile['rutaFinal'], ['DOBLE_RUTA_REVISAR', 'SIN_RUTA_DEFINIDA'], true)) {
-            return 'REVISAR';
-        }
-
-        if ($profile['hasMissingIdentity'] || $profile['hasMissingDate']) {
-            return 'REVISAR';
-        }
-
-        return 'LISTO';
-    }
-
-    /**
-     * @param  array<string, mixed>  $profile
-     */
-    private function reviewReason(array $profile): string
-    {
-        $reasons = match ($profile['rutaFinal']) {
-            'PROSTATA' => ['Diagnóstico C61 detectado.'],
-            'CERVIX' => ['Diagnóstico C53 detectado.'],
-            'DOBLE_RUTA_REVISAR' => ['Se detectaron diagnósticos C61 y C53 en el mismo mes.'],
-            default => ['No se detectó diagnóstico C61 ni C53 en el mes.'],
-        };
-
-        if ($profile['hasMissingIdentity']) {
-            $reasons[] = 'Falta tipo o número de documento.';
-        }
-
-        if ($profile['hasMissingDate']) {
-            $reasons[] = 'No se pudo asignar el registro a un mes de atención.';
-        }
-
-        return implode(' ', $reasons);
-    }
-
-    /**
-     * @param  array<string, int|float|string|bool>  $record
-     */
-    private function matchRoute(string $rutaFinal, ?string $rutaEjecucion): string
-    {
-        if (in_array($rutaFinal, ['PROSTATA', 'CERVIX'], true)) {
-            return $rutaFinal;
-        }
-
-        return $rutaEjecucion ?? $rutaFinal;
+        return array_filter(
+            $data,
+            static fn (mixed $value): bool => ! is_array($value) && ! is_object($value)
+        );
     }
 
     /**
@@ -820,6 +1175,43 @@ class SeguimientoRutaClassifier
             $servicio,
             ['codDiagnosticoPrincipal', 'codDiagnosticoPrincipalCIE11']
         ));
+    }
+
+    /**
+     * @param  array<string, mixed>  $servicio
+     * @return array<int, string>
+     */
+    private function secondaryEvidence(string $diagnosticoPrincipal, array $servicio): array
+    {
+        $evidence = [];
+
+        if ($this->startsWithAny($diagnosticoPrincipal, self::PRINCIPAL_SECONDARY_PREFIXES)) {
+            $evidence[] = $diagnosticoPrincipal;
+        }
+
+        foreach (self::RELATED_DIAGNOSIS_FIELDS as $field) {
+            $code = strtoupper($this->stringValue($servicio[$field] ?? null));
+
+            if ($this->startsWithAny($code, self::SECONDARY_EVIDENCE_PREFIXES)) {
+                $evidence[] = $code;
+            }
+        }
+
+        return array_values(array_unique($evidence));
+    }
+
+    /**
+     * @param  array<int, string>  $prefixes
+     */
+    private function startsWithAny(string $value, array $prefixes): bool
+    {
+        foreach ($prefixes as $prefix) {
+            if (str_starts_with($value, $prefix)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -876,19 +1268,19 @@ class SeguimientoRutaClassifier
         return $matches[1].'-'.$matches[2];
     }
 
-    private function invoiceFromJsonFile(string $path): string
+    private function scalarFromJsonFile(string $path, string $pointer): string
     {
         try {
-            $facturas = Items::fromFile(
+            $values = Items::fromFile(
                 $path,
                 [
-                    'pointer' => '/numFactura',
+                    'pointer' => $pointer,
                     'decoder' => new ExtJsonDecoder(true),
                 ]
             );
 
-            foreach ($facturas as $factura) {
-                return $this->stringValue($factura);
+            foreach ($values as $value) {
+                return $this->stringValue($value);
             }
         } catch (\Throwable) {
             return '';
@@ -991,7 +1383,7 @@ class SeguimientoRutaClassifier
 
     /**
      * @param  array<string, int|float|string|bool>  $record
-     * @return array<string, float|int|string>
+     * @return array<string, float|int|string|bool>
      */
     private function defaultReferenceMatch(array $record): array
     {
@@ -999,12 +1391,17 @@ class SeguimientoRutaClassifier
             'descripcionOficial' => '',
             'nombreNotaTecnica' => '',
             'encontradoEnNotaTecnica' => false,
+            'enNotaTecnica' => false,
             'catalogoCruce' => '',
             'grupoTecnico' => '',
             'valorRipsReportado' => (float) $record['valorRips'],
             'tarifaReferencia' => 0.0,
             'costoEstimadoReferencia' => 0.0,
             'estadoCruce' => 'SIN_CATALOGO_ACTIVO',
+            'estadoTarifario' => EstadoTarifario::SinTarifa->value,
+            'fuenteTarifa' => FuenteTarifa::Ninguna->value,
+            'formaCruce' => FormaCruce::SinCruce->value,
+            'candidatosPresentacion' => '',
             'cum' => '',
             'principioActivo' => '',
             'atc' => '',

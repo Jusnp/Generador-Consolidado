@@ -36,6 +36,10 @@ class ReferenciaRutaMatcherTest extends TestCase
         $this->assertSame(12500.0, $match['tarifaReferencia']);
         $this->assertSame(25000.0, $match['costoEstimadoReferencia']);
         $this->assertSame('CRUCE_COMPLETO', $match['estadoCruce']);
+        $this->assertSame('CON_TARIFA', $match['estadoTarifario']);
+        $this->assertSame('NOTA_TECNICA', $match['fuenteTarifa']);
+        $this->assertSame('CODIGO_EXACTO', $match['formaCruce']);
+        $this->assertTrue($match['enNotaTecnica']);
     }
 
     public function test_identifies_cum_and_oncology_scheme_without_inventing_a_drug_rate(): void
@@ -75,8 +79,12 @@ class ReferenciaRutaMatcherTest extends TestCase
         $this->assertSame('Pembrolizumab', $match['principioActivo']);
         $this->assertSame('L01XC18', $match['atc']);
         $this->assertSame('PEMBROLIZUMAB', $match['esquemaOncologico']);
-        $this->assertSame('Pembrolizumab', $match['nombreNotaTecnica']);
+        $this->assertSame('', $match['nombreNotaTecnica']);
         $this->assertFalse($match['encontradoEnNotaTecnica']);
+        $this->assertFalse($match['enNotaTecnica']);
+        $this->assertSame('SIN_TARIFA', $match['estadoTarifario']);
+        $this->assertSame('NINGUNA', $match['fuenteTarifa']);
+        $this->assertSame('SIN_CRUCE', $match['formaCruce']);
         $this->assertSame(0.0, $match['tarifaReferencia']);
         $this->assertSame(0.0, $match['costoEstimadoReferencia']);
         $this->assertSame('MEDICAMENTO_CUM_IDENTIFICADO', $match['estadoCruce']);
@@ -111,6 +119,8 @@ class ReferenciaRutaMatcherTest extends TestCase
         $this->assertSame(12500.0, $match['tarifaReferencia']);
         $this->assertSame(25000.0, $match['costoEstimadoReferencia']);
         $this->assertSame('CRUCE_TECNICO', $match['estadoCruce']);
+        $this->assertSame('CUM_EXACTO', $match['formaCruce']);
+        $this->assertSame('NOTA_TECNICA', $match['fuenteTarifa']);
     }
 
     public function test_uses_administrative_dispensation_when_medication_is_not_in_the_technical_note(): void
@@ -145,6 +155,10 @@ class ReferenciaRutaMatcherTest extends TestCase
         $this->assertSame(4900000.0, $match['costoEstimadoReferencia']);
         $this->assertSame('MEDICAMENTO_CON_DISPENSACION', $match['estadoCruce']);
         $this->assertSame('TARIFA_DISPENSACION_ADMINISTRATIVA', $match['tipoValorReferencia']);
+        $this->assertSame('CON_TARIFA', $match['estadoTarifario']);
+        $this->assertSame('DISPENSACION', $match['fuenteTarifa']);
+        $this->assertSame('DOCUMENTO_CUM_MES', $match['formaCruce']);
+        $this->assertFalse($match['enNotaTecnica']);
     }
 
     public function test_falls_back_to_principio_activo_and_paracetamol_alias_when_cum_differs(): void
@@ -175,9 +189,11 @@ class ReferenciaRutaMatcherTest extends TestCase
         $this->assertSame('ACETAMINOFEN', $match['principioActivo']);
         $this->assertSame(800.0, $match['tarifaReferencia']);
         $this->assertSame('CRUCE_TECNICO', $match['estadoCruce']);
+        $this->assertSame('PRINCIPIO_TARIFA_UNICA', $match['formaCruce']);
+        $this->assertSame('CON_TARIFA', $match['estadoTarifario']);
     }
 
-    public function test_uses_cum_principio_to_match_nt_and_fills_name_when_nt_missing(): void
+    public function test_uses_cum_principio_to_match_nt_and_leaves_nt_name_empty_without_match(): void
     {
         $matcher = new ReferenciaRutaMatcher(new Collection([
             $this->catalog('MEDICAMENTOS_CUM', [
@@ -233,9 +249,159 @@ class ReferenciaRutaMatcherTest extends TestCase
             'valorRips' => 0,
         ], 'CERVIX');
 
-        $this->assertSame('LACTATO DE SODIO', $fallback['nombreNotaTecnica']);
+        $this->assertSame('', $fallback['nombreNotaTecnica']);
+        $this->assertSame('SIN_TARIFA', $fallback['estadoTarifario']);
         $this->assertFalse($fallback['encontradoEnNotaTecnica']);
         $this->assertSame('MEDICAMENTO_CUM_IDENTIFICADO', $fallback['estadoCruce']);
+    }
+
+    public function test_ambiguous_presentation_by_principio_is_not_priced(): void
+    {
+        $matcher = new ReferenciaRutaMatcher(new Collection([
+            $this->apalutamidaNote(),
+        ]));
+
+        $match = $matcher->match([
+            'codigo' => '1A1027731000100',
+            'tipoServicio' => 'medicamentos',
+            'cantidad' => 120,
+            'nombreServicio' => 'APALUTAMIDA',
+            'valorRips' => 0,
+        ], 'PROSTATA');
+
+        $this->assertSame('REVISAR_PRESENTACION', $match['estadoTarifario']);
+        $this->assertSame('PRINCIPIO_AMBIGUO', $match['formaCruce']);
+        $this->assertSame('NINGUNA', $match['fuenteTarifa']);
+        $this->assertSame(0.0, $match['tarifaReferencia']);
+        $this->assertSame(0.0, $match['costoEstimadoReferencia']);
+        $this->assertSame('', $match['nombreNotaTecnica']);
+        $this->assertTrue($match['enNotaTecnica']);
+        $this->assertStringContainsString('APALUTAMIDA 240 MG', $match['candidatosPresentacion']);
+        $this->assertStringContainsString('APALUTAMIDA 60 MG', $match['candidatosPresentacion']);
+    }
+
+    public function test_exact_cum_wins_over_an_ambiguous_principio(): void
+    {
+        $matcher = new ReferenciaRutaMatcher(new Collection([
+            $this->apalutamidaNote(),
+        ]));
+
+        $match = $matcher->match([
+            'codigo' => '20137853-1',
+            'tipoServicio' => 'medicamentos',
+            'cantidad' => 120,
+            'nombreServicio' => 'APALUTAMIDA',
+            'valorRips' => 0,
+        ], 'PROSTATA');
+
+        $this->assertSame('CON_TARIFA', $match['estadoTarifario']);
+        $this->assertSame('CUM_EXACTO', $match['formaCruce']);
+        $this->assertSame(87967.0, $match['tarifaReferencia']);
+        $this->assertSame('APALUTAMIDA 60 MG TABLETA RECUBIERTA', $match['nombreNotaTecnica']);
+    }
+
+    public function test_principio_with_a_single_rate_across_presentations_is_priced(): void
+    {
+        $matcher = new ReferenciaRutaMatcher(new Collection([
+            $this->catalog('NOTA_MEDICAMENTOS', [
+                $this->item('20149223-1', 'CERVIX', 'MEDICAMENTO_NT', 'BEVACIZUMAB 100 MG SOLUCION INYECTABLE', 612563.0, ['principio_activo' => 'BEVACIZUMAB']),
+                $this->item('20149223-2', 'CERVIX', 'MEDICAMENTO_NT', 'BEVACIZUMAB 400 MG SOLUCION INYECTABLE', 612563.0, ['principio_activo' => 'BEVACIZUMAB']),
+            ]),
+        ]));
+
+        $match = $matcher->match([
+            'codigo' => '1B1018961009101',
+            'tipoServicio' => 'medicamentos',
+            'cantidad' => 2,
+            'nombreServicio' => 'BEVACIZUMAB',
+            'valorRips' => 0,
+        ], 'CERVIX');
+
+        $this->assertSame('CON_TARIFA', $match['estadoTarifario']);
+        $this->assertSame('PRINCIPIO_TARIFA_UNICA', $match['formaCruce']);
+        $this->assertSame(1225126.0, $match['costoEstimadoReferencia']);
+    }
+
+    public function test_dispensation_prices_a_medication_whose_principio_is_ambiguous(): void
+    {
+        $matcher = new ReferenciaRutaMatcher(new Collection([
+            $this->apalutamidaNote(),
+            $this->catalog('DISPENSACION_PROSTATA', [
+                $this->item('1A1027731000100', 'PROSTATA', 'DISPENSACION_ADMINISTRATIVA', 'Apalutamida dispensada', 80000.0, [
+                    'documento_paciente' => '100',
+                    'fecha_dispensacion' => '2026-07-03',
+                ]),
+            ]),
+        ]));
+
+        $match = $matcher->match([
+            'codigo' => '1A1027731000100',
+            'tipoServicio' => 'medicamentos',
+            'cantidad' => 2,
+            'numDocumentoIdentificacion' => '100',
+            'fechaAtencion' => '2026-07-05 10:00',
+            'nombreServicio' => 'APALUTAMIDA',
+            'valorRips' => 0,
+        ], 'PROSTATA');
+
+        $this->assertSame('CON_TARIFA', $match['estadoTarifario']);
+        $this->assertSame('DISPENSACION', $match['fuenteTarifa']);
+        $this->assertSame(160000.0, $match['costoEstimadoReferencia']);
+    }
+
+    public function test_complementary_medication_is_priced_as_complement_outside_the_technical_note(): void
+    {
+        $matcher = new ReferenciaRutaMatcher(new Collection([
+            $this->catalog('NOTA_PROSTATA', [
+                $this->item('20052945-1', 'PROSTATA', 'MEDICAMENTOS_NUEVOS', 'Denosumab', 1355147.0, ['periodo_precio' => '2026-04']),
+            ]),
+        ]));
+
+        $match = $matcher->match([
+            'codigo' => '20052945-1',
+            'tipoServicio' => 'medicamentos',
+            'cantidad' => 1,
+            'nombreServicio' => 'DENOSUMAB',
+            'valorRips' => 0,
+        ], 'PROSTATA');
+
+        $this->assertSame('CON_TARIFA', $match['estadoTarifario']);
+        $this->assertSame('COMPLEMENTO', $match['fuenteTarifa']);
+        $this->assertSame('CUM_EXACTO', $match['formaCruce']);
+        $this->assertFalse($match['enNotaTecnica']);
+        $this->assertSame('', $match['nombreNotaTecnica']);
+        $this->assertSame(1355147.0, $match['costoEstimadoReferencia']);
+    }
+
+    public function test_medication_without_any_rate_source_is_kept_without_a_rate(): void
+    {
+        $matcher = new ReferenciaRutaMatcher(new Collection([
+            $this->catalog('NOTA_MEDICAMENTOS', [
+                $this->item('19935327-1', 'PROSTATA', 'MEDICAMENTO_NT', 'BICALUTAMIDA 50 MG TABLETA', 12500.0, ['principio_activo' => 'BICALUTAMIDA']),
+            ]),
+        ]));
+
+        $match = $matcher->match([
+            'codigo' => '19979158-2',
+            'tipoServicio' => 'medicamentos',
+            'cantidad' => 3,
+            'nombreServicio' => 'SODIO CLORURO',
+            'valorRips' => 0,
+        ], 'PROSTATA');
+
+        $this->assertSame('SIN_TARIFA', $match['estadoTarifario']);
+        $this->assertSame('NINGUNA', $match['fuenteTarifa']);
+        $this->assertSame('SIN_CRUCE', $match['formaCruce']);
+        $this->assertFalse($match['enNotaTecnica']);
+        $this->assertSame(0.0, $match['costoEstimadoReferencia']);
+    }
+
+    private function apalutamidaNote(): CatalogoReferencia
+    {
+        return $this->catalog('NOTA_MEDICAMENTOS', [
+            $this->item('20254463-1', 'PROSTATA', 'MEDICAMENTO_NT', 'APALUTAMIDA 240 MG TABLETA RECUBIERTA', 339686.0, ['principio_activo' => 'APALUTAMIDA']),
+            $this->item('20137853-1', 'PROSTATA', 'MEDICAMENTO_NT', 'APALUTAMIDA 60 MG TABLETA RECUBIERTA', 87967.0, ['principio_activo' => 'APALUTAMIDA']),
+        ]);
     }
 
     /**

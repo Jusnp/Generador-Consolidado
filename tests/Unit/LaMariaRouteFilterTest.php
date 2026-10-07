@@ -12,12 +12,12 @@ class LaMariaRouteFilterTest extends TestCase
     {
         $classifier = new SeguimientoRutaClassifier;
         $profiles = [
-            ['rutaFinal' => 'PROSTATA', 'rutaCalculo' => 'PROSTATA', 'profileKey' => 'a'],
-            ['rutaFinal' => 'CERVIX', 'rutaCalculo' => 'CERVIX', 'profileKey' => 'b'],
-            ['rutaFinal' => 'DOBLE_RUTA_REVISAR', 'rutaCalculo' => 'PROSTATA', 'profileKey' => 'c'],
-            ['rutaFinal' => 'DOBLE_RUTA_REVISAR', 'rutaCalculo' => 'CERVIX', 'profileKey' => 'd'],
-            ['rutaFinal' => 'SIN_RUTA_DEFINIDA', 'rutaCalculo' => 'PROSTATA', 'profileKey' => 'e'],
-            ['rutaFinal' => 'SIN_RUTA_DEFINIDA', 'rutaCalculo' => 'CERVIX', 'profileKey' => 'f'],
+            ['ruta' => 'PROSTATA', 'origenRuta' => 'DIAGNOSTICO', 'profileKey' => 'a'],
+            ['ruta' => 'CERVIX', 'origenRuta' => 'DIAGNOSTICO', 'profileKey' => 'b'],
+            ['ruta' => 'NO_ASIGNABLE', 'origenRuta' => 'NINGUNO', 'profileKey' => 'c'],
+            ['ruta' => 'NO_ASIGNABLE', 'origenRuta' => 'NINGUNO', 'profileKey' => 'd'],
+            ['ruta' => 'PROSTATA', 'origenRuta' => 'SEXO', 'profileKey' => 'e'],
+            ['ruta' => 'CERVIX', 'origenRuta' => 'SEXO', 'profileKey' => 'f'],
         ];
 
         $prostata = $classifier->profilesForExecutionRoute(
@@ -29,7 +29,7 @@ class LaMariaRouteFilterTest extends TestCase
             LaMariaPrograma::RUTA_CERVIX
         );
 
-        $this->assertSame(['a', 'c', 'e'], array_column($prostata, 'profileKey'));
-        $this->assertSame(['b', 'd', 'f'], array_column($cervix, 'profileKey'));
+        $this->assertSame(['a', 'e'], array_column($prostata, 'profileKey'));
+        $this->assertSame(['b', 'f'], array_column($cervix, 'profileKey'));
     }
 }

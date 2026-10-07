@@ -316,45 +316,59 @@ class CatalogoReferenciaImporter
                 $normalisedName === 'RESUMEN' => $this->importTechnicalSummary($rows, $catalogo, $route),
                 $normalisedName === 'HX' => $this->importHospitalizationReference($rows, $catalogo, $route),
                 str_contains($normalisedName, 'TRANSPORTE') => $this->importTransportAndLodgingReference($rows, $catalogo, $route),
-                str_contains($normalisedName, 'MEDICAMENTOSNUEVOS') => $this->importNewProstateMedicines($rows, $catalogo),
+                str_contains($normalisedName, 'MEDICAMENTOSNUEVOS') => $this->importComplementaryMedicines($rows, $catalogo, $route),
                 $normalisedName === 'POBLACION' => $this->importPopulation($rows, $catalogo, $route),
                 default => 0,
             };
         });
     }
 
-    private function importNewProstateMedicines(iterable $rows, CatalogoReferencia $catalogo): int
+    /**
+     * Importa la hoja "Medicamentos nuevos" con la ruta del catálogo que se
+     * está cargando (próstata o cérvix).
+     */
+    private function importComplementaryMedicines(iterable $rows, CatalogoReferencia $catalogo, string $route): int
     {
         $header = null;
         $items = [];
+        $count = 0;
+
         foreach ($rows as $row) {
             $values = $this->rowValues($row);
+
             if ($header === null) {
                 $candidate = $this->headerMap($values);
+
                 if (isset($candidate['CODIGOCUM']) && isset($candidate['MEDICAMENTOAAGREGAR'])) {
                     $header = $candidate;
                 }
 
                 continue;
             }
+
             $code = $this->normaliseCode($this->at($values, $header, ['CODIGO CUM']));
+
             if ($code === '') {
                 continue;
             }
-            $items[] = [
-                'catalogo_referencia_id' => $catalogo->id,
-                'hoja' => $this->currentSheet,
-                'codigo' => $code,
-                'ruta' => 'PROSTATA',
-                'categoria' => 'MEDICAMENTOS_NUEVOS',
-                'descripcion' => $this->stringValue($this->at($values, $header, ['MEDICAMENTO A AGREGAR'])),
-                'tarifa_referencia' => $this->numberValue($this->at($values, $header, ['VALOR UNITARIO'])),
-                'activo' => true,
-                'metadatos' => json_encode(['presentacion' => $this->stringValue($this->at($values, $header, ['PRESENTACION EXACTA'])), 'cups' => $this->stringValue($this->at($values, $header, ['CUPS'])), 'periodo_precio' => $this->stringValue($this->at($values, $header, ['PERIODO DEL PRECIO']))], JSON_UNESCAPED_UNICODE),
-            ];
+
+            $items[] = $this->item(
+                $catalogo,
+                $code,
+                $route,
+                'MEDICAMENTOS_NUEVOS',
+                $this->stringValue($this->at($values, $header, ['MEDICAMENTO A AGREGAR'])),
+                $this->numberValue($this->at($values, $header, ['VALOR UNITARIO'])),
+                [
+                    'presentacion' => $this->stringValue($this->at($values, $header, ['PRESENTACION EXACTA'])),
+                    'cups' => $this->normaliseCode($this->at($values, $header, ['CUPS'])),
+                    'periodo_precio' => $this->stringValue($this->at($values, $header, ['PERIODO DEL PRECIO'])),
+                ]
+            );
+            $count += $this->flushItems($items);
         }
 
-        return $this->flushItems($items, true);
+        return $count + $this->flushItems($items, true);
     }
 
     /**
@@ -539,37 +553,26 @@ class CatalogoReferenciaImporter
 
         foreach ($rows as $row) {
             $values = $this->rowValues($row);
-            $rowText = $this->normaliseHeader(implode(' ', array_map(fn (mixed $value): string => $this->stringValue($value), $values)));
+            $code = $header === null ? '' : $this->normaliseCode($this->at($values, $header, ['CUPS']));
 
-            if (str_contains($rowText, 'QUIMIOTERAPIA')) {
-                $section = 'QUIMIOTERAPIA';
-                $header = null;
-
-                continue;
-            }
-
-            if (str_contains($rowText, 'RADIOTERAPIA')) {
-                $section = 'RADIOTERAPIA';
-                $header = null;
-
-                continue;
-            }
-
-            $candidate = $this->headerMap($values);
-
-            if (isset($candidate['CUPS']) && ($section !== '' || isset($candidate['TARIFA']))) {
-                $header = $candidate;
-
-                continue;
-            }
-
-            if ($header === null) {
-                continue;
-            }
-
-            $code = $this->normaliseCode($this->at($values, $header, ['CUPS']));
-
+            // Una fila con CUPS válido siempre es un servicio, aunque su descripción
+            // mencione QUIMIOTERAPIA o RADIOTERAPIA.
             if (! $this->isCatalogCode($code)) {
+                $title = $this->oncologySectionTitle($values);
+
+                if ($title !== null) {
+                    $section = $title;
+                    $header = null;
+
+                    continue;
+                }
+
+                $candidate = $this->headerMap($values);
+
+                if (isset($candidate['CUPS']) && ($section !== '' || isset($candidate['TARIFA']))) {
+                    $header = $candidate;
+                }
+
                 continue;
             }
 
@@ -598,6 +601,28 @@ class CatalogoReferenciaImporter
         }
 
         return $count + $this->flushItems($items, true);
+    }
+
+    /**
+     * Título de sección: una fila con una sola celda cuyo texto completo es
+     * QUIMIOTERAPIA o RADIOTERAPIA.
+     *
+     * @param  array<int, mixed>  $values
+     */
+    private function oncologySectionTitle(array $values): ?string
+    {
+        $texts = array_values(array_filter(
+            array_map(fn (mixed $value): string => $this->stringValue($value), $values),
+            static fn (string $value): bool => $value !== ''
+        ));
+
+        if (count($texts) !== 1) {
+            return null;
+        }
+
+        $title = $this->normaliseHeader($texts[0]);
+
+        return in_array($title, ['QUIMIOTERAPIA', 'RADIOTERAPIA'], true) ? $title : null;
     }
 
     private function importPalliativeDrugs(iterable $rows, CatalogoReferencia $catalogo, string $route): int

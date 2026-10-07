@@ -208,6 +208,131 @@ class CatalogoReferenciaControllerTest extends TestCase
         $this->assertSame(800.0, $paliativo->tarifa_referencia);
     }
 
+    public function test_oncology_sheet_imports_radiotherapy_rows_whose_description_mentions_radioterapia(): void
+    {
+        $admin = User::factory()->create(['role' => 'admin']);
+
+        $this->actingAs($admin)
+            ->post(route('catalogos-referencia.store'), [
+                'tipo' => 'NOTA_PROSTATA',
+                'version' => '2026-10-06',
+                'archivo' => $this->oncologyWorkbook(),
+            ])
+            ->assertRedirectToRoute('catalogos-referencia.index')
+            ->assertSessionHas('success');
+
+        $items = CatalogoReferencia::query()
+            ->where('tipo', 'NOTA_PROSTATA')
+            ->firstOrFail()
+            ->items()
+            ->get()
+            ->keyBy('codigo');
+
+        $this->assertSame(
+            ['992505', '992509', '992511', '922444', '922446', '922443', '922615'],
+            $items->pluck('codigo')->values()->all()
+        );
+        $this->assertSame('ONCOLOGIA_QUIMIOTERAPIA', $items['992505']->categoria);
+        $this->assertSame(444690.0, $items['992505']->tarifa_referencia);
+        $this->assertSame(286114.0, $items['992509']->tarifa_referencia);
+        $this->assertSame('ONCOLOGIA_RADIOTERAPIA', $items['922444']->categoria);
+        $this->assertSame(8852976.0, $items['922444']->tarifa_referencia);
+        $this->assertSame('ONCOLOGIA_RADIOTERAPIA', $items['922446']->categoria);
+        $this->assertSame(5373000.0, $items['922443']->tarifa_referencia);
+        $this->assertSame(9345000.0, $items['922615']->tarifa_referencia);
+        $this->assertSame('PROSTATA', $items['922615']->ruta);
+    }
+
+    public function test_cervix_note_imports_complementary_medicines_with_the_cervix_route(): void
+    {
+        $admin = User::factory()->create(['role' => 'admin']);
+
+        $this->actingAs($admin)
+            ->post(route('catalogos-referencia.store'), [
+                'tipo' => 'NOTA_CERVIX',
+                'version' => '2026-10-06',
+                'archivo' => $this->complementaryMedicinesWorkbook(),
+            ])
+            ->assertRedirectToRoute('catalogos-referencia.index')
+            ->assertSessionHas('success');
+
+        $item = CatalogoReferencia::query()
+            ->where('tipo', 'NOTA_CERVIX')
+            ->firstOrFail()
+            ->items()
+            ->where('categoria', 'MEDICAMENTOS_NUEVOS')
+            ->firstOrFail();
+
+        $this->assertSame('20178975-1', $item->codigo);
+        $this->assertSame('CERVIX', $item->ruta);
+        $this->assertSame('Fosaprepitant', $item->descripcion);
+        $this->assertSame(73333.0, $item->tarifa_referencia);
+        $this->assertSame('2026-08', $item->metadatos['periodo_precio']);
+        $this->assertSame('992504', $item->metadatos['cups']);
+    }
+
+    private function oncologyWorkbook(): UploadedFile
+    {
+        $spreadsheet = new Spreadsheet;
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('quimio y Radio - Prostata');
+        $sheet->fromArray([
+            ['QUIMIOTERAPIA'],
+            ['CUPS', 'Valores', 'Total general', 'Frec Año', 'Cantidad mes', 'Tarifa aplicación ciclo', 'Costo total', 'Tarifa medicamento', 'Costo mes', 'Mxs contemplados en el esquema'],
+            ['992505', 'POLITERAPIA ANTINEOPLASICA DE ALTA TOXICIDAD', 201, 0.08, 222, 444690, 98721180, 7520978.97, 1768378512.72, 'Abiraterona, apalutamida'],
+            ['992509', 'MONOTERAPIA ANTINEOPLASICA DE BAJA TOXICIDAD', 427, 0.18, 82, 286114, 23461348, 2114153.85, 196821964.42, 'Leuprolide'],
+            ['992511', 'MONOTERAPIA ANTINEOPLASICA DE ALTA TOXICIDAD', 201, 0.08, 0.5, 444690, 222345, 6884131.88, 3664410.94, 'Cabazitaxel'],
+            [null, null, null, null, null, null, null, 'TOTAL', 1968864888.08],
+            [],
+            [],
+            ['RADIOTERAPIA'],
+            ['CUPS', 'Valores', 'Total general', 'Frec Año', 'Cantidad mes', 'Tarifa tratamiento', 'Costo total', 'Costo mes'],
+            ['922444', 'TELETERAPIA CON ACELERADOR LINEAL (PLANEACION COMPUTARIZADA) RADIOTERAPIA DE INTENSIDAD MODULADA', 57, 0.02, 34, 8852976, 504619632, 301001184],
+            ['922446', 'TELETERAPIA CON ACELERADOR LINEAL RADIOTERAPIA ESTEREOTAXICA', 9, 0.003, 0.75, 8852976, 79676784, 6639732],
+            ['922443', 'TELETERAPIA CON ACELERADOR LINEAL (PLANEACION COMPUTARIZADA TRIDIMENSIONAL)', 27, 0.01, 2.25, 5373000, 145071000, 12089250],
+            ['922615', 'BRAQUITERAPIA INTERSTICIAL (PLANEACION COMPUTARIZADA TRIDIMENSIONAL)', 3, 0.001, 3, 9345000, 28035000, 28035000],
+            [null, null, null, null, null, null, 'TOTAL', 347765166],
+        ], null, 'C1');
+
+        return $this->uploadedWorkbook($spreadsheet, 'nota-prostata.xlsx');
+    }
+
+    private function complementaryMedicinesWorkbook(): UploadedFile
+    {
+        $spreadsheet = new Spreadsheet;
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('Medicamentos nuevos ');
+        $sheet->fromArray([
+            ['CUPS', 'Tipo Servicio', 'Servicio / Valores', 'Medicamento a agregar', 'Presentación exacta', 'Código Producto', 'Código CUM', 'Código ATC', 'Código DCI', 'Valor Unitario', 'Periodo del precio'],
+            ['992504', 'Quimioterapia', 'POLITERAPIA ANTINEOPLASICA DE BAJA TOXICIDAD', 'Fosaprepitant', 'FOSAPREPITANT 150 MG POLVO LIOFILIZADO', null, '20178975-1', 'A04AD12', 'A04AD', 73333, '2026-08'],
+        ]);
+
+        return $this->uploadedWorkbook($spreadsheet, 'nota-cervix.xlsx');
+    }
+
+    private function uploadedWorkbook(Spreadsheet $spreadsheet, string $fileName): UploadedFile
+    {
+        $path = tempnam(sys_get_temp_dir(), 'catalogo-nota-');
+
+        if ($path === false) {
+            $this->fail('No fue posible crear el archivo temporal de prueba.');
+        }
+
+        (new Xlsx($spreadsheet))->save($path);
+        $content = file_get_contents($path);
+        unlink($path);
+
+        if ($content === false) {
+            $this->fail('No fue posible leer el archivo temporal de prueba.');
+        }
+
+        return UploadedFile::fake()->createWithContent(
+            $fileName,
+            $content,
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+    }
+
     private function annexWorkbook(): UploadedFile
     {
         $spreadsheet = new Spreadsheet;
