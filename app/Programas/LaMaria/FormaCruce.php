@@ -9,6 +9,9 @@ enum FormaCruce: string
 {
     case CodigoExacto = 'CODIGO_EXACTO';
     case CumExacto = 'CUM_EXACTO';
+    case IumExacto = 'IUM_EXACTO';
+    case DispensacionPacientePeriodo = 'DISPENSACION_PACIENTE_PERIODO';
+    case IumFamiliaDispensacion = 'IUM_FAMILIA_DISPENSACION';
     case PrincipioTarifaUnica = 'PRINCIPIO_TARIFA_UNICA';
     case PrincipioAmbiguo = 'PRINCIPIO_AMBIGUO';
     case DocumentoCumMes = 'DOCUMENTO_CUM_MES';

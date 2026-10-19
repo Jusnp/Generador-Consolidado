@@ -179,6 +179,7 @@
             data-upload-progress-mode="download"
         >
             @csrf
+            <input type="hidden" name="archivos_declarados" id="archivos-declarados" value="">
 
             <div>
                 <label for="archivos" class="form-label">
@@ -196,7 +197,7 @@
                 >
 
                 <div class="form-help">
-                    Puedes cargar hasta 25 archivos, con un máximo de 500 MB por archivo.
+                    Puedes cargar hasta {{ $limiteArchivos }} archivos, con un máximo de 500 MB por archivo.
                 </div>
             </div>
 
@@ -214,6 +215,25 @@
                 <div class="form-help">
                     Se cruza por número de documento y se agrega la hoja “VALIDACION SQL”.
                     La basura, comentarios y tablas no reconocidas no detienen el reporte.
+                </div>
+            </div>
+
+            <div>
+                <label for="informes_administrativos" class="form-label">
+                    Informe administrativo histórico <span class="form-help">(opcional)</span>
+                </label>
+                <input
+                    id="informes_administrativos"
+                    name="informes_administrativos[]"
+                    type="file"
+                    accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    class="form-input"
+                    multiple
+                >
+                <div class="form-help">
+                    Se lee la hoja “inf admin” (mes, tipo, código y valor) para agregar la estimación administrativa
+                    referencial. Si no se carga, se usa el informe configurado para esta ruta; si falta, el reporte
+                    se detiene con un aviso. No cambia el costo A y no es facturación.
                 </div>
             </div>
 
@@ -252,5 +272,14 @@
         </form>
     </section>
 
+    <script>
+        document.getElementById('archivos').addEventListener('change', function () {
+            document.getElementById('archivos-declarados').value = JSON.stringify(
+                Array.from(this.files, function (file) {
+                    return { nombre: file.name, tamano: file.size };
+                })
+            );
+        });
+    </script>
     <script src="{{ asset('js/upload-progress.js') }}"></script>
 @endsection

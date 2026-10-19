@@ -36,6 +36,7 @@ class LaMariaProstataPipeline implements ProgramaPipeline
             CatalogoReferenciaImporter::TYPE_NOTA_PROSTATA,
             CatalogoReferenciaImporter::TYPE_NOTA_MEDICAMENTOS,
             CatalogoReferenciaImporter::TYPE_DISPENSACION_PROSTATA,
+            CatalogoReferenciaImporter::TYPE_COMPLEMENTO_MEDICAMENTOS_PROSTATA,
         ];
     }
 

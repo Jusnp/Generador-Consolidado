@@ -255,14 +255,20 @@
 
         <h3 style="margin-top: 36px;">Estado de las fuentes</h3>
 
+        <p class="catalog-help">
+            Cada carga queda <strong>INACTIVA</strong>. Revisa sus validaciones y actívala; la versión activa anterior del
+            mismo tipo se desactiva en la misma operación, y la operación se puede deshacer restaurando exactamente las versiones activas anteriores.
+        </p>
+
         <table class="catalog-table">
             <thead>
                 <tr>
                     <th>Programa</th>
                     <th>Fuente</th>
-                    <th>Versión activa</th>
+                    <th>Versión</th>
                     <th>Archivo</th>
                     <th>Registros</th>
+                    <th>Validaciones</th>
                     <th>Estado</th>
                 </tr>
             </thead>
@@ -276,13 +282,32 @@
                         <td>{{ $activeCatalog->archivo_origen }}</td>
                         <td>{{ $activeCatalog->items_count }}</td>
                         <td>
+                            @php($verificacion = $verificaciones[$activeCatalog->id] ?? null)
+                            @if ($verificacion === null)
+                                <span class="catalog-status missing">SIN VERIFICACIÓN REGISTRADA</span>
+                                <div class="catalog-help">Se verificará al activar.</div>
+                            @elseif ($verificacion['estado'] === 'VERIFICADO')
+                                <span class="catalog-status ready">VERIFICADO</span>
+                            @else
+                                <span class="catalog-status missing">VALIDACIONES PENDIENTES</span>
+                                <div class="catalog-help">{{ $verificacion['detalle'] }}</div>
+                            @endif
+                        </td>
+                        <td>
                             @if ($activeCatalog)
                                 <span class="catalog-status {{ $activeCatalog->activo ? 'ready' : 'missing' }}">{{ $activeCatalog->activo ? 'ACTIVO' : 'INACTIVO' }}</span>
                                 <a href="{{ route('catalogos-referencia.show', $activeCatalog) }}" class="catalog-view-button">Ver contenido</a>
                                 <form method="POST" action="{{ route('catalogos-referencia.toggle-file', $activeCatalog) }}">
                                     @csrf
-                                    <button type="submit" class="catalog-view-button catalog-toggle-button {{ $activeCatalog->activo ? 'danger' : 'success' }}">{{ $activeCatalog->activo ? 'Inactivar archivo' : 'Activar archivo' }}</button>
+                                    <input type="hidden" name="activos_esperados" value="{{ $catalogos->where('activo', true)->pluck('id')->sort()->implode(',') }}">                                    <button type="submit" class="catalog-view-button catalog-toggle-button {{ $activeCatalog->activo ? 'danger' : 'success' }}">{{ $activeCatalog->activo ? 'Inactivar archivo' : 'Activar archivo' }}</button>
                                 </form>
+                                @php($operacion = $operacionesReversibles[$type] ?? null)
+                                @if ($operacion !== null && (int) ($operacion->metadata['catalogo_id'] ?? 0) === $activeCatalog->id)
+                                    <form method="POST" action="{{ route('catalogos-referencia.operaciones.revertir', $operacion) }}">
+                                        @csrf
+                                        <button type="submit" class="catalog-view-button catalog-toggle-button danger">Revertir última operación</button>
+                                    </form>
+                                @endif
                             @else
                                 <span class="catalog-status missing">PENDIENTE</span>
                             @endif
@@ -290,7 +315,7 @@
                     </tr>
                     @endforeach
                 @empty
-                    <tr><td colspan="6">No hay notas técnicas o catálogos cargados.</td></tr>
+                    <tr><td colspan="7">No hay notas técnicas o catálogos cargados.</td></tr>
                 @endforelse
             </tbody>
         </table>

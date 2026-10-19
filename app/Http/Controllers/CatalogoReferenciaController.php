@@ -2,6 +2,8 @@
 
 namespace App\Http\Controllers;
 
+use App\Exceptions\ActivacionCatalogoException;
+use App\Models\ActivityLog;
 use App\Models\CatalogoConsolidadoImport;
 use App\Models\CatalogoReferencia;
 use App\Models\CatalogoReferenciaItem;
@@ -15,6 +17,7 @@ use App\Programas\LaMaria\LaMariaPrograma;
 use App\Programas\ProgramaRegistry;
 use App\Services\ActivityLogger;
 use App\Services\CatalogoConsolidadoImporter;
+use App\Services\CatalogoReferenciaActivator;
 use App\Services\CatalogoReferenciaImporter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
@@ -121,9 +124,11 @@ class CatalogoReferenciaController extends Controller
         return response()->json(['message' => $referenciaManual->activo ? 'Registro activado.' : 'Registro inactivado.', 'referencia' => $referenciaManual]);
     }
 
-    public function index(ProgramaRegistry $programas): View
+    public function index(ProgramaRegistry $programas, CatalogoReferenciaActivator $activator): View
     {
         return view('catalogos-referencia', [
+            'verificaciones' => $activator->verificacionesRegistradas(),
+            'operacionesReversibles' => $activator->operacionesReversibles(LaMariaPrograma::SLUG),
             'catalogOwnership' => $programas->catalogOwnershipMap(),
             'catalogTypes' => CatalogoReferenciaImporter::types(),
             'catalogosPorTipo' => CatalogoReferencia::query()
@@ -161,13 +166,16 @@ class CatalogoReferenciaController extends Controller
     public function show(Request $request, CatalogoReferencia $catalogoReferencia): View
     {
         $sheet = $request->string('sheet')->toString();
-        $metadataColumns = $catalogoReferencia->items()
+        $metadataKeys = [];
+        $metadataItems = $catalogoReferencia->items()
             ->when($sheet !== '', fn ($query) => $query->where('hoja', $sheet))
-            ->pluck('metadatos')
-            ->filter()
-            ->flatMap(fn ($metadata) => array_keys(is_array($metadata) ? Arr::dot($metadata) : []))
-            ->unique()
-            ->values();
+            ->select(['id', 'metadatos'])->cursor();
+        foreach ($metadataItems as $metadataItem) {
+            foreach (array_keys(Arr::dot($metadataItem->metadatos ?? [])) as $key) {
+                $metadataKeys[$key] = true;
+            }
+        }
+        $metadataColumns = collect(array_keys($metadataKeys));
 
         return view('catalogo-referencia-detalle', [
             'catalogo' => $catalogoReferencia,
@@ -176,7 +184,7 @@ class CatalogoReferenciaController extends Controller
             'items' => $catalogoReferencia->items()
                 ->when($request->filled('q'), function ($query) use ($request) {
                     $term = '%'.$request->string('q')->toString().'%';
-                    $query->where(fn ($query) => $query->where('codigo', 'like', $term)->orWhere('descripcion', 'like', $term));
+                    $query->where(fn ($query) => $query->where('codigo', 'like', $term)->orWhere('descripcion', 'like', $term)->orWhere('metadatos->ium', 'like', $term));
                 })->when($request->filled('sheet'), fn ($query) => $query->where('hoja', $request->string('sheet')->toString()))->orderBy('id')->paginate(100)->withQueryString(),
         ]);
     }
@@ -370,18 +378,49 @@ class CatalogoReferenciaController extends Controller
         return back()->with('success', 'Registro agregado correctamente.');
     }
 
-    public function toggleTechnicalFile(CatalogoReferencia $catalogoReferencia, ActivityLogger $logger): RedirectResponse
+    /**
+     * Activa o inactiva una versión. Recibe las versiones activas que vio el
+     * administrador para rechazar el cambio si otro las modificó entretanto.
+     */
+    public function toggleTechnicalFile(Request $request, CatalogoReferencia $catalogoReferencia, CatalogoReferenciaActivator $activator): RedirectResponse
     {
-        $catalogoReferencia->update(['activo' => ! $catalogoReferencia->activo]);
-        $logger->log('catalogo_tecnico_archivo_estado', 'Estado de la nota técnica actualizado.', ['catalogo_id' => $catalogoReferencia->id, 'activo' => $catalogoReferencia->activo]);
+        abort_unless($catalogoReferencia->programa_slug === LaMariaPrograma::SLUG, 404);
+        $validated = $request->validate(['activos_esperados' => ['present', 'nullable', 'string', 'regex:/^(\d+(,\d+)*)?$/']]);
+        $esperados = array_map('intval', array_filter(explode(',', (string) ($validated['activos_esperados'] ?? ''))));
 
-        return back()->with('success', $catalogoReferencia->activo ? 'Archivo activado.' : 'Archivo inactivado.');
+        try {
+            $catalogoReferencia->activo
+                ? $activator->inactivar($catalogoReferencia, $esperados, $request)
+                : $activator->activar($catalogoReferencia, $esperados, $request);
+        } catch (ActivacionCatalogoException $exception) {
+            return back()->withErrors(['catalogo' => $exception->getMessage()]);
+        }
+
+        return back()->with('success', $catalogoReferencia->fresh()->activo ? 'Versión activada.' : 'Versión inactivada.');
+    }
+
+    /**
+     * Restaura exactamente las versiones activas anteriores a una activación o
+     * inactivación de La María.
+     */
+    public function revertOperation(Request $request, ActivityLog $operacion, CatalogoReferenciaActivator $activator): RedirectResponse
+    {
+        abort_unless(($operacion->metadata['programa'] ?? null) === LaMariaPrograma::SLUG, 404);
+
+        try {
+            $activator->revertir($operacion, $request);
+        } catch (ActivacionCatalogoException $exception) {
+            return back()->withErrors(['catalogo' => $exception->getMessage()]);
+        }
+
+        return back()->with('success', 'Operación revertida: se restauraron las versiones activas anteriores.');
     }
 
     public function store(
         Request $request,
         CatalogoReferenciaImporter $catalogoReferenciaImporter,
-        ActivityLogger $activityLogger
+        ActivityLogger $activityLogger,
+        CatalogoReferenciaActivator $catalogoReferenciaActivator
     ): RedirectResponse|JsonResponse {
         $validated = $request->validate([
             'tipo' => ['required', Rule::in(array_keys(CatalogoReferenciaImporter::types()))],
@@ -414,7 +453,8 @@ class CatalogoReferenciaController extends Controller
                 $validated['version'],
                 $request->user(),
                 LaMariaPrograma::SLUG,
-                $validated['contrato_id'] ?? null
+                $validated['contrato_id'] ?? null,
+                activar: false
             );
         } catch (InvalidArgumentException|RuntimeException $exception) {
             throw ValidationException::withMessages([
@@ -426,6 +466,8 @@ class CatalogoReferenciaController extends Controller
             'catalogo_referencia_importado',
             'Administrador actualizó un catálogo de referencia para La María.',
             [
+                'catalogo_id' => $result['catalogo']->id,
+                'verificacion' => $catalogoReferenciaActivator->estadoVerificacion($result['catalogo']),
                 'programa' => LaMariaPrograma::SLUG,
                 'contrato_id' => $result['catalogo']->contrato_id,
                 'tipo' => $result['catalogo']->tipo,
@@ -435,7 +477,7 @@ class CatalogoReferenciaController extends Controller
             ]
         );
 
-        $message = "Catálogo actualizado: {$result['items']} registros disponibles para los próximos reportes.";
+        $message = "Versión cargada como INACTIVA con {$result['items']} registros. Revísala y actívala en Estado de las fuentes.";
 
         if ($request->expectsJson()) {
             return response()->json(['message' => $message]);
