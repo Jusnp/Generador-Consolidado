@@ -5,21 +5,34 @@ namespace App\Services;
 use App\Models\CatalogoReferencia;
 use App\Models\CatalogoReferenciaItem;
 use App\Models\User;
+use App\Programas\LaMaria\EstadoContractual;
 use App\Programas\LaMaria\LaMariaPrograma;
 use DateTimeImmutable;
 use DateTimeInterface;
 use Illuminate\Http\UploadedFile;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 use OpenSpout\Common\Entity\Cell\FormulaCell;
 use OpenSpout\Common\Entity\Row;
+use OpenSpout\Reader\XLSX\Options;
 use OpenSpout\Reader\XLSX\Reader;
 use RuntimeException;
 
 class CatalogoReferenciaImporter
 {
     private string $currentSheet = '';
+
+    /**
+     * Sistema de fechas del libro: 1904 (Mac) o 1900 (Windows).
+     */
+    private bool $date1904 = false;
+
+    /**
+     * Diagnóstico de lectura por hoja: filas leídas, aceptadas y rechazadas por motivo.
+     *
+     * @var array<string, array{leidas: int, aceptadas: int, rechazadas: array<string, int>, hoja_rechazada: string}>
+     */
+    private array $diagnostics = [];
 
     public const TYPE_ANEXOS_2706 = 'ANEXOS_2706';
 
@@ -35,6 +48,10 @@ class CatalogoReferenciaImporter
 
     public const TYPE_DISPENSACION_PROSTATA = 'DISPENSACION_PROSTATA';
 
+    public const TYPE_COMPLEMENTO_MEDICAMENTOS_PROSTATA = 'COMPLEMENTO_MEDICAMENTOS_PROSTATA';
+
+    public function __construct(private CatalogoReferenciaActivator $activator) {}
+
     /**
      * @return array<string, string>
      */
@@ -48,11 +65,15 @@ class CatalogoReferenciaImporter
             self::TYPE_NOTA_MEDICAMENTOS => 'Nota técnica de medicamentos (La María)',
             self::TYPE_DISPENSACION_CERVIX => 'Dispensación administrativa de cérvix',
             self::TYPE_DISPENSACION_PROSTATA => 'Dispensación administrativa de próstata',
+            self::TYPE_COMPLEMENTO_MEDICAMENTOS_PROSTATA => 'Complemento contractual de medicamentos de próstata',
         ];
     }
 
     /**
-     * @return array{catalogo: CatalogoReferencia, items: int}
+     * Importa una versión nueva del catálogo. Con $activar = false la versión
+     * queda cargada pero inactiva, para revisarla antes de activarla.
+     *
+     * @return array{catalogo: CatalogoReferencia, items: int, diagnostico: array<string, array<string, mixed>>}
      */
     public function import(
         UploadedFile $file,
@@ -60,8 +81,11 @@ class CatalogoReferenciaImporter
         string $version,
         User $user,
         string $programaSlug = LaMariaPrograma::SLUG,
-        ?int $contratoId = null
+        ?int $contratoId = null,
+        bool $activar = true
     ): array {
+        $this->diagnostics = [];
+
         if (! array_key_exists($type, self::types())) {
             throw new InvalidArgumentException('El tipo de catálogo seleccionado no es válido.');
         }
@@ -98,22 +122,18 @@ class CatalogoReferenciaImporter
                 self::TYPE_NOTA_MEDICAMENTOS => $this->importMedicationTechnicalNote($path, $catalogo),
                 self::TYPE_DISPENSACION_CERVIX => $this->importAdministrativeDispensation($path, $catalogo, 'CERVIX'),
                 self::TYPE_DISPENSACION_PROSTATA => $this->importAdministrativeDispensation($path, $catalogo, 'PROSTATA'),
+                self::TYPE_COMPLEMENTO_MEDICAMENTOS_PROSTATA => $this->importMedicationComplement($path, $catalogo, 'PROSTATA'),
             };
 
             if ($itemCount === 0) {
                 throw new InvalidArgumentException('No se encontraron registros reconocibles para el tipo de catálogo seleccionado.');
             }
 
-            // Activa solo dentro del mismo programa+tipo; conserva versiones previas inactivas.
-            DB::transaction(function () use ($catalogo, $type, $programaSlug): void {
-                CatalogoReferencia::query()
-                    ->forPrograma($programaSlug)
-                    ->where('tipo', $type)
-                    ->whereKeyNot($catalogo->id)
-                    ->update(['activo' => false]);
-
-                $catalogo->update(['activo' => true]);
-            });
+            // Activa solo dentro del mismo programa+tipo, verificada y auditada;
+            // conserva las versiones previas inactivas.
+            if ($activar) {
+                $this->activator->activar($catalogo, null);
+            }
         } catch (\Throwable $exception) {
             $catalogo->delete();
 
@@ -123,6 +143,7 @@ class CatalogoReferenciaImporter
         return [
             'catalogo' => $catalogo->fresh(),
             'items' => $itemCount,
+            'diagnostico' => $this->diagnostics,
         ];
     }
 
@@ -176,10 +197,12 @@ class CatalogoReferenciaImporter
     {
         return $this->readWorkbook($path, function (string $sheetName, iterable $rows) use ($catalogo, $route): int {
             $header = null;
-            $items = [];
-            $count = 0;
+            $sheetItems = [];
+            $rowNumber = 0;
+            $diagnostic = ['leidas' => 0, 'aceptadas' => 0, 'rechazadas' => [], 'hoja_rechazada' => ''];
 
             foreach ($rows as $row) {
+                $rowNumber++;
                 $values = $this->rowValues($row);
 
                 if ($header === null) {
@@ -192,23 +215,37 @@ class CatalogoReferenciaImporter
                     continue;
                 }
 
-                $document = $this->normaliseCode($this->at($values, $header, ['DOCUMENTO PACIENTE']));
-                $code = $this->normaliseCode($this->at($values, $header, ['CODIGO CUM', 'CODIGO PRODUCTO']));
-                $dispensationDate = $this->dateValue($this->at($values, $header, ['FECHA DISPENSACION']));
-
-                if ($document === '' || $code === '' || $dispensationDate === '') {
+                if (array_filter($values, fn (mixed $value): bool => $this->stringValue($value) !== '') === []) {
                     continue;
                 }
 
-                $units = $this->numberValue($this->at($values, $header, ['UNIDADES DISPENSADAS', 'CANTIDAD ENTREGADA'])) ?? 0.0;
-                $unitRate = $this->currencyValue($this->at($values, $header, [
-                    'VALOR UNITARIO MEDICAMENTOS DISPENSADOS',
-                    'VALOR UNITARIO',
-                ]));
-                $totalRate = $this->currencyValue($this->at($values, $header, [
-                    'VALOR TOTAL MEDICAMENTOS DISPENSADOS',
-                    'VALOR TOTAL',
-                ]));
+                $diagnostic['leidas']++;
+                $document = $this->normaliseCode($this->at($values, $header, ['DOCUMENTO PACIENTE']));
+                $code = $this->normaliseCode($this->at($values, $header, ['CODIGO CUM']));
+                $dispensationDate = $this->dateValue($this->at($values, $header, ['FECHA DISPENSACION']));
+                $units = $this->numberValue($this->at($values, $header, ['UNIDADES DISPENSADAS', 'CANTIDAD ENTREGADA']));
+                $rawUnitRate = $this->at($values, $header, ['VALOR UNITARIO MEDICAMENTOS DISPENSADOS', 'VALOR UNITARIO']);
+                $rawTotalRate = $this->at($values, $header, ['VALOR TOTAL MEDICAMENTOS DISPENSADOS', 'VALOR TOTAL']);
+                $unitRate = $this->currencyValue($rawUnitRate);
+                $totalRate = $this->currencyValue($rawTotalRate);
+
+                // Una columna desplazada o equivocada no puede convertirse en documento,
+                // CUM, fecha, cantidad o precio: la fila se rechaza con su motivo.
+                $rejection = match (true) {
+                    preg_match('/^(?=.*\d)[A-Z0-9]{3,20}$/', $document) !== 1 => 'DOCUMENTO_INVALIDO',
+                    preg_match('/^\d{3,9}-\d{1,3}$/', $code) !== 1 => 'CUM_INVALIDO',
+                    ! $this->isPlausibleDate($dispensationDate) => 'FECHA_INVALIDA',
+                    $units === null || $units < 0 => 'UNIDADES_INVALIDAS',
+                    $unitRate === null && $this->hasContent($rawUnitRate) => 'VALOR_UNITARIO_NO_INTERPRETABLE',
+                    $totalRate === null && $this->hasContent($rawTotalRate) => 'VALOR_TOTAL_NO_INTERPRETABLE',
+                    default => null,
+                };
+
+                if ($rejection !== null) {
+                    $diagnostic['rechazadas'][$rejection] = ($diagnostic['rechazadas'][$rejection] ?? 0) + 1;
+
+                    continue;
+                }
 
                 if ($unitRate === null && $totalRate !== null && $units > 0) {
                     $unitRate = round($totalRate / $units, 4);
@@ -219,7 +256,7 @@ class CatalogoReferenciaImporter
                     'DESCRIPCION MEDICAMENTOS DISPENSADOS',
                 ]));
 
-                $items[] = $this->item(
+                $sheetItems[] = $this->item(
                     $catalogo,
                     $code,
                     $route,
@@ -232,14 +269,184 @@ class CatalogoReferenciaImporter
                         'fecha_dispensacion' => $dispensationDate,
                         'unidades_dispensadas' => $units,
                         'valor_total_dispensado' => $totalRate,
+                        'control_valor' => $this->valueControl($units, $unitRate, $totalRate),
+                        'fila' => $rowNumber,
                         'origen_fecha' => 'FECHA DISPENSACION',
                     ]
                 );
-                $count += $this->flushItems($items);
+                $diagnostic['aceptadas']++;
             }
 
-            return $count + $this->flushItems($items, true);
+            $rejected = $diagnostic['leidas'] - $diagnostic['aceptadas'];
+
+            // Si la mayoría de las filas no supera la validación, los encabezados no
+            // son confiables (por ejemplo, desplazados) y la hoja completa se descarta.
+            if ($diagnostic['leidas'] >= 10 && $rejected > $diagnostic['leidas'] / 2) {
+                $diagnostic['hoja_rechazada'] = 'ENCABEZADOS_NO_CONFIABLES';
+                $diagnostic['aceptadas'] = 0;
+                $sheetItems = [];
+            }
+
+            if ($header !== null) {
+                $this->diagnostics[$sheetName] = $diagnostic;
+            }
+
+            $count = 0;
+
+            foreach (array_chunk($sheetItems, 500) as $chunk) {
+                $count += $this->flushItems($chunk, true);
+            }
+
+            return $count;
         });
+    }
+
+    /**
+     * Complemento contractual de medicamentos: una fila por CUM y precio, con su
+     * vigencia, documento fuente, evidencia y estado contractual. No se deducen
+     * vigencias: si el archivo no las trae quedan vacías, y un precio VERIFICADO
+     * exige evidencia contractual y vigencia inicial. Nunca se identifica el
+     * medicamento por un CUPS.
+     */
+    private function importMedicationComplement(string $path, CatalogoReferencia $catalogo, string $route): int
+    {
+        return $this->readWorkbook($path, function (string $sheetName, iterable $rows) use ($catalogo, $route): int {
+            $header = null;
+            $items = [];
+            $rowNumber = 0;
+            $diagnostic = ['leidas' => 0, 'aceptadas' => 0, 'rechazadas' => [], 'hoja_rechazada' => ''];
+
+            foreach ($rows as $row) {
+                $rowNumber++;
+                $values = $this->rowValues($row);
+
+                if ($header === null) {
+                    $candidate = $this->headerMap($values);
+
+                    if (isset($candidate['CUM'], $candidate['TARIFA'], $candidate['ESTADOCONTRACTUAL'])) {
+                        $header = $candidate;
+                    }
+
+                    continue;
+                }
+
+                if (array_filter($values, fn (mixed $value): bool => $this->stringValue($value) !== '') === []) {
+                    continue;
+                }
+
+                $diagnostic['leidas']++;
+                $code = $this->normaliseCode($this->at($values, $header, ['CUM']));
+                $ium = $this->normaliseCode($this->at($values, $header, ['IUM']));
+                $rawRate = $this->at($values, $header, ['TARIFA']);
+                $rate = $this->currencyValue($rawRate);
+                $state = strtoupper($this->stringValue($this->at($values, $header, ['ESTADO CONTRACTUAL'])));
+                $state = $state === '' ? EstadoContractual::Pendiente->value : $state;
+                $rawFrom = $this->at($values, $header, ['VIGENCIA DESDE']);
+                $rawTo = $this->at($values, $header, ['VIGENCIA HASTA']);
+                $validFrom = $this->dateValue($rawFrom);
+                $validTo = $this->dateValue($rawTo);
+                $evidence = $this->stringValue($this->at($values, $header, ['EVIDENCIA CONTRACTUAL']));
+
+                $rejection = match (true) {
+                    preg_match('/^\d{3,9}-\d{1,3}$/', $code) !== 1 => 'CUM_INVALIDO',
+                    $ium !== '' && preg_match('/^[0-9A-Z]{15}$/', $ium) !== 1 => 'IUM_INVALIDO',
+                    $rate === null || $rate < 0 => 'TARIFA_INVALIDA',
+                    EstadoContractual::tryFrom($state) === null => 'ESTADO_CONTRACTUAL_INVALIDO',
+                    ($this->hasContent($rawFrom) && ! $this->isPlausibleDate($validFrom))
+                        || ($this->hasContent($rawTo) && ! $this->isPlausibleDate($validTo))
+                        || ($validFrom !== '' && $validTo !== '' && $validTo < $validFrom) => 'VIGENCIA_INVALIDA',
+                    $state === EstadoContractual::Verificado->value && ($evidence === '' || $validFrom === '') => 'VERIFICADO_SIN_EVIDENCIA_O_VIGENCIA',
+                    default => null,
+                };
+
+                if ($rejection !== null) {
+                    $diagnostic['rechazadas'][$rejection] = ($diagnostic['rechazadas'][$rejection] ?? 0) + 1;
+
+                    continue;
+                }
+
+                $principle = $this->stringValue($this->at($values, $header, ['PRINCIPIO ACTIVO']));
+                $concentration = $this->stringValue($this->at($values, $header, ['CONCENTRACION']));
+                $form = $this->stringValue($this->at($values, $header, ['FORMA FARMACEUTICA']));
+                $items[] = $this->item(
+                    $catalogo,
+                    $code,
+                    $route,
+                    'MEDICAMENTO_COMPLEMENTARIO',
+                    trim(implode(' ', array_filter([$principle, $concentration, $form]))),
+                    $rate,
+                    [
+                        'ium' => $ium,
+                        'principio_activo' => $principle,
+                        'concentracion' => $concentration,
+                        'forma_farmaceutica' => $form,
+                        'vigencia_desde' => $validFrom,
+                        'vigencia_hasta' => $validTo,
+                        'documento_fuente' => $this->stringValue($this->at($values, $header, ['DOCUMENTO FUENTE'])),
+                        'evidencia_contractual' => $evidence,
+                        'estado_contractual' => $state,
+                        'periodo_precio_observado' => $this->stringValue($this->at($values, $header, ['PERIODO PRECIO OBSERVADO'])),
+                        'observacion' => $this->stringValue($this->at($values, $header, ['OBSERVACION'])),
+                        'fila' => $rowNumber,
+                    ]
+                );
+                $diagnostic['aceptadas']++;
+            }
+
+            if ($header !== null) {
+                $this->diagnostics[$sheetName] = $diagnostic;
+            }
+
+            return $this->flushItems($items, true);
+        });
+    }
+
+    /**
+     * UNIDADES × VALOR UNITARIO frente a VALOR TOTAL, sin modificar ninguno.
+     */
+    private function valueControl(?float $units, ?float $unitRate, ?float $totalRate): string
+    {
+        if ($units === null || $unitRate === null || $totalRate === null) {
+            return 'SIN_VALOR';
+        }
+
+        $difference = abs($units * $unitRate - $totalRate);
+
+        return match (true) {
+            $difference <= 1 => 'CUADRA',
+            $difference <= max(5, 0.001 * abs($totalRate)) => 'REDONDEO',
+            default => 'INCONSISTENTE',
+        };
+    }
+
+    private function hasContent(mixed $value): bool
+    {
+        return ! in_array(str_replace(['$', ' ', "\u{00A0}"], '', $this->stringValue($value)), ['', '-'], true);
+    }
+
+    private function isPlausibleDate(string $date): bool
+    {
+        return preg_match('/^(\d{4})-\d{2}-\d{2}$/', $date, $matches) === 1
+            && (int) $matches[1] >= 2000
+            && (int) $matches[1] <= 2100;
+    }
+
+    /**
+     * Fecha del registro INVIMA (formato mm/dd/aaaa) en aaaa-mm-dd.
+     */
+    private function registryDate(mixed $value): string
+    {
+        if ($value instanceof DateTimeInterface) {
+            return $value->format('Y-m-d');
+        }
+
+        $text = $this->stringValue($value);
+
+        if (preg_match('/^(\d{2})\/(\d{2})\/(\d{4})$/', $text, $matches) === 1) {
+            return $matches[3].'-'.$matches[1].'-'.$matches[2];
+        }
+
+        return $this->dateValue($value);
     }
 
     private function importCum(string $path, CatalogoReferencia $catalogo): int
@@ -283,6 +490,18 @@ class CatalogoReferenciaImporter
                     'principio_activo' => $this->stringValue($this->at($values, $header, ['PRINCIPIOACTIVO'])),
                     'forma_farmaceutica' => $this->stringValue($this->at($values, $header, ['FORMAFARMACEUTICA'])),
                     'estado_cum' => $this->stringValue($this->at($values, $header, ['ESTADOCUM'])),
+                    'ium' => $this->normaliseCode($this->at($values, $header, ['IUM'])),
+                    'expediente' => $this->normaliseCode($this->at($values, $header, ['EXPEDIENTE'])),
+                    'registro_sanitario' => $this->stringValue($this->at($values, $header, ['REGISTROSANITARIO'])),
+                    'estado_registro' => $this->stringValue($this->at($values, $header, ['ESTADOREGISTRO'])),
+                    'cantidad_cum' => $this->numberValue($this->at($values, $header, ['CANTIDADCUM'])),
+                    'unidad' => $this->stringValue($this->at($values, $header, ['UNIDAD'])),
+                    'cantidad' => $this->numberValue($this->at($values, $header, ['CANTIDAD'])),
+                    'unidad_medida' => $this->stringValue($this->at($values, $header, ['UNIDADMEDIDA'])),
+                    'unidad_referencia' => $this->stringValue($this->at($values, $header, ['UNIDADREFERENCIA'])),
+                    'muestra_medica' => $this->stringValue($this->at($values, $header, ['MUESTRAMEDICA'])),
+                    'fecha_activo' => $this->registryDate($this->at($values, $header, ['FECHAACTIVO'])),
+                    'fecha_inactivo' => $this->registryDate($this->at($values, $header, ['FECHAINACTIVO'])),
                 ];
                 $description = $metadata['principio_activo'] !== ''
                     ? $metadata['principio_activo']
@@ -320,7 +539,7 @@ class CatalogoReferenciaImporter
                 $normalisedName === 'POBLACION' => $this->importPopulation($rows, $catalogo, $route),
                 default => 0,
             };
-        });
+        }, preserveEmptyRows: true);
     }
 
     /**
@@ -528,6 +747,11 @@ class CatalogoReferenciaImporter
                 'frecuencia_mensual' => $this->numberValue($this->at($values, $header, ['FRECUENCIA MES CERVIX', 'FRECUENCIA MES PROSTATA'])),
                 'cantidad_mensual' => $this->numberValue($this->at($values, $header, ['CANTIDAD MES CERVIX', 'CANTIDAD MES PROSTATA'])),
             ];
+            $servicio = $this->stringValue($this->at($values, $header, ['SERVICIO']));
+
+            if ($servicio !== '') {
+                $metadata['servicio'] = $servicio;
+            }
 
             $items[] = $this->item(
                 $catalogo,
@@ -551,7 +775,7 @@ class CatalogoReferenciaImporter
         $items = [];
         $count = 0;
 
-        foreach ($rows as $row) {
+        foreach ($rows as $rowNumber => $row) {
             $values = $this->rowValues($row);
             $code = $header === null ? '' : $this->normaliseCode($this->at($values, $header, ['CUPS']));
 
@@ -579,7 +803,9 @@ class CatalogoReferenciaImporter
             $category = $section === 'QUIMIOTERAPIA'
                 ? 'ONCOLOGIA_QUIMIOTERAPIA'
                 : 'ONCOLOGIA_RADIOTERAPIA';
-            $scheme = $this->stringValue($this->at($values, $header, ['MXS CONTEMPLADOS', 'ESQUEMA', 'MEDICAMENTO']));
+            $schemeAliases = ['MXS CONTEMPLADOS EN EL ESQUEMA', 'MXS CONTEMPLADOS', 'ESQUEMA', 'MEDICAMENTO'];
+            $quantityAliases = ['CANTIDAD MES', 'CANTIDAD', 'FRECUENCIA'];
+            $scheme = $this->stringValue($this->at($values, $header, $schemeAliases));
             $applicationRate = $this->numberValue($this->at($values, $header, ['TARIFA APLICACION CICLO', 'TARIFA']));
             $treatmentRate = $this->numberValue($this->at($values, $header, ['TARIFA TRATAMIENTO', 'TARIFA']));
             $tariff = $category === 'ONCOLOGIA_QUIMIOTERAPIA' ? $applicationRate : $treatmentRate;
@@ -594,7 +820,18 @@ class CatalogoReferenciaImporter
                 [
                     'esquema' => $scheme,
                     'tarifa_medicamento' => $this->numberValue($this->at($values, $header, ['TARIFA MEDICAMENTO'])),
-                    'cantidad_referencia' => $this->numberValue($this->at($values, $header, ['CANTIDAD', 'FRECUENCIA'])),
+                    'cantidad_referencia' => $this->numberValue($this->at($values, $header, $quantityAliases)),
+                    'frecuencia_anual' => $this->numberValue($this->at($values, $header, ['FREC ANO', 'FRECUENCIA ANUAL'])),
+                    'naturaleza_cantidad' => 'PROYECCION_NOTA_TECNICA',
+                    'unidad_referencia' => $category === 'ONCOLOGIA_QUIMIOTERAPIA' ? 'APLICACION_CICLO' : 'TRATAMIENTO',
+                    'unidad_contractual' => null,
+                    'fuente_celdas' => [
+                        'tarifa' => $this->sourceCell($values, $header, $category === 'ONCOLOGIA_QUIMIOTERAPIA' ? ['TARIFA APLICACION CICLO', 'TARIFA'] : ['TARIFA TRATAMIENTO', 'TARIFA'], (int) $rowNumber),
+                        'tarifa_medicamento' => $this->sourceCell($values, $header, ['TARIFA MEDICAMENTO'], (int) $rowNumber),
+                        'cantidad_referencia' => $this->sourceCell($values, $header, $quantityAliases, (int) $rowNumber),
+                        'esquema' => $this->sourceCell($values, $header, $schemeAliases, (int) $rowNumber),
+                        'frecuencia_anual' => $this->sourceCell($values, $header, ['FREC ANO', 'FRECUENCIA ANUAL'], (int) $rowNumber),
+                    ],
                 ]
             );
             $count += $this->flushItems($items);
@@ -789,19 +1026,42 @@ class CatalogoReferenciaImporter
             'ALBERGUE' => [],
         ];
 
-        foreach ($rows as $row) {
+        $sourceCells = ['TRANSPORTE' => [], 'ALBERGUE' => []];
+        $blocks = [];
+        foreach ($rows as $rowNumber => $row) {
             $values = $this->rowValues($row);
 
             foreach ([[0, 1], [4, 5]] as [$labelIndex, $valueIndex]) {
                 $label = $this->stringValue($values[$labelIndex] ?? null);
                 $value = $this->numberValue($values[$valueIndex] ?? null);
-                $key = str_contains($this->normaliseHeader($label), 'ALBERGUE') ? 'ALBERGUE' : 'TRANSPORTE';
+                $normalisedLabel = $this->normaliseHeader($label);
+                if (str_contains($normalisedLabel, 'TARIFA')) {
+                    $block = match (true) {
+                        str_contains($normalisedLabel, 'ALBERGUE') => 'ALBERGUE',
+                        str_contains($normalisedLabel, 'TRANSPORTE') => 'TRANSPORTE',
+                        default => null,
+                    };
+                    if ($block !== null) {
+                        $blocks[$labelIndex] = $block;
+                    }
+                }
+                $key = $blocks[$labelIndex] ?? null;
 
-                if ($label === '' || $value === null) {
+                if ($key === null || $label === '' || $value === null) {
                     continue;
                 }
 
                 $references[$key][$label] = $value;
+                $field = match (true) {
+                    str_contains($normalisedLabel, 'TARIFA') => 'tarifa',
+                    str_contains($normalisedLabel, 'FRECUENCIA') => 'frecuencia_anual',
+                    str_starts_with($normalisedLabel, 'COSTO') => 'costo_anual',
+                    str_starts_with($normalisedLabel, 'TOTAL') => 'cantidad_proyectada',
+                    default => null,
+                };
+                if ($field !== null) {
+                    $sourceCells[$key][$field] = $this->sourceCell($values, [$normalisedLabel => $valueIndex], [$label], (int) $rowNumber);
+                }
             }
         }
 
@@ -825,7 +1085,14 @@ class CatalogoReferenciaImporter
                 'TRANSPORTE_ALBERGUE',
                 Str::ucfirst(Str::lower($key)),
                 $tariff,
-                ['valores_referencia' => $values]
+                [
+                    'valores_referencia' => $values,
+                    'cantidad_proyectada' => $sourceCells[$key]['cantidad_proyectada']['valor_original'] ?? null,
+                    'frecuencia_anual' => $sourceCells[$key]['frecuencia_anual']['valor_original'] ?? null,
+                    'naturaleza_cantidad' => 'PROYECCION_NOTA_TECNICA',
+                    'unidad_contractual' => null,
+                    'fuente_celdas' => $sourceCells[$key],
+                ]
             );
         }
 
@@ -835,9 +1102,49 @@ class CatalogoReferenciaImporter
     /**
      * @param  callable(string, iterable<int, Row>): int  $readSheet
      */
-    private function readWorkbook(string $path, callable $readSheet): int
+    /**
+     * Convierte un serial de Excel en fecha según el sistema del libro. En el
+     * sistema 1900, Excel cuenta el 29 de febrero de 1900, que no existe.
+     */
+    private function excelSerialDate(float $serial): ?DateTimeImmutable
     {
-        $reader = new Reader;
+        $days = (int) floor($serial);
+
+        if ($days < 0 || $days > 2958465) {
+            return null;
+        }
+
+        if ($this->date1904) {
+            return (new DateTimeImmutable('1904-01-01'))->modify('+'.$days.' days');
+        }
+
+        if ($days < 1) {
+            return null;
+        }
+
+        return (new DateTimeImmutable('1899-12-31'))->modify('+'.($days >= 60 ? $days - 1 : $days).' days');
+    }
+
+    private function workbookUsesDate1904(string $path): bool
+    {
+        $zip = new \ZipArchive;
+
+        if ($zip->open($path) !== true) {
+            return false;
+        }
+
+        $workbook = (string) $zip->getFromName('xl/workbook.xml');
+        $zip->close();
+
+        return preg_match('/<(?:\w+:)?workbookPr\b[^>]*\bdate1904="(?:1|true)"/i', $workbook) === 1;
+    }
+
+    private function readWorkbook(string $path, callable $readSheet, bool $preserveEmptyRows = false): int
+    {
+        $this->date1904 = $this->workbookUsesDate1904($path);
+        $options = new Options;
+        $options->SHOULD_PRESERVE_EMPTY_ROWS = $preserveEmptyRows;
+        $reader = new Reader($options);
         $reader->open($path);
         $count = 0;
 
@@ -907,6 +1214,33 @@ class CatalogoReferenciaImporter
     }
 
     /**
+     * @param  array<int, mixed>  $values
+     * @param  array<string, int>  $header
+     * @param  list<string>  $aliases
+     * @return array{hoja: string, celda: string, valor_original: mixed}|null
+     */
+    private function sourceCell(array $values, array $header, array $aliases, int $rowNumber): ?array
+    {
+        foreach ($aliases as $alias) {
+            $index = $header[$this->normaliseHeader($alias)] ?? null;
+            if ($index === null) {
+                continue;
+            }
+            $column = '';
+            $position = $index + 1;
+            while ($position > 0) {
+                $position--;
+                $column = chr(65 + $position % 26).$column;
+                $position = intdiv($position, 26);
+            }
+
+            return ['hoja' => $this->currentSheet, 'celda' => $column.$rowNumber, 'valor_original' => $values[$index] ?? null];
+        }
+
+        return null;
+    }
+
+    /**
      * @param  array<string, mixed>  $metadata
      * @return array<string, mixed>
      */
@@ -920,6 +1254,14 @@ class CatalogoReferenciaImporter
         array $metadata = []
     ): array {
         $timestamp = now();
+
+        if ($rate !== null && in_array($catalogo->tipo, [
+            self::TYPE_NOTA_PROSTATA,
+            self::TYPE_NOTA_CERVIX,
+            self::TYPE_NOTA_MEDICAMENTOS,
+        ], true)) {
+            $metadata['tarifa_fuente_precision'] = $rate;
+        }
 
         return [
             'catalogo_referencia_id' => $catalogo->id,
@@ -1038,6 +1380,11 @@ class CatalogoReferenciaImporter
     {
         if ($value instanceof DateTimeInterface) {
             return $value->format('Y-m-d');
+        }
+
+        // Fecha guardada como número serial de Excel (celda con formato General).
+        if (is_int($value) || is_float($value) || preg_match('/^\d{1,7}(\.\d+)?$/', $this->stringValue($value)) === 1) {
+            return $this->excelSerialDate((float) $this->stringValue($value))?->format('Y-m-d') ?? '';
         }
 
         $value = $this->stringValue($value);

@@ -2,21 +2,33 @@
 
 namespace App\Http\Controllers;
 
+use App\Exceptions\LibroPaquetesException;
+use App\Models\CatalogoReferencia;
 use App\Models\ProgramaEjecucion;
+use App\Programas\LaMaria\ConciliacionRipsNota;
 use App\Programas\LaMaria\CondicionArchivo;
 use App\Programas\LaMaria\EstadoClinico;
 use App\Programas\LaMaria\EstadoDuplicidad;
 use App\Programas\LaMaria\EstadoTarifario;
+use App\Programas\LaMaria\ExplicacionBrecha;
 use App\Programas\LaMaria\FuenteTarifa;
+use App\Programas\LaMaria\HistorialAdministrativo;
 use App\Programas\LaMaria\LaMariaCervixPipeline;
 use App\Programas\LaMaria\LaMariaPrograma;
 use App\Programas\LaMaria\LaMariaProstataPipeline;
+use App\Programas\LaMaria\LibroPaquetesEjecucion;
+use App\Programas\LaMaria\ModoLibroPaquetes;
+use App\Programas\LaMaria\PoliticaPaqueteHospitalario;
+use App\Programas\LaMaria\ReconstructorEpisodiosHospitalarios;
+use App\Programas\LaMaria\ResumenEconomico;
 use App\Programas\LaMaria\RutaCalculo;
+use App\Programas\LaMaria\ValorizacionAdministrativa;
 use App\Services\ActivityLogger;
 use App\Services\ReferenciaRutaMatcher;
 use App\Services\SeguimientoRutaClassifier;
 use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -42,7 +54,7 @@ class SeguimientoRutaController extends Controller
 
     private const CODIGO_FIELDS = ['codConsulta', 'codProcedimiento', 'codTecnologiaSalud'];
 
-    private const CANTIDAD_FIELDS = ['cantidadMedicamento', 'cantidadOS'];
+    private const CANTIDAD_FIELDS = ['cantidadMedicamento', 'cantidadOS', 'cantidad', 'cantDispensada', 'cantSuministrada'];
 
     private const VR_UNIT_FIELDS = ['vrUnitMedicamento', 'vrUnitOS'];
 
@@ -68,7 +80,7 @@ class SeguimientoRutaController extends Controller
     ];
 
     private const MONTHLY_SUMMARY_HEADERS = [
-        'MES', 'PACIENTES', 'SERVICIOS', 'COSTO TOTAL', 'CASOS A REVISAR',
+        'MES', 'PACIENTES', 'SERVICIOS', 'COSTO ACTIVO (A + CONDICIONADO)', 'CASOS A REVISAR',
         'SERVICIOS SIN TARIFA APLICADA',
     ];
 
@@ -76,9 +88,9 @@ class SeguimientoRutaController extends Controller
         'MES', 'tipoDocumentoIdentificacion', 'numDocumentoIdentificacion', 'codSexo',
         'fechaNacimiento', 'codMunicipioResidencia', 'codZonaTerritorialResidencia', 'tipoUsuario',
         'codDiagnosticoPrincipal (valores del mes)', 'numFactura (facturas del mes)',
-        'PRIMERA ATENCION', 'ULTIMA ATENCION', 'CONSULTAS', 'PROCEDIMIENTOS', 'MEDICAMENTOS',
+        'PRIMERA ATENCION', 'ULTIMA ATENCION', 'CONSULTAS', 'PROCEDIMIENTOS', 'MEDICAMENTOS (LINEAS)',
         'OTROS SERVICIOS', 'URGENCIAS', 'HOSPITALIZACIONES', 'TOTAL SERVICIOS',
-        'SERVICIOS SIN TARIFA APLICADA', 'COSTO TOTAL', 'OBSERVACION',
+        'SERVICIOS SIN TARIFA APLICADA', 'COSTO ACTIVO (A + CONDICIONADO)', 'OBSERVACION',
     ];
 
     private const REVIEW_HEADERS = [
@@ -110,17 +122,43 @@ class SeguimientoRutaController extends Controller
         'COINCIDENCIAS EN DETALLE', 'ESTADO',
     ];
 
+    private const PACKAGE_LEDGER_HEADERS = ['LIBRO DE PAQUETES', 'VALOR', 'OBSERVACION'];
+
+    private const HOSPITAL_CONTROL_HEADERS = [
+        'CONTROL HOSPITALARIO (MES)', 'PAQUETES', 'COSTO PAQUETES', 'SERVICIOS ABSORBIDOS',
+        'COSTO INDIVIDUAL EXCLUIDO', 'SERVICIOS COBRADOS POR FUERA', 'COSTO COBRADO POR FUERA',
+        'SERVICIOS REGLA PENDIENTE', 'URGENCIAS COBRADAS', 'COSTO REFERENCIA URGENCIA PENDIENTE', 'OBSERVACION',
+    ];
+
+    private const HOSPITAL_EPISODE_HEADERS = ['EPISODIOS HOSPITALARIOS', 'CANTIDAD', 'OBSERVACION'];
+
     private const CONTROL_HEADERS = [
         'ARCHIVO', 'numFactura', 'tipoNota', 'numNota', 'USUARIOS', 'SERVICIOS',
         'SERVICIOS SIN FECHA', 'MES INICIAL', 'MES FINAL', 'ESTADO CARGUE', 'OBSERVACION',
     ];
 
+    private const RECEPTION_HEADERS = ['RECEPCION DE ARCHIVOS', 'CANTIDAD', 'ARCHIVOS', 'OBSERVACION'];
+
+    private const ROUTE_NAMES = ['PROSTATA' => 'PRÓSTATA', 'CERVIX' => 'CÉRVIX'];
+
+    /** Informes administrativos históricos opcionales por carga (uno por programa). */
+    private const ADMINISTRATIVE_REPORT_LIMIT = 2;
+
+    private const PROCESSING_ERROR = 'No se pudo generar el reporte por un error interno al procesar los archivos; quedó registrado para revisión. Ningún archivo se omitió en silencio: no se generó un consolidado parcial.';
+
+    private const ECONOMIC_STATE_HEADERS = [
+        'MES', 'FACTURA', 'TIPO SERVICIO', 'CODIGO RIPS', 'CANTIDAD ORIGINAL', 'TARIFA REFERENCIA',
+        'CUM RESUELTO', 'METODO RESOLUCION', 'ESTADO ECONOMICO', 'COSTO RESPALDADO', 'CONDICIONADO INCLUIDO',
+        'DISPENSACION ADMINISTRATIVA EN ESCENARIO', 'ESCENARIO REFERENCIAL', 'EXTERNO POTENCIAL NO SUMADO',
+        'MOTIVO', 'FUENTE TARIFA', 'GRUPO NOTA', 'FACTURACION APROBADA',
+    ];
+
     private const CONCILIATION_HEADERS = [
-        'CONCILIACION', 'SERVICIOS', 'PACIENTE-MES', 'COSTO TOTAL', 'OBSERVACION',
+        'CONCILIACION', 'SERVICIOS', 'PACIENTE-MES', 'COSTO ACTIVO (A + CONDICIONADO)', 'OBSERVACION',
     ];
 
     private const SQL_HEADERS = [
-        'DOCUMENTO', 'ENCONTRADO EN SQL', 'RUTA', 'ESTADO VALIDACION', 'OBSERVACION',
+        'DOCUMENTO', 'RESULTADO', 'OBSERVACION',
     ];
 
     /**
@@ -144,6 +182,12 @@ class SeguimientoRutaController extends Controller
                 $pipeline->ownedCatalogTypes()
             ),
             'exportRoute' => route('la-maria.'.$ejecucion.'.export'),
+            'limiteArchivos' => self::uploadLimit(),
+            'resultado' => $this->sessionResult('la-maria.resultado.'.$ejecucion),
+            'pacientesDemo' => session('la-maria.pacientes.'.$ejecucion, []),
+            'categoriasEconomicas' => session('la-maria.categorias.'.$ejecucion, []),
+            'fuentesCatalogos' => CatalogoReferencia::query()->forPrograma(LaMariaPrograma::SLUG)->active()
+                ->whereIn('tipo', $pipeline->ownedCatalogTypes())->get(['id', 'tipo', 'version', 'archivo_origen', 'fecha_referencia']),
         ]);
     }
 
@@ -157,32 +201,27 @@ class SeguimientoRutaController extends Controller
         $ruta = (string) $pipeline->rutaCodigo();
         $referenciaRutaMatcher = new ReferenciaRutaMatcher;
 
-        $validated = $request->validate([
-            'archivos' => ['required', 'array', 'min:1', 'max:25'],
-            'archivos.*' => [
-                'required',
-                'file',
-                'mimes:json,txt',
-                'extensions:json,txt',
-                'max:512000',
-            ],
-            'sql_archivo' => ['nullable', 'file', 'mimes:sql,txt', 'extensions:sql,txt', 'max:102400'],
-        ], [
-            'archivos.required' => 'Selecciona al menos un archivo JSON.',
-            'archivos.array' => 'Selecciona los archivos JSON para procesar.',
-            'archivos.min' => 'Selecciona al menos un archivo JSON.',
-            'archivos.max' => 'Puedes cargar hasta 25 archivos por vez.',
-            'archivos.*.mimes' => 'Cada archivo debe ser un JSON válido.',
-            'archivos.*.extensions' => 'Cada archivo debe tener extensión .json o .txt.',
-            'archivos.*.max' => 'Cada archivo puede pesar hasta 500 MB.',
-            'sql_archivo.file' => 'El archivo SQL no es válido.',
-            'sql_archivo.max' => 'El archivo SQL puede pesar hasta 100 MB.',
-        ]);
+        $validated = $this->validateUpload($request);
 
         $sqlFile = $request->file('sql_archivo');
 
         $files = $this->uploadedFiles($validated['archivos']);
+        $recepcion = $this->verifyReception($request, $validated['archivos'], $files, $seguimientoRutaClassifier);
+        $historialAdministrativo = $this->administrativeHistory($validated, [$ruta]);
         $batchId = (string) Str::uuid();
+        $modoPaquetes = LibroPaquetesEjecucion::modo();
+        $esCorreccion = (bool) ($validated['correccion_autorizada'] ?? false);
+        $libroEjecucion = null;
+
+        if ($modoPaquetes === ModoLibroPaquetes::Persistente) {
+            $libroEjecucion = app(LibroPaquetesEjecucion::class);
+
+            try {
+                $libroEjecucion->prepararClasificador($seguimientoRutaClassifier, $ruta, $esCorreccion);
+            } catch (LibroPaquetesException $exception) {
+                throw ValidationException::withMessages(['archivos' => $exception->getMessage()]);
+            }
+        }
         $fileName = 'LA_MARIA_'.$ruta.'_'.now()->format('Ymd_His').'_'
             .Str::lower(Str::random(8)).'.xlsx';
         $outputDirectory = storage_path('app/generated');
@@ -203,7 +242,14 @@ class SeguimientoRutaController extends Controller
         $reviewRowsStream = null;
         $notFoundRowsStream = null;
 
+        $resultadoLibro = null;
+
         try {
+            // En modo PERSISTENTE el libro y la ejecución se confirman juntos.
+            if ($libroEjecucion !== null) {
+                DB::beginTransaction();
+            }
+
             $screenedFiles = $seguimientoRutaClassifier->screenFiles($files);
             $processableFiles = $seguimientoRutaClassifier->processableFiles($screenedFiles);
             $allProfiles = $seguimientoRutaClassifier->profilesForFiles($processableFiles);
@@ -217,6 +263,19 @@ class SeguimientoRutaController extends Controller
             $allProfiles = $evaluation['profiles'];
             $profiles = $seguimientoRutaClassifier->profilesForExecutionRoute($allProfiles, $ruta);
             $sharedProfiles = $seguimientoRutaClassifier->profilesNotAssignable($allProfiles);
+            $resultadoLibro = $libroEjecucion?->registrar(
+                $seguimientoRutaClassifier,
+                $processableFiles,
+                $allProfiles,
+                $profiles,
+                $ruta,
+                $batchId,
+                $esCorreccion
+            );
+            $patientConciliation = $seguimientoRutaClassifier->patientConciliationForFiles(
+                $processableFiles,
+                $allProfiles
+            );
             $controlRows = iterator_to_array(
                 $seguimientoRutaClassifier->controlRowsForFiles($screenedFiles),
                 false
@@ -226,7 +285,7 @@ class SeguimientoRutaController extends Controller
 
             $summarySheet = $writer->getCurrentSheet();
             $summarySheet->setName('SEGUIMIENTO MENSUAL');
-            $this->configureSheet($summarySheet, $this->columnWidths(self::MONTHLY_SUMMARY_HEADERS));
+            $this->configureSheet($summarySheet, $this->summarySheetWidths(self::MONTHLY_SUMMARY_HEADERS));
             $writer->addRow(Row::fromValues(self::MONTHLY_SUMMARY_HEADERS, $this->headerStyle()));
 
             foreach ($this->monthlySummaries($profiles, $sharedProfiles) as $summary) {
@@ -249,6 +308,11 @@ class SeguimientoRutaController extends Controller
             $this->configureSheet($detailSheet, $this->columnWidths($detailHeaders));
             $writer->addRow(Row::fromValues($detailHeaders, $this->headerStyle()));
             $detailMoneyStyles = $this->moneyColumnStyles($detailHeaders);
+            $resumenEconomico = new ResumenEconomico($ruta, $referenciaRutaMatcher->entradasNotaTecnica($ruta));
+            $conciliacionRipsNota = new ConciliacionRipsNota((string) config('app.key'));
+            $valorizacion = $this->administrativeValuation($ruta, $historialAdministrativo, $referenciaRutaMatcher);
+            $estadosEconomicos = [];
+            $categoriasEconomicas = [];
 
             $reviewRowsStream = $this->openTemporaryRowsStream($reviewRowsPath);
             $notFoundRowsStream = $this->openTemporaryRowsStream($notFoundRowsPath);
@@ -264,6 +328,22 @@ class SeguimientoRutaController extends Controller
                 $duplicateIndex
             ) as $detail) {
                 $writer->addRow(Row::fromValuesWithStyles($this->columnValues($detailColumns, $detail), null, $detailMoneyStyles));
+                $estadoEconomico = $resumenEconomico->registrar($detail);
+                $conciliacionRipsNota->registrar($detail, $estadoEconomico);
+                $valorizacion->registrar($detail, $estadoEconomico);
+                $estadosEconomicos[] = [$detail['mesAtencion'], $detail['factura'], $detail['tipoServicio'], $detail['codigo'],
+                    $detail['cantidad'], $detail['tarifaReferencia'], $detail['cumResuelto'] ?? '', $detail['metodoResolucion'] ?? '',
+                    $estadoEconomico['estado'], $estadoEconomico['respaldado'], $estadoEconomico['condicionadoIncluido'],
+                    $estadoEconomico['referencialAdicional'], $estadoEconomico['escenarioReferencial'],
+                    $estadoEconomico['condicionadoExterno'], $estadoEconomico['motivo'], $detail['fuenteTarifa'],
+                    $estadoEconomico['grupoNota'], 'NO'];
+                $categoria = $detail['tipoServicio'] === 'medicamentos' ? 'Medicamentos' : ($detail['grupoTecnico'] ?: $detail['tipoServicio']);
+                $categoriaKey = $detail['mesAtencion'].'|'.$categoria;
+                $categoriasEconomicas[$categoriaKey] ??= [$detail['mesAtencion'], $categoria, 0, 0, 0, 0];
+                $categoriasEconomicas[$categoriaKey][2]++;
+                $categoriasEconomicas[$categoriaKey][3] += (int) round($estadoEconomico['respaldado'] * 100);
+                $categoriasEconomicas[$categoriaKey][4] += (int) round($estadoEconomico['condicionadoIncluido'] * 100);
+                $categoriasEconomicas[$categoriaKey][5] += (int) round($estadoEconomico['condicionadoExterno'] * 100);
 
                 if ($detail['requiereRevision']) {
                     $this->writeTemporaryRow($reviewRowsStream, $this->reviewValues($detail));
@@ -286,6 +366,11 @@ class SeguimientoRutaController extends Controller
                 $duplicateIndex
             ) as $detail) {
                 $this->writeTemporaryRow($reviewRowsStream, $this->reviewValues($detail));
+                $reviewRowCount++;
+            }
+
+            foreach ($patientConciliation['noRepresentados'] as $usuario) {
+                $this->writeTemporaryRow($reviewRowsStream, $this->unrepresentedPatientValues($usuario));
                 $reviewRowCount++;
             }
 
@@ -360,22 +445,83 @@ class SeguimientoRutaController extends Controller
             }
 
             $writer->addRow(Row::fromValues(['']));
+            $writer->addRow(Row::fromValues(self::RECEPTION_HEADERS, $this->headerStyle()));
+
+            foreach ($this->receptionRows($recepcion, $controlRows) as $receptionRow) {
+                $writer->addRow(Row::fromValues($receptionRow));
+            }
+
+            $writer->addRow(Row::fromValues(['']));
             $writer->addRow(Row::fromValues(self::CONCILIATION_HEADERS, $this->headerStyle()));
 
-            foreach ($this->conciliationRows($controlRows, $allProfiles, $ruta) as $conciliation) {
+            foreach ([
+                ...$this->conciliationRows($controlRows, $allProfiles, $ruta),
+                ...$this->patientConciliationRows($patientConciliation),
+            ] as $conciliation) {
                 $writer->addRow(Row::fromValuesWithStyles($conciliation, null, $this->moneyColumnStyles(self::CONCILIATION_HEADERS)));
+            }
+
+            $writer->addRow(Row::fromValues(['']));
+            $writer->addRow(Row::fromValues(self::HOSPITAL_CONTROL_HEADERS, $this->headerStyle()));
+
+            foreach ($this->hospitalControlRows($profiles) as $hospitalControl) {
+                $writer->addRow(Row::fromValuesWithStyles($hospitalControl, null, $this->moneyColumnStyles(self::HOSPITAL_CONTROL_HEADERS)));
+            }
+
+            $writer->addRow(Row::fromValues(['']));
+            $writer->addRow(Row::fromValues(self::HOSPITAL_EPISODE_HEADERS, $this->headerStyle()));
+
+            foreach ($this->hospitalEpisodeRows($evaluation['episodios'], $profiles, $ruta) as $episodeRow) {
+                $writer->addRow(Row::fromValues($episodeRow));
+            }
+
+            $writer->addRow(Row::fromValues(['']));
+            $writer->addRow(Row::fromValues(self::PACKAGE_LEDGER_HEADERS, $this->headerStyle()));
+
+            foreach (LibroPaquetesEjecucion::filasControl($resultadoLibro) as $ledgerRow) {
+                $writer->addRow(Row::fromValues($ledgerRow));
             }
 
             if ($sqlFile instanceof UploadedFile) {
                 $sqlSheet = $writer->addNewSheetAndMakeItCurrent();
                 $sqlSheet->setName('VALIDACION SQL');
-                $this->configureSheet($sqlSheet, [24, 22, 14, 24, 70]);
+                $this->configureSheet($sqlSheet, [24, 30, 80]);
                 $writer->addRow(Row::fromValues(self::SQL_HEADERS, $this->headerStyle()));
-                foreach ($this->sqlValidationRows($sqlFile, $profiles, $ruta) as $row) {
+                foreach ($this->sqlValidationRows($sqlFile, $profiles, $allProfiles) as $row) {
                     $writer->addRow(Row::fromValues($row));
                 }
             }
 
+            $resultadoEconomico = $this->economicResult($resumenEconomico, $profiles, $sharedProfiles, $ruta);
+            $conciliacionRipsNota->atribuirPaquetes($resultadoEconomico['hospitalizacion']);
+            $valorizacion->atribuirPaquetes($resultadoEconomico['hospitalizacion']);
+            $valorizacion->atribuirUrgencias($conciliacionRipsNota->filasEpisodiosUrgencias(), $conciliacionRipsNota->costoUrgenciasPorTipo());
+            $estimacionAdministrativa = $this->writeAdministrativeSheets($writer, [$ruta => $valorizacion], [$ruta => $resultadoEconomico]);
+            $writer->addNewSheetAndMakeItCurrent()->setName('ESTADOS ECONOMICOS');
+            $writer->addRow(Row::fromValues(self::ECONOMIC_STATE_HEADERS, $this->headerStyle()));
+            foreach ($estadosEconomicos as $filaEstado) {
+                $writer->addRow(Row::fromValues($filaEstado));
+            }
+            $hospitalizacionDemo = $resultadoEconomico['hospitalizacion'];
+            foreach ($hospitalizacionDemo as $filaHospital) {
+                if ($filaHospital[0] !== 'TOTAL') {
+                    $categoriasEconomicas[$filaHospital[0].'|Paquetes hospitalarios'] = [$filaHospital[0], 'Paquetes hospitalarios', $filaHospital[1], (int) round($filaHospital[2] * 100), 0, 0];
+                }
+            }
+            ksort($categoriasEconomicas);
+            foreach ($categoriasEconomicas as &$filaCategoria) {
+                foreach ([3, 4, 5] as $columnaCosto) {
+                    $filaCategoria[$columnaCosto] /= 100.0;
+                }
+            }
+            unset($filaCategoria);
+            $writer->addNewSheetAndMakeItCurrent()->setName('COSTOS POR CATEGORIA');
+            $writer->addRow(Row::fromValues(['MES', 'CATEGORIA', 'REGISTROS / PAQUETES', 'COSTO RESPALDADO', 'CONDICIONADO INCLUIDO', 'CONDICIONADO EXTERNO NO SUMADO'], $this->headerStyle()));
+            foreach ($categoriasEconomicas as $filaCategoria) {
+                $writer->addRow(Row::fromValues($filaCategoria));
+            }
+            $writer->setCurrentSheet($summarySheet);
+            $this->writeServiceSummary($writer, [$ruta => $valorizacion], [$ruta => $resultadoEconomico], $historialAdministrativo);
             $writer->close();
             $writerClosed = true;
 
@@ -388,10 +534,23 @@ class SeguimientoRutaController extends Controller
                     'excel_file' => $fileName,
                     'programa' => $pipeline->slug(),
                     'ruta' => $ruta,
+                    'files_sha256' => array_combine(
+                        array_column($files, 'fileName'),
+                        array_map(static fn (array $file): string => (string) hash_file('sha256', $file['path']), $files)
+                    ),
+                    'modo_paquetes' => $modoPaquetes->value,
+                    'correccion_autorizada' => $esCorreccion,
+                    'libro_paquetes' => $resultadoLibro === null ? null : array_diff_key($resultadoLibro, ['resumen' => true]),
+                    'recepcion' => array_diff_key($recepcion, ['archivos' => true]),
+                    'costos_y_brechas' => $resultadoEconomico['costos'],
+                    'valorizacion_administrativa' => [
+                        'fuentes' => $historialAdministrativo->fuentes(),
+                        'totales' => $valorizacion->totalesPorMes(),
+                    ],
                 ]
             );
 
-            ProgramaEjecucion::query()->create([
+            $ejecucion = ProgramaEjecucion::query()->create([
                 'programa_slug' => $pipeline->slug(),
                 'contrato_id' => null,
                 'user_id' => $request->user()?->id,
@@ -401,11 +560,32 @@ class SeguimientoRutaController extends Controller
                 'catalogos_aplicados' => $referenciaRutaMatcher->appliedCatalogsSnapshot(),
                 'archivos_procesados' => count($files),
             ]);
+
+            if ($libroEjecucion !== null) {
+                foreach (['hospital_segmentos', 'hospital_paquete_movimientos'] as $tabla) {
+                    DB::table($tabla)->where('ejecucion_origen', $batchId)->update(['programa_ejecucion_id' => $ejecucion->id]);
+                }
+
+                DB::commit();
+            }
+            $this->storeResultInSession($request, strtolower($ruta), [$resultadoEconomico], $recepcion, $controlRows, $estimacionAdministrativa);
+            $request->session()->put('la-maria.categorias.'.strtolower($ruta), array_values($categoriasEconomicas));
+            $pacientesDemo = array_values(array_map(static fn (array $profile): array => [$profile['mesAtencion'],
+                'Paciente-mes '.substr(hash_hmac('sha256', $profile['profileKey'], (string) config('app.key')), 0, 12),
+                $profile['estadoClinico'], $profile['serviceCount'], round($profile['costoValido'] + $profile['costoValidoConAlerta'], 2),
+                $profile['serviceCounts']['medicamentos'], $profile['controlHospitalario']['paquetes']], $profiles));
+            $request->session()->put('la-maria.pacientes.'.strtolower($ruta), $pacientesDemo);
         } catch (\Throwable $exception) {
+            if ($libroEjecucion !== null && DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
             report($exception);
 
             throw ValidationException::withMessages([
-                'archivos' => 'Uno de los archivos no contiene la estructura RIPS esperada (usuarios).',
+                'archivos' => $exception instanceof LibroPaquetesException
+                    ? $exception->getMessage()
+                    : self::PROCESSING_ERROR,
             ]);
         } finally {
             if (is_resource($reviewRowsStream)) {
@@ -424,6 +604,168 @@ class SeguimientoRutaController extends Controller
             File::deleteDirectory($tempFolder);
         }
 
+        return $this->excelDownload($outputPath, $fileName);
+    }
+
+    /**
+     * Consolidado económico de Próstata y Cérvix con los mismos archivos y el
+     * mismo cálculo de cada ruta. No incluye el detalle por servicio, que está
+     * en el Excel de cada ruta.
+     */
+    public function exportConsolidated(
+        Request $request,
+        SeguimientoRutaClassifier $seguimientoRutaClassifier,
+        ActivityLogger $activityLogger
+    ): BinaryFileResponse {
+        if (LibroPaquetesEjecucion::modo() === ModoLibroPaquetes::Persistente) {
+            throw ValidationException::withMessages([
+                'archivos' => 'Con el libro de paquetes PERSISTENTE genera el reporte de cada ruta: el consolidado se calcula por lote.',
+            ]);
+        }
+
+        $validated = $this->validateUpload($request);
+        $files = $this->uploadedFiles($validated['archivos']);
+        $recepcion = $this->verifyReception($request, $validated['archivos'], $files, $seguimientoRutaClassifier);
+        $historialAdministrativo = $this->administrativeHistory($validated, [LaMariaPrograma::RUTA_PROSTATA, LaMariaPrograma::RUTA_CERVIX]);
+        $referenciaRutaMatcher = new ReferenciaRutaMatcher;
+        $batchId = (string) Str::uuid();
+        $fileName = 'LA_MARIA_CONSOLIDADO_'.now()->format('Ymd_His').'_'.Str::lower(Str::random(8)).'.xlsx';
+        $outputDirectory = storage_path('app/generated');
+        $outputPath = $outputDirectory.DIRECTORY_SEPARATOR.$fileName;
+        $tempFolder = storage_path('app/openspout-temp/'.$batchId);
+        File::ensureDirectoryExists($outputDirectory);
+        File::ensureDirectoryExists($tempFolder);
+        $options = new Options;
+        $options->setTempFolder($tempFolder);
+        $writer = new Writer($options);
+        $writer->openToFile($outputPath);
+        $writerClosed = false;
+
+        try {
+            $screenedFiles = $seguimientoRutaClassifier->screenFiles($files);
+            $processableFiles = $seguimientoRutaClassifier->processableFiles($screenedFiles);
+            $allProfiles = $seguimientoRutaClassifier->profilesForFiles($processableFiles);
+            $duplicateIndex = $seguimientoRutaClassifier->duplicateIndexForFiles($processableFiles);
+            $evaluation = $seguimientoRutaClassifier->evaluateCostsForFiles($processableFiles, $allProfiles, $referenciaRutaMatcher, $duplicateIndex);
+            $allProfiles = $evaluation['profiles'];
+            $sharedProfiles = $seguimientoRutaClassifier->profilesNotAssignable($allProfiles);
+            $controlRows = iterator_to_array($seguimientoRutaClassifier->controlRowsForFiles($screenedFiles), false);
+            $resultados = [];
+            $valorizaciones = [];
+
+            foreach ([LaMariaPrograma::RUTA_PROSTATA, LaMariaPrograma::RUTA_CERVIX] as $ruta) {
+                $profiles = $seguimientoRutaClassifier->profilesForExecutionRoute($allProfiles, $ruta);
+                $resumenEconomico = new ResumenEconomico($ruta, $referenciaRutaMatcher->entradasNotaTecnica($ruta));
+                $conciliacionRipsNota = new ConciliacionRipsNota((string) config('app.key'));
+                $valorizaciones[$ruta] = $this->administrativeValuation($ruta, $historialAdministrativo, $referenciaRutaMatcher);
+
+                foreach ($seguimientoRutaClassifier->detailRowsForFiles($processableFiles, $profiles, $referenciaRutaMatcher, $ruta, $duplicateIndex) as $detail) {
+                    $estadoEconomico = $resumenEconomico->registrar($detail);
+                    $conciliacionRipsNota->registrar($detail, $estadoEconomico);
+                    $valorizaciones[$ruta]->registrar($detail, $estadoEconomico);
+                }
+
+                $resultados[$ruta] = $this->economicResult($resumenEconomico, $profiles, $sharedProfiles, $ruta);
+                $valorizaciones[$ruta]->atribuirPaquetes($resultados[$ruta]['hospitalizacion']);
+                $valorizaciones[$ruta]->atribuirUrgencias($conciliacionRipsNota->filasEpisodiosUrgencias(), $conciliacionRipsNota->costoUrgenciasPorTipo());
+            }
+
+            $summaryHeaders = ['RUTA', ...self::MONTHLY_SUMMARY_HEADERS];
+            $summarySheet = $writer->getCurrentSheet();
+            $summarySheet->setName('SEGUIMIENTO MENSUAL');
+            $this->configureSheet($summarySheet, $this->summarySheetWidths($summaryHeaders));
+            $writer->addRow(Row::fromValues($summaryHeaders, $this->headerStyle()));
+
+            foreach ($resultados as $resultado) {
+                foreach ($resultado['mensual'] as $summary) {
+                    $writer->addRow(Row::fromValuesWithStyles([$resultado['ruta'], ...$summary], null, $this->moneyColumnStyles($summaryHeaders)));
+                }
+            }
+
+            $this->writeServiceSummary($writer, $valorizaciones, $resultados, $historialAdministrativo);
+            $estimacionAdministrativa = $this->writeAdministrativeSheets($writer, $valorizaciones, $resultados);
+
+            $controlSheet = $writer->addNewSheetAndMakeItCurrent();
+            $controlSheet->setName('CONTROL DE CARGUE');
+            $this->configureSheet($controlSheet, [34, 18, 12, 12, 12, 12, 18, 14, 14, 16, 90]);
+            $writer->addRow(Row::fromValues(self::CONTROL_HEADERS, $this->headerStyle()));
+
+            foreach ($this->controlValues($controlRows, $evaluation['archivos']) as $control) {
+                $writer->addRow(Row::fromValues($control));
+            }
+
+            $writer->addRow(Row::fromValues(['']));
+            $writer->addRow(Row::fromValues(self::RECEPTION_HEADERS, $this->headerStyle()));
+
+            foreach ($this->receptionRows($recepcion, $controlRows) as $receptionRow) {
+                $writer->addRow(Row::fromValues($receptionRow));
+            }
+
+            $catalogSheet = $writer->addNewSheetAndMakeItCurrent();
+            $catalogSheet->setName('CATALOGOS APLICADOS');
+            $this->configureSheet($catalogSheet, [48, 24, 38, 22, 28, 16]);
+            $writer->addRow(Row::fromValues(self::CATALOG_HEADERS, $this->headerStyle()));
+
+            foreach ($referenciaRutaMatcher->catalogUsageRows() as $catalog) {
+                $writer->addRow(Row::fromValues($catalog));
+            }
+
+            $writer->close();
+            $writerClosed = true;
+
+            $activityLogger->log(
+                'seguimiento_rutas',
+                'Usuario generó el consolidado económico de La María (PROSTATA y CERVIX).',
+                [
+                    'batch_id' => $batchId,
+                    'files' => array_column($files, 'fileName'),
+                    'excel_file' => $fileName,
+                    'programa' => LaMariaPrograma::SLUG,
+                    'ruta' => 'CONSOLIDADO',
+                    'files_sha256' => array_combine(
+                        array_column($files, 'fileName'),
+                        array_map(static fn (array $file): string => (string) hash_file('sha256', $file['path']), $files)
+                    ),
+                    'modo_paquetes' => ModoLibroPaquetes::PorLote->value,
+                    'recepcion' => array_diff_key($recepcion, ['archivos' => true]),
+                    'costos_y_brechas' => array_merge(...array_column(array_values($resultados), 'costos')),
+                    'valorizacion_administrativa' => [
+                        'fuentes' => $historialAdministrativo->fuentes(),
+                        'totales' => array_map(static fn (ValorizacionAdministrativa $valorizacion): array => $valorizacion->totalesPorMes(), $valorizaciones),
+                    ],
+                ]
+            );
+
+            ProgramaEjecucion::query()->create([
+                'programa_slug' => LaMariaPrograma::SLUG,
+                'contrato_id' => null,
+                'user_id' => $request->user()?->id,
+                'periodo' => now()->format('Y-m'),
+                'batch_id' => $batchId,
+                'archivo_salida' => $fileName,
+                'catalogos_aplicados' => $referenciaRutaMatcher->appliedCatalogsSnapshot(),
+                'archivos_procesados' => count($files),
+            ]);
+
+            $this->storeResultInSession($request, 'consolidado', array_values($resultados), $recepcion, $controlRows, $estimacionAdministrativa);
+        } catch (\Throwable $exception) {
+            report($exception);
+
+            throw ValidationException::withMessages(['archivos' => self::PROCESSING_ERROR]);
+        } finally {
+            if (! $writerClosed) {
+                $writer->close();
+                File::delete($outputPath);
+            }
+
+            File::deleteDirectory($tempFolder);
+        }
+
+        return $this->excelDownload($outputPath, $fileName);
+    }
+
+    private function excelDownload(string $outputPath, string $fileName): BinaryFileResponse
+    {
         return response()
             ->download(
                 $outputPath,
@@ -442,6 +784,166 @@ class SeguimientoRutaController extends Controller
             'cervix' => app(LaMariaCervixPipeline::class),
             default => abort(404),
         };
+    }
+
+    /**
+     * Último resultado económico de la sesión. Los resultados guardados con el
+     * formato anterior se descartan para no mostrar columnas desalineadas.
+     *
+     * @return array<string, mixed>
+     */
+    public static function sessionResult(string $key): array
+    {
+        $result = session($key, []);
+
+        return is_array($result) && isset($result['costos']) ? $result : [];
+    }
+
+    /**
+     * Máximo de JSON por carga. PHP descarta sin aviso los archivos que superan
+     * max_file_uploads; se reservan cupos para el SQL y los informes administrativos opcionales.
+     */
+    public static function uploadLimit(): int
+    {
+        $phpLimit = (int) ini_get('max_file_uploads');
+
+        return max(1, min(25, $phpLimit > 0 ? $phpLimit - 1 - self::ADMINISTRATIVE_REPORT_LIMIT : 25));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function validateUpload(Request $request): array
+    {
+        $limit = self::uploadLimit();
+
+        return $request->validate([
+            'archivos' => ['required', 'array', 'min:1', 'max:'.$limit],
+            'archivos.*' => [
+                'required',
+                'file',
+                'mimes:json,txt',
+                'extensions:json,txt',
+                'max:512000',
+            ],
+            'archivos_declarados' => ['nullable', 'json'],
+            'sql_archivo' => ['nullable', 'file', 'mimes:sql,txt', 'extensions:sql,txt', 'max:102400'],
+            'correccion_autorizada' => ['nullable', 'boolean'],
+            'informes_administrativos' => ['nullable', 'array', 'max:'.self::ADMINISTRATIVE_REPORT_LIMIT],
+            'informes_administrativos.*' => ['file', 'extensions:xlsx', 'max:102400'],
+        ], [
+            'archivos.required' => 'Selecciona al menos un archivo JSON.',
+            'archivos.array' => 'Selecciona los archivos JSON para procesar.',
+            'archivos.min' => 'Selecciona al menos un archivo JSON.',
+            'archivos.max' => 'Puedes cargar hasta '.$limit.' archivos por vez.',
+            'archivos.*.mimes' => 'Cada archivo debe ser un JSON válido.',
+            'archivos.*.extensions' => 'Cada archivo debe tener extensión .json o .txt.',
+            'archivos.*.max' => 'Cada archivo puede pesar hasta 500 MB.',
+            'archivos_declarados.json' => 'La lista de archivos seleccionados no es válida.',
+            'sql_archivo.file' => 'El archivo SQL no es válido.',
+            'sql_archivo.max' => 'El archivo SQL puede pesar hasta 100 MB.',
+            'informes_administrativos.max' => 'Puedes cargar hasta '.self::ADMINISTRATIVE_REPORT_LIMIT.' informes administrativos.',
+            'informes_administrativos.*.extensions' => 'Cada informe administrativo debe ser un archivo .xlsx.',
+            'informes_administrativos.*.max' => 'Cada informe administrativo puede pesar hasta 100 MB.',
+        ]);
+    }
+
+    /**
+     * Compara los archivos seleccionados en pantalla con los recibidos y valida
+     * la estructura de cada uno. Si falta o falla alguno, no se genera un
+     * consolidado parcial: se informa por nombre.
+     *
+     * @param  array<int, UploadedFile>  $uploadedFiles
+     * @param  array<int, array{path: string, fileName: string}>  $files
+     * @return array{declarados: int|null, recibidos: int, omitidos: list<string>, archivos: list<array{nombre: string, tamano: int}>}
+     */
+    private function verifyReception(Request $request, array $uploadedFiles, array $files, SeguimientoRutaClassifier $classifier): array
+    {
+        $received = array_map(static fn (UploadedFile $file): array => [
+            'nombre' => $file->getClientOriginalName(),
+            'tamano' => (int) $file->getSize(),
+        ], array_values($uploadedFiles));
+        $declared = $request->filled('archivos_declarados')
+            ? json_decode((string) $request->input('archivos_declarados'), true)
+            : null;
+        $missing = [];
+
+        if (is_array($declared)) {
+            $pending = array_map(static fn (array $file): string => $file['nombre'].'|'.$file['tamano'], $received);
+
+            foreach ($declared as $file) {
+                $key = (string) ($file['nombre'] ?? '').'|'.(int) ($file['tamano'] ?? -1);
+                $position = array_search($key, $pending, true);
+
+                if ($position === false) {
+                    $missing[] = (string) ($file['nombre'] ?? '');
+                } else {
+                    unset($pending[$position]);
+                }
+            }
+        }
+
+        if ($missing !== []) {
+            throw ValidationException::withMessages([
+                'archivos' => sprintf(
+                    'Se seleccionaron %d archivos pero el servidor recibió %d. No llegaron: %s. No se generó el reporte para evitar un consolidado incompleto; vuelve a cargarlos.',
+                    count($declared),
+                    count($received),
+                    implode(', ', $missing)
+                ),
+            ]);
+        }
+
+        $invalid = $classifier->invalidStructureFiles($files);
+
+        if ($invalid !== []) {
+            throw ValidationException::withMessages([
+                'archivos' => 'Archivos rechazados: '.implode(' ', array_map(
+                    static fn (string $name, string $reason): string => $name.': '.$reason,
+                    array_keys($invalid),
+                    $invalid
+                )).' Corrígelos o retíralos y vuelve a generar el reporte.',
+            ]);
+        }
+
+        return [
+            'declarados' => is_array($declared) ? count($declared) : null,
+            'recibidos' => count($received),
+            'omitidos' => $missing,
+            'archivos' => $received,
+        ];
+    }
+
+    /**
+     * Bloque inicial de CONTROL DE CARGUE: archivos seleccionados, recibidos,
+     * procesados, rechazados y omitidos.
+     *
+     * @param  array{declarados: int|null, recibidos: int, omitidos: list<string>, archivos: list<array{nombre: string, tamano: int}>}  $recepcion
+     * @param  array<int, array<string, mixed>>  $controlRows
+     * @return list<array<int, int|string>>
+     */
+    private function receptionRows(array $recepcion, array $controlRows): array
+    {
+        $byState = static fn (string $state): array => array_values(array_map(
+            static fn (array $control): string => $control['archivoOrigen'],
+            array_filter($controlRows, static fn (array $control): bool => $control['estadoCargue'] === $state)
+        ));
+        $excluded = $byState('EXCLUIDO');
+        $review = $byState('REVISAR');
+        $processed = array_values(array_map(
+            static fn (array $control): string => $control['archivoOrigen'],
+            array_filter($controlRows, static fn (array $control): bool => $control['estadoCargue'] !== 'EXCLUIDO')
+        ));
+        $services = array_sum(array_column($controlRows, 'serviceCount'));
+
+        return [
+            ['SELECCIONADOS EN PANTALLA', $recepcion['declarados'] ?? 'NO INFORMADO', '', $recepcion['declarados'] === null ? 'La carga no envió la lista de selección; se usa lo recibido.' : 'Lista enviada por la pantalla antes de subir.'],
+            ['RECIBIDOS POR EL SERVIDOR', $recepcion['recibidos'], implode(', ', array_column($recepcion['archivos'], 'nombre')), 'Límite por carga: '.self::uploadLimit().' archivos JSON.'],
+            ['PROCESADOS', count($processed), implode(', ', $processed), $services.' servicios RIPS en los archivos recibidos.'],
+            ['PROCESADOS CON ALERTA', count($review), implode(', ', $review), 'Ver observación del archivo.'],
+            ['RECHAZADOS (CONTENIDO IDENTICO)', count($excluded), implode(', ', $excluded), 'No se procesan para evitar doble conteo.'],
+            ['OMITIDOS', count($recepcion['omitidos']), implode(', ', $recepcion['omitidos']), 'Seleccionados en pantalla y no recibidos.'],
+        ];
     }
 
     /**
@@ -497,9 +999,33 @@ class SeguimientoRutaController extends Controller
             static fn (): Style => $style,
             array_filter(
                 $headers,
-                static fn (string $header): bool => in_array($header, ['COSTO TOTAL', 'TARIFA', 'COSTO'], true)
+                static fn (string $header): bool => $header === 'TARIFA' || str_starts_with($header, 'COSTO')
             )
         );
+    }
+
+    /**
+     * Formato de pesos y porcentajes de las hojas económicas; el valor de la
+     * celda se conserva sin redondear.
+     *
+     * @param  array<int, string>  $headers
+     * @return array<int, Style>
+     */
+    private function economicColumnStyles(array $headers): array
+    {
+        $money = (new Style)->setFormat('#,##0.00');
+        $percentage = (new Style)->setFormat('0.00%');
+        $styles = [];
+
+        foreach ($headers as $column => $header) {
+            if (preg_match('/^(COBERTURA|PORCENTAJE)/', $header) === 1) {
+                $styles[$column] = $percentage;
+            } elseif (preg_match('/COSTO|TARIFA|CONDICIONAD|ESCENARIO|EXTERNO|BRECHA|REFERENCIA NOTA|REFERENCIA HISTORICA|PROYECTADO NOTA|DISPENSACION|ACTIVIDAD|PRESUPUESTADO|DIFERENCIA|VALOR|PRECIO|IMPORTES|ESTIMACION|COMPONENTE/', $header) === 1) {
+                $styles[$column] = $money;
+            }
+        }
+
+        return $styles;
     }
 
     /**
@@ -758,6 +1284,12 @@ class SeguimientoRutaController extends Controller
         $estado = (string) $detail['estadoClinico'];
         $reasons = [];
 
+        if ($detail['motivoNoSuma'] === 'CANTIDAD_MEDICAMENTO_NO_INFORMADA') {
+            $reasons[] = 'CANTIDAD MEDICAMENTO NO INFORMADA - COSTO NO CALCULABLE, NO SUMA';
+        } elseif ($detail['motivoNoSuma'] === 'CANTIDAD_INVALIDA') {
+            $reasons[] = 'CANTIDAD INVALIDA - COSTO NO CALCULABLE, NO SUMA';
+        }
+
         if ($detail['ruta'] === RutaCalculo::NoAsignable->value) {
             $reasons[] = sprintf(
                 '%s (POTENCIAL PROSTATA $%s / CERVIX $%s)',
@@ -791,6 +1323,30 @@ class SeguimientoRutaController extends Controller
         if ($detail['estadoDuplicidad'] === EstadoDuplicidad::DuplicadoExacto->value) {
             $reasons[] = 'COPIA EXACTA DE OTRO REGISTRO - NO SUMA';
         }
+
+        if ($detail['reglaHospitalariaPendiente'] ?? false) {
+            $reasons[] = 'SERVICIO DURANTE HOSPITALIZACION - REGLA DE PAQUETE NO DEFINIDA ('
+                .$detail['categoriaPaquete'].') - SE MANTIENE EL COBRO INDIVIDUAL';
+        }
+
+        $reasons = [...$reasons, ...match ($detail['estadoEpisodioHospitalario'] ?? '') {
+            'URGENCIA_MENOR_24H_TARIFA_PENDIENTE' => [sprintf(
+                'URGENCIA <24H - TARIFA PENDIENTE DE DEFINICION (%s); SUS SERVICIOS NO SUMAN COMO COSTO CONTRACTUAL',
+                match ((int) $detail['consultasUrgenciaEpisodio']) {
+                    0 => 'SIN CONSULTA DE URGENCIAS 890701/890702 EN EL EPISODIO',
+                    1 => 'LA CONSULTA DE URGENCIAS NO TIENE TARIFA EN LA NOTA TECNICA DE LA RUTA',
+                    default => 'VARIAS CONSULTAS DE URGENCIAS EN EL EPISODIO',
+                }
+            )],
+            ReconstructorEpisodiosHospitalarios::ESTADO_CONTINUIDAD_PENDIENTE => [
+                'CONTINUIDAD HOSPITALARIA NO RESUELTA - CORTE DE FACTURACION 08 SIN CONTINUACION EN LOS ARCHIVOS CARGADOS (SOLO SE COBRAN LOS PAQUETES DE LA DURACION CONOCIDA)',
+            ],
+            ReconstructorEpisodiosHospitalarios::ESTADO_CONTINUIDAD_NO_CONFIRMADA => [
+                'CONTINUIDAD NO CONFIRMADA - HAY EVIDENCIA PARCIAL O VARIOS CANDIDATOS DE CONTINUACION DE UN CORTE 08 (MOTIVO: '.($detail['motivoContinuidadEpisodio'] ?? '').'); NO SE UNEN Y LA POSIBLE CONTINUACION NO GENERA PAQUETE HASTA REVISARLA',
+            ],
+            'HOSPITALIZACION_SIN_FECHAS_VALIDAS' => ['HOSPITALIZACION SIN FECHAS VALIDAS DE INGRESO Y EGRESO - PAQUETE NO CALCULADO'],
+            default => [],
+        }];
 
         if ($detail['estadoDuplicidad'] === EstadoDuplicidad::PosibleDobleFacturacion->value) {
             $reasons[] = 'POSIBLE DOBLE FACTURACION';
@@ -957,10 +1513,134 @@ class SeguimientoRutaController extends Controller
             EstadoClinico::SinFecha->value => 'SIN FECHA DE ATENCION',
         ];
 
-        return implode(' | ', array_values(array_filter(array_map(
+        $observations = array_values(array_filter(array_map(
             static fn (string $estado): ?string => $labels[$estado] ?? null,
             $profile['estadosClinicos']
-        ))));
+        )));
+
+        if ($profile['soloPaqueteHospitalario'] ?? false) {
+            $observations[] = 'PACIENTE-MES SIN REGISTROS RIPS: SOLO CARGO DE PAQUETE HOSPITALARIO';
+        }
+
+        foreach ($profile['episodiosHospitalarios'] ?? [] as $episodio) {
+            $observations[] = sprintf(
+                '%s PAQUETE HOSPITALARIO BLOQUE %d DE %d%s POR $%s (INGRESO %s, INICIO DEL BLOQUE %s, FACTURA %s)%s',
+                $episodio['suma'] ? 'INCLUYE' : 'NO SUMA',
+                $episodio['bloque'],
+                $episodio['bloques'],
+                $episodio['continuidadPendiente'] ? ' CONOCIDOS' : '',
+                number_format((float) $episodio['costo'], 2, '.', ','),
+                $episodio['ingreso'],
+                $episodio['inicioBloque'],
+                $episodio['factura'],
+                $episodio['suma'] ? '' : ' - '.$episodio['motivoNoSuma']
+            );
+        }
+
+        return implode(' | ', $observations);
+    }
+
+    /**
+     * Control hospitalario por mes de la ejecución: COSTO ACTIVO = costo de las
+     * líneas del RIPS que suman + paquetes hospitalarios.
+     *
+     * @param  array<int, array<string, mixed>>  $profiles
+     * @return array<int, array<int, mixed>>
+     */
+    private function hospitalControlRows(array $profiles): array
+    {
+        $months = [];
+        $total = SeguimientoRutaClassifier::emptyHospitalControl();
+        $executionCost = 0.0;
+
+        foreach ($profiles as $profile) {
+            $month = $profile['mesAtencion'] === '' ? 'SIN FECHA' : $profile['mesAtencion'];
+            $months[$month] ??= SeguimientoRutaClassifier::emptyHospitalControl();
+            $executionCost += $profile['costoValido'] + $profile['costoValidoConAlerta'];
+
+            foreach ($profile['controlHospitalario'] as $field => $value) {
+                $months[$month][$field] += $value;
+                $total[$field] += $value;
+            }
+        }
+
+        ksort($months);
+        $row = static fn (string $label, array $control, string $observation): array => [
+            $label,
+            $control['paquetes'],
+            round($control['costoPaquetes'], 2),
+            $control['serviciosAbsorbidos'],
+            round($control['costoIndividualExcluido'], 2),
+            $control['serviciosCobradosPorFuera'],
+            round($control['costoCobradoPorFuera'], 2),
+            $control['serviciosReglaPendiente'],
+            $control['urgenciasCobradas'],
+            round($control['costoReferenciaUrgenciaPendiente'], 2),
+            $observation,
+        ];
+        $rows = [];
+
+        foreach ($months as $month => $control) {
+            $rows[] = $row((string) $month, $control, $control['paquetesSimulados'] > 0 ? sprintf(
+                'PERIODO HISTORICO NO VERIFICADO: %d paquete(s) del modelo nuevo por $%s no se cobran; requiere revisión frente al histórico.',
+                $control['paquetesSimulados'],
+                number_format($control['costoPaquetesSimulados'], 2, '.', ',')
+            ) : '');
+        }
+
+        $rows[] = $row('TOTAL', $total, sprintf(
+            'Paquete de $%s por cada bloque de hasta 600 horas (25 días) de la estancia lógica, imputado al mes en que inicia el bloque (hoja Hx). COSTO ACTIVO $%s = líneas RIPS $%s + paquetes $%s.',
+            number_format(PoliticaPaqueteHospitalario::VALOR_PAQUETE, 2, '.', ','),
+            number_format($executionCost, 2, '.', ','),
+            number_format($executionCost - $total['costoPaquetes'], 2, '.', ','),
+            number_format($total['costoPaquetes'], 2, '.', ',')
+        ));
+
+        return $rows;
+    }
+
+    /**
+     * Resumen de las estancias hospitalarias lógicas de la ruta (después de unir
+     * los cortes de facturación 08) y de la fuente de clasificación usada.
+     *
+     * @param  list<array<string, mixed>>  $episodes
+     * @param  array<int, array<string, mixed>>  $profiles
+     * @return array<int, array<int, int|string>>
+     */
+    private function hospitalEpisodeRows(array $episodes, array $profiles, string $ruta): array
+    {
+        $episodes = array_values(array_filter($episodes, static fn (array $episode): bool => $episode['ruta'] === $ruta));
+        $count = static fn (callable $filter): int => count(array_filter($episodes, $filter));
+        $sum = static fn (string $field): int => (int) array_sum(array_column($episodes, $field));
+        $control = SeguimientoRutaClassifier::emptyHospitalControl();
+
+        foreach ($profiles as $profile) {
+            foreach ($profile['controlHospitalario'] as $field => $value) {
+                $control[$field] += $value;
+            }
+        }
+
+        $isUrgency = static fn (array $episode): bool => $episode['tipo'] === ReconstructorEpisodiosHospitalarios::TIPO_URGENCIA;
+
+        return [
+            ['REGISTROS DE HOSPITALIZACION DEL RIPS', $sum('registros'), 'Segmentos facturados.'],
+            ['SEGMENTOS CON CORTE DE FACTURACION 08', $sum('cortesFacturacion'), 'El paciente continúa en el servicio; no es un alta.'],
+            ['EPISODIOS LOGICOS', count($episodes), 'Estancias reales después de unir los cortes 08.'],
+            ['CONTINUIDADES RESUELTAS', $sum('continuidadesResueltas'), 'Cortes 08 unidos con su continuación.'],
+            ['CONTINUIDADES PENDIENTES', $count(static fn (array $episode): bool => $episode['estado'] === ReconstructorEpisodiosHospitalarios::ESTADO_CONTINUIDAD_PENDIENTE), 'Corte 08 sin continuación en los archivos cargados: solo se cobran los paquetes de la duración conocida.'],
+            ['CONTINUIDADES NO CONFIRMADAS', $count(static fn (array $episode): bool => $episode['estado'] === ReconstructorEpisodiosHospitalarios::ESTADO_CONTINUIDAD_NO_CONFIRMADA && ! $episode['retenidoPorContinuidadNoConfirmada']), 'Corte 08 con evidencia parcial o varios candidatos: no se une; solo se cobran los paquetes de su duración conocida.'],
+            ['ESTANCIAS RETENIDAS POR CONTINUIDAD NO CONFIRMADA', $count(static fn (array $episode): bool => $episode['retenidoPorContinuidadNoConfirmada']), 'Posibles continuaciones de un corte: no generan paquete propio hasta revisarlas.'],
+            ['EPISODIOS CON PAQUETE', $count(static fn (array $episode): bool => $episode['paquetes'] > 0), ''],
+            ['PAQUETES GENERADOS', $sum('paquetesSumados'), ''],
+            ['URGENCIAS < 24 H CON TARIFA', $count(static fn (array $episode): bool => $isUrgency($episode) && $episode['urgenciaConTarifa']), 'Cobradas con la consulta de urgencias 890701/890702 del episodio.'],
+            ['URGENCIAS < 24 H PENDIENTES DE TARIFA', $count(static fn (array $episode): bool => $isUrgency($episode) && ! $episode['urgenciaConTarifa']), 'Sin tarifa de urgencia definida: sus servicios no suman como costo contractual.'],
+            ['EPISODIOS SIN FECHAS VALIDAS', $count(static fn (array $episode): bool => $episode['estado'] === ReconstructorEpisodiosHospitalarios::ESTADO_SIN_FECHAS), ''],
+            ['CLASIFICADOS POR SERVICIO DE LA NOTA TECNICA', $control['clasificadosPorServicio'], 'Servicios durante hospitalización.'],
+            ['CLASIFICADOS POR AGRUPADOR DE LA NOTA TECNICA', $control['clasificadosPorAgrupador'], ''],
+            ['CLASIFICADOS POR CLASIFICACION OFICIAL TEMPORAL', $control['clasificadosPorFallback'], 'Mientras la nota activa no tenga la clasificación del código.'],
+            ['CLASIFICADOS POR REGLA DE CODIGO O TIPO DE SERVICIO', $control['clasificadosPorCodigo'] + $control['clasificadosPorTipo'], ''],
+            ['SIN CATEGORIA', $control['clasificadosSinCategoria'], 'Regla no definida; conservan el cobro individual.'],
+        ];
     }
 
     /**
@@ -1163,15 +1843,16 @@ class SeguimientoRutaController extends Controller
     }
 
     /**
-     * Cruza documentos de los RIPS contra un SQL sin asumir una estructura
-     * concreta: el SQL puede contener comentarios, INSERTS y tablas auxiliares.
-     * Se reportan los documentos encontrados para que el usuario valide la
-     * diferencia entre la fuente administrativa y la realidad del RIPS.
+     * Cruza documentos de los RIPS contra un SQL administrativo en ambos
+     * sentidos, sin asumir una estructura concreta: el SQL puede contener
+     * comentarios, INSERTS y tablas auxiliares. Es una conciliación: no cambia
+     * rutas ni costos.
      *
      * @param  array<int, array<string, mixed>>  $profiles
+     * @param  array<int, array<string, mixed>>  $allProfiles
      * @return iterable<int, array<int, string>>
      */
-    private function sqlValidationRows(UploadedFile $sqlFile, array $profiles, string $ruta): iterable
+    private function sqlValidationRows(UploadedFile $sqlFile, array $profiles, array $allProfiles): iterable
     {
         $contents = file_get_contents($sqlFile->getRealPath());
         $contents = is_string($contents) ? $contents : '';
@@ -1182,27 +1863,111 @@ class SeguimientoRutaController extends Controller
             $documentsInSql[(string) $document] = true;
         }
 
+        $documentsInExecution = [];
+
         foreach ($profiles as $profile) {
             $document = (string) $profile['numDocumentoIdentificacion'];
-            $found = $document !== '' && isset($documentsInSql[$document]);
+
+            if ($document !== '') {
+                $documentsInExecution[$document] = true;
+            }
+        }
+
+        $documentsInRips = [];
+
+        foreach ($allProfiles as $profile) {
+            $documentsInRips[(string) $profile['numDocumentoIdentificacion']] = true;
+        }
+
+        foreach (array_keys($documentsInExecution) as $document) {
+            $found = isset($documentsInSql[(string) $document]);
+
             yield [
-                $document,
-                $found ? 'SI' : 'NO',
-                $ruta,
-                $found ? 'VALIDADO' : 'REVISAR',
+                (string) $document,
+                $found ? 'EN RIPS Y EN ADMINISTRATIVO' : 'SOLO EN RIPS',
                 $found
-                    ? 'El documento aparece en el SQL y en los RIPS.'
-                    : 'El documento está en los RIPS, pero no fue encontrado en el SQL cargado.',
+                    ? 'El paciente aparece en los RIPS de esta ejecución y en el SQL administrativo.'
+                    : 'El paciente está en los RIPS de esta ejecución, pero no en el SQL administrativo.',
             ];
         }
 
-        if ($profiles === []) {
-            yield ['', 'NO', $ruta, 'REVISAR', 'No se encontraron pacientes válidos en los RIPS.'];
+        foreach (array_keys($documentsInSql) as $document) {
+            if (! isset($documentsInRips[(string) $document])) {
+                yield [
+                    (string) $document,
+                    'SOLO EN ADMINISTRATIVO',
+                    'El documento aparece en el SQL administrativo, pero no en ningún RIPS cargado.',
+                ];
+            }
+        }
+
+        if ($documentsInExecution === [] && $documentsInSql === []) {
+            yield ['', 'SIN DATOS', 'No se encontraron pacientes en los RIPS de esta ejecución ni documentos en el SQL.'];
         }
     }
 
     /**
-     * Resumen mensual de la ejecución: COSTO TOTAL solo incluye lo que suma.
+     * Conciliación de pacientes: todo paciente del JSON debe quedar en
+     * Próstata, Cérvix o NO ASIGNABLE.
+     *
+     * @param  array{pacientesJson: int, representados: int, porRuta: array<string, int>, noRepresentados: list<array<string, string>>}  $conciliation
+     * @return array<int, array<int, mixed>>
+     */
+    private function patientConciliationRows(array $conciliation): array
+    {
+        $missing = count($conciliation['noRepresentados']);
+
+        return [
+            ['', '', '', '', ''],
+            ['CONCILIACION PACIENTES', 'PACIENTES', '', '', 'OBSERVACION'],
+            ['PACIENTES EN JSON', $conciliation['pacientesJson'], '', '', 'Pacientes únicos por tipo y número de documento en los archivos procesados.'],
+            ['PACIENTES EN PROSTATA', $conciliation['porRuta'][RutaCalculo::Prostata->value] ?? 0, '', '', 'Un paciente puede estar en más de una ruta en meses distintos.'],
+            ['PACIENTES EN CERVIX', $conciliation['porRuta'][RutaCalculo::Cervix->value] ?? 0, '', '', ''],
+            ['PACIENTES NO ASIGNABLES', $conciliation['porRuta'][RutaCalculo::NoAsignable->value] ?? 0, '', '', 'Doble ruta o sexo no reconocido; aparecen en ambos Excel.'],
+            ['PACIENTES REPRESENTADOS', $conciliation['representados'], '', '', ''],
+            [
+                'PACIENTES NO REPRESENTADOS',
+                $missing,
+                '',
+                '',
+                $missing === 0
+                    ? 'Todos los pacientes del JSON quedaron representados en el resultado.'
+                    : 'REVISAR: pacientes del JSON sin servicios procesables; se listan en CASOS A REVISAR.',
+            ],
+            [
+                'DIFERENCIA PACIENTES',
+                $conciliation['pacientesJson'] - $conciliation['representados'],
+                '',
+                '',
+                'PACIENTES EN JSON - PACIENTES REPRESENTADOS. Debe ser 0.',
+            ],
+        ];
+    }
+
+    /**
+     * @param  array<string, string>  $usuario
+     * @return array<int, string>
+     */
+    private function unrepresentedPatientValues(array $usuario): array
+    {
+        return [
+            $usuario['factura'],
+            $usuario['tipoDocumentoIdentificacion'],
+            $usuario['numDocumentoIdentificacion'],
+            $usuario['codSexo'],
+            '',
+            '',
+            '',
+            '',
+            '',
+            '',
+            '',
+            'USUARIO DEL RIPS SIN SERVICIOS PROCESABLES - NO QUEDO EN NINGUNA RUTA (ARCHIVO: '.$usuario['archivo'].')',
+        ];
+    }
+
+    /**
+     * Resumen mensual de la ejecución: COSTO ACTIVO solo incluye lo que suma.
      * CASOS A REVISAR cuenta las líneas de esa hoja, incluidas las compartidas
      * no asignables.
      *
@@ -1210,6 +1975,382 @@ class SeguimientoRutaController extends Controller
      * @param  array<int, array<string, mixed>>  $sharedProfiles
      * @return array<int, array<int, float|int|string>>
      */
+    /**
+     * Resultado económico de una ruta: costos y brechas, explicación,
+     * medicamentos, servicios sin tarifa y hospitalización. Pantalla, Excel por
+     * ruta y consolidado usan esta misma salida.
+     *
+     * @param  array<int, array<string, mixed>>  $profiles
+     * @param  array<int, array<string, mixed>>  $sharedProfiles
+     * @return array{ruta: string, mensual: list<array<int, mixed>>, costos: list<array<int, mixed>>, explicacion: list<array<int, mixed>>, medicamentos: list<array<int, mixed>>, sinTarifa: list<array<int, mixed>>, hospitalizacion: list<array<int, mixed>>}
+     */
+    private function economicResult(ResumenEconomico $resumen, array $profiles, array $sharedProfiles, string $ruta): array
+    {
+        $mensual = $this->monthlySummaries($profiles, $sharedProfiles);
+        $explicacion = new ExplicacionBrecha($resumen);
+        $filasExplicacion = $explicacion->filas($resumen->totalesMensuales($mensual));
+
+        return [
+            'ruta' => $ruta,
+            'mensual' => $mensual,
+            'costos' => $resumen->filas($mensual, $ruta, $explicacion->totalesPorMes()),
+            'explicacion' => $filasExplicacion,
+            'medicamentos' => $resumen->filasMedicamentos(),
+            'sinTarifa' => $resumen->filasSinTarifa(),
+            'hospitalizacion' => $this->hospitalControlRows($profiles),
+        ];
+    }
+
+    /**
+     * Anchos de SEGUIMIENTO MENSUAL: sus indicadores y, debajo, el resumen
+     * económico por servicio (ESTADO es la última columna).
+     *
+     * @param  array<int, string>  $headers
+     * @return array<int, int>
+     */
+    private function summarySheetWidths(array $headers): array
+    {
+        $widths = [14, 20, 14, 22, 26, 22, 22, 110, 16, 22, 16];
+
+        foreach ($this->columnWidths($headers) as $column => $width) {
+            $widths[$column] = max($widths[$column] ?? 0, $width);
+        }
+
+        return $widths;
+    }
+
+    /**
+     * Resumen económico por servicio bajo los indicadores de SEGUIMIENTO
+     * MENSUAL, con los totales A, B y la estimación central de cada mes. Los
+     * importes con metodologías distintas llevan su propio nombre y el total
+     * solo suma conceptos aditivos.
+     *
+     * @param  array<string, ValorizacionAdministrativa>  $valorizaciones  Por ruta.
+     * @param  array<string, array<string, mixed>>  $resultados  Resultado económico por ruta.
+     */
+    private function writeServiceSummary(Writer $writer, array $valorizaciones, array $resultados, HistorialAdministrativo $historial): void
+    {
+        $money = (new Style)->setFormat('#,##0.00');
+        $integer = (new Style)->setFormat('#,##0');
+        $percent = (new Style)->setFormat('0.00%');
+        $title = (new Style)->setFontBold()->setFontSize(12);
+        $pesos = static fn (float $valor): string => '$'.number_format($valor, 2, ',', '.');
+        $blockHeader = static fn (string $label): array => [$label, '', '', 'VALOR', 'DESCRIPCIÓN', '', '', ''];
+
+        foreach ($resultados as $ruta => $resultado) {
+            $valorizacion = $valorizaciones[$ruta];
+            $mesAnterior = '';
+            $fuentes = implode(', ', array_column(array_filter(
+                $historial->fuentes(),
+                static fn (array $fuente): bool => $fuente['ruta'] === $ruta
+            ), 'archivo'));
+
+            foreach ($resultado['costos'] as $costos) {
+                $mes = (string) ($costos[1] ?? '');
+
+                if (in_array($mes, ['', 'TOTAL PERIODO', 'SIN FECHA'], true)) {
+                    continue;
+                }
+
+                $resumen = $valorizacion->resumenServicios($mes);
+                $urgencias = $resumen['urgencias'];
+                $costoA = (float) $costos[3];
+                $ventana = $resumen['meses'] === []
+                    ? 'SIN HISTORIAL ADMINISTRATIVO PARA EL MES'
+                    : 'meses '.implode(', ', $resumen['meses']).($fuentes === '' ? '' : ' de '.$fuentes);
+                $enlazados = implode('/', array_keys($urgencias['porTipo'])) ?: 'los servicios enlazados';
+                $control = round($resumen['totales']['costoA'] - $costoA, 2);
+                $referenciaGerencial = ValorizacionAdministrativa::REFERENCIAS_GERENCIALES[$ruta];
+                $pacientesUnicos = 0;
+
+                foreach ($resultado['mensual'] as $filaMensual) {
+                    if (($filaMensual[0] ?? '') === $mes) {
+                        $pacientesUnicos = (int) ($filaMensual[1] ?? 0);
+
+                        break;
+                    }
+                }
+
+                $writer->addRow(Row::fromValues(['']));
+                $writer->addRow(Row::fromValues(['RESUMEN ECONÓMICO POR SERVICIO · '.self::ROUTE_NAMES[$ruta].' · '.$mes], $title));
+                $writer->addRow(Row::fromValues(ValorizacionAdministrativa::RESUMEN_SERVICIOS_HEADERS, $this->headerStyle()));
+
+                foreach ($resumen['filas'] as $fila) {
+                    $writer->addRow(Row::fromValuesWithStyles($fila, null, [2 => $integer, 3 => $money, 4 => $money, 5 => $money, 6 => $money, 8 => $integer, 9 => $money, 10 => $integer]));
+                }
+
+                $registrosPendientes = (int) ($resumen['filas'][array_key_last($resumen['filas'])][10] ?? 0);
+                $indicadores = [
+                    ['PACIENTES ÚNICOS', $pacientesUnicos, 'Pacientes distintos de esta ruta y mes, identificados por tipo y número de documento en los JSON procesados.', $integer],
+                    ['COSTO A', $costoA, 'Costo respaldado por reglas acreditadas de SIRUTA: tarifa de la nota técnica sin condiciones pendientes más paquetes hospitalarios. No cambia con la estimación administrativa.'],
+                    ['COSTO B', (float) $costos[5], 'Escenario referencial: COSTO A + condicionado incluido ('.$pesos((float) $costos[4]).'). No es facturación aprobada.'],
+                    ['ESTIMACIÓN ADMINISTRATIVA CENTRAL', $resumen['totales']['estimado'], 'AC + AP + AT + AM + AH con precios administrativos históricos comparables ('.$ventana.'). Referencial: no es facturación ni tarifa contractual. AU no suma.'],
+                    ['INDICADOR GERENCIAL FIJO', $referenciaGerencial, 'Referencia de comparación de la ruta; no es tarifa, piso, tope ni objetivo del motor económico.'],
+                    ['VARIACIÓN CONTRA INDICADOR', round($resumen['totales']['estimado'] - $referenciaGerencial, 2), 'Estimación administrativa calculada menos indicador gerencial fijo. No modifica el resultado.'],
+                    ['PORCENTAJE DEL INDICADOR', $referenciaGerencial > 0 ? $resumen['totales']['estimado'] / $referenciaGerencial : 0.0,
+                        'Estimación administrativa central sobre el indicador gerencial fijo. Solo compara: no limita, completa ni recorta el cálculo.', $percent],
+                    ['REGISTROS PENDIENTES', $registrosPendientes, 'Registros condicionados o sin valorización posible (columna PENDIENTE); no suman a la estimación central. Detalle e información faltante en la hoja PENDIENTES DE VALORIZACIÓN, que también lista los estimados referenciales que sí suman pero requieren soporte contractual.', $integer],
+                    ['CONDICIONADOS NO SUMADOS', $resumen['totales']['condicionado'], 'Valores sin evidencia suficiente: radioterapia por registro, mezcla de esquemas, unidades no compatibles, medicamentos asociados a AP sin cobertura demostrada (RN-14) y precios de dispensación del mismo paciente, CUM y mes. No se suman al COSTO A ni a la estimación central.'],
+                    ['COSTOS ATRIBUIDOS A URGENCIAS (YA INCLUIDOS)', $urgencias['atribuido'], 'Costo de '.$enlazados.' enlazado a '.$urgencias['episodios'].' episodios AU; ya está en el COSTO A y en la estimación. No se suma de nuevo.'],
+                    ['AU ADMINISTRATIVO ATRIBUIDO (YA INCLUIDO)', $urgencias['atribuidoAdministrativo'], 'Reclasificación de componentes administrativos con código, unidad y episodio inequívocos. Ya está incluido en la estimación; no se suma de nuevo.'],
+                ];
+
+                if ((float) $costos[6] > 0) {
+                    $indicadores[] = ['EXTERNOS POTENCIALES NO SUMADOS', (float) $costos[6], 'Valores administrativos fuera del COSTO A y del COSTO B. No se suman a ningún resultado.'];
+                }
+
+                $administrativoMismoMes = $historial->totalDelMes($ruta, $mes);
+
+                if ($administrativoMismoMes !== null) {
+                    $indicadores[] = ['ADMINISTRATIVO REGISTRADO EN EL MISMO MES', $administrativoMismoMes['valor'],
+                        'Valor del informe administrativo de '.$mes.' ('.$administrativoMismoMes['registros'].' registros). Referencia observada, no tarifa contractual.'];
+                    $indicadores[] = ['DIFERENCIA CENTRAL − ADMINISTRATIVO MISMO MES',
+                        round($resumen['totales']['estimado'] - $administrativoMismoMes['valor'], 2),
+                        'Variación de actividad, esquema, alcance y precios por código; detalle en DIFERENCIAS HISTÓRICAS.'];
+                }
+
+                $indicadores[] = ['PRINCIPALES CUPS DE LA VARIACIÓN', $mesAnterior !== '' ? 'TABLA PRINCIPALES CUPS AP' : 'HOJA DIFERENCIAS HISTÓRICAS',
+                    $mesAnterior !== ''
+                        ? 'Cambio AP de '.$mesAnterior.' a '.$mes.' por CUPS (registros, unidades y valor) en la tabla PRINCIPALES CUPS AP de este bloque. Contra el histórico administrativo, por código: hoja DIFERENCIAS HISTÓRICAS.'
+                        : 'Por código, contra el histórico administrativo (efecto actividad y efecto composición, precio o estado): hoja DIFERENCIAS HISTÓRICAS. Para comparar meses entre sí, cárguelos en el mismo reporte.'];
+                $indicadores[] = ['CONTROL: COSTO A POR SERVICIO − COSTO A', $control, abs($control) < 0.005
+                    ? 'Concilia al centavo: la suma por servicio reproduce el COSTO A.'
+                    : 'DIFERENCIA: la suma por servicio no reproduce el COSTO A; revisar antes de usar el resumen.'];
+
+                $writer->addRow(Row::fromValues(['']));
+                $writer->addRow(Row::fromValues($blockHeader('INDICADOR'), $this->headerStyle()));
+
+                foreach ($indicadores as $indicador) {
+                    $writer->addRow(Row::fromValuesWithStyles([$indicador[0], '', '', $indicador[1], $indicador[2]], null, [3 => $indicador[3] ?? $money]));
+                }
+
+                $desglose = implode(' · ', array_map(
+                    static fn (string $tipo, float $valor): string => $tipo.' '.$pesos($valor),
+                    array_keys($urgencias['porTipo']),
+                    array_values($urgencias['porTipo'])
+                ));
+
+                $writer->addRow(Row::fromValues(['']));
+                $writer->addRow(Row::fromValues($blockHeader('URGENCIAS (AU)'), $this->headerStyle()));
+
+                foreach ([
+                    ['EPISODIOS AU', $urgencias['episodios'], 'Atenciones de urgencias del mes; cada una se enlaza con los servicios del mismo caso y factura entre su ingreso y su egreso.', $integer],
+                    ['COSTO ASOCIADO YA RECONOCIDO', $urgencias['atribuido'], ($desglose === '' ? 'Sin servicios enlazados' : $desglose).'. Incluido en el COSTO A y en la estimación; no se suma de nuevo.', $money],
+                    ['ADMINISTRATIVO ASOCIADO YA INCLUIDO', $urgencias['atribuidoAdministrativo'], 'Importe de los componentes administrativos inequívocos. Otros componentes ambiguos permanecen en su tipo RIPS.', $money],
+                    ['VALOR ADMINISTRATIVO HISTÓRICO COMPARABLE', $urgencias['referencia'] ?? 'SIN HISTORIAL', 'Mediana mensual de AU en el informe administrativo ('.$ventana.'). Referencia; no se suma.', $money],
+                    ['COBRO INDEPENDIENTE DEMOSTRADO', $urgencias['cobroIndependiente'], $urgencias['cobroIndependiente'] > 0
+                        ? 'Costo A propio de AU con tarifa acreditada; ya está en el COSTO A.'
+                        : 'Sin tarifa contractual ni cobro AU independiente acreditado en el RIPS.', $money],
+                    ['¿ES ADITIVO?', 'NO', 'La atribución AU es informativa: sus valores ya están en '.$enlazados.'.', null],
+                ] as [$concepto, $valor, $descripcion, $style]) {
+                    $writer->addRow(Row::fromValuesWithStyles([$concepto, '', '', $valor, $descripcion], null, $style === null ? [] : [3 => $style]));
+                }
+
+                $writer->addRow(Row::fromValues(['']));
+                $writer->addRow(Row::fromValues(['VISTA GERENCIAL RECLASIFICADA · AU ADITIVO; MISMO TOTAL'], $title));
+                $writer->addRow(Row::fromValues(['TIPO RIPS', 'SERVICIO', 'ORIGINAL ADMINISTRATIVO', 'TRASLADO A AU', 'GERENCIAL'], $this->headerStyle()));
+                $controlGerencial = 0;
+
+                foreach ($valorizacion->vistaGerencial($mes) as $filaGerencial) {
+                    $controlGerencial += ResumenEconomico::centavos($filaGerencial['gerencial']);
+                    $tipo = $filaGerencial['tipo'];
+                    $writer->addRow(Row::fromValuesWithStyles([$tipo, ValorizacionAdministrativa::SERVICIOS[$tipo] ?? $tipo,
+                        $filaGerencial['original'], $filaGerencial['trasladadoAu'], $filaGerencial['gerencial']], null,
+                        [2 => $money, 3 => $money, 4 => $money]));
+                }
+
+                $writer->addRow(Row::fromValuesWithStyles(['TOTAL', '', $resumen['totales']['estimado'], 0,
+                    $controlGerencial / 100.0], null, [2 => $money, 3 => $money, 4 => $money]));
+
+                if ($mesAnterior !== '') {
+                    $writer->addRow(Row::fromValues(['']));
+                    $writer->addRow(Row::fromValues(['PRINCIPALES CUPS AP · '.$mesAnterior.' → '.$mes.' · VARIACIÓN DE ACTIVIDAD Y VALOR'], $title));
+                    $writer->addRow(Row::fromValues(['CUPS', 'REGISTROS ANTERIOR', 'REGISTROS ACTUAL', 'UNIDADES ANTERIOR',
+                        'UNIDADES ACTUAL', 'VALOR ANTERIOR', 'VALOR ACTUAL', 'DIFERENCIA'], $this->headerStyle()));
+
+                    foreach ($valorizacion->principalesVariacionesCups($mesAnterior, $mes) as $variacion) {
+                        $writer->addRow(Row::fromValuesWithStyles([$variacion['codigo'], $variacion['registrosAnterior'],
+                            $variacion['registrosActual'], $variacion['unidadesAnterior'], $variacion['unidadesActual'],
+                            $variacion['valorAnterior'], $variacion['valorActual'], $variacion['diferencia']], null,
+                            [1 => $integer, 2 => $integer, 3 => $integer, 4 => $integer, 5 => $money, 6 => $money, 7 => $money]));
+                    }
+                }
+
+                $mesAnterior = $mes;
+            }
+        }
+    }
+
+    /**
+     * Historial administrativo de cada ruta: el informe cargado en el
+     * formulario o, si no se cargó, el configurado para la ruta. Solo se leen
+     * mes, tipo, código, descripción, diagnóstico y valor. Si una ruta queda
+     * sin fuente, el reporte se detiene en lugar de salir incompleto.
+     *
+     * @param  array<string, mixed>  $validated
+     * @param  list<string>  $rutas
+     */
+    private function administrativeHistory(array $validated, array $rutas): HistorialAdministrativo
+    {
+        $historial = new HistorialAdministrativo;
+        $configuracion = (array) config('programas.la-maria.informes_administrativos', []);
+
+        try {
+            foreach ($validated['informes_administrativos'] ?? [] as $informe) {
+                if ($informe instanceof UploadedFile && $informe->getRealPath() !== false) {
+                    $historial->cargarArchivo($informe->getRealPath(), $informe->getClientOriginalName());
+                }
+            }
+
+            foreach ($rutas as $ruta) {
+                $configurado = (string) ($configuracion[$ruta] ?? '');
+
+                if ($historial->tieneDatos($ruta) || $configurado === '') {
+                    continue;
+                }
+
+                if (! is_file($configurado)) {
+                    throw ValidationException::withMessages(['informes_administrativos' => sprintf(
+                        'No se encontró el informe administrativo configurado para %s (%s). Revise LA_MARIA_INFORME_ADMIN_%s o cargue el informe en el formulario. No se generó un resultado incompleto.',
+                        self::ROUTE_NAMES[$ruta] ?? $ruta, basename($configurado), $ruta
+                    )]);
+                }
+
+                $historial->cargarArchivo($configurado, basename($configurado));
+            }
+        } catch (ValidationException $exception) {
+            throw $exception;
+        } catch (\Throwable $exception) {
+            report($exception);
+
+            throw ValidationException::withMessages([
+                'informes_administrativos' => 'No fue posible leer el informe administrativo: debe ser un .xlsx con la hoja «inf admin».',
+            ]);
+        }
+
+        $faltantes = array_values(array_filter($rutas, static fn (string $ruta): bool => ! $historial->tieneDatos($ruta)));
+
+        if ($faltantes !== [] && (bool) ($configuracion['requerido'] ?? true)) {
+            $leidos = implode(', ', array_map(
+                static fn (array $fuente): string => $fuente['archivo'].' ('.$fuente['ruta'].', '.$fuente['filas'].' filas)',
+                $historial->fuentes()
+            ));
+
+            throw ValidationException::withMessages(['informes_administrativos' => sprintf(
+                'Falta el informe administrativo histórico de %s: cárguelo en el formulario o configure %s. Sin esa fuente la estimación administrativa quedaría incompleta, por eso no se generó el reporte.%s',
+                implode(' y ', array_map(static fn (string $ruta): string => self::ROUTE_NAMES[$ruta] ?? $ruta, $faltantes)),
+                implode(' / ', array_map(static fn (string $ruta): string => 'LA_MARIA_INFORME_ADMIN_'.$ruta, $faltantes)),
+                $leidos === '' ? '' : ' Informes leídos: '.$leidos.'.'
+            )]);
+        }
+
+        return $historial;
+    }
+
+    private function administrativeValuation(string $ruta, HistorialAdministrativo $historial, ReferenciaRutaMatcher $matcher): ValorizacionAdministrativa
+    {
+        return new ValorizacionAdministrativa(
+            $ruta,
+            $historial,
+            $matcher->entradasNotaTecnica($ruta),
+            static fn (string $cum): array => $matcher->historialPreciosDispensacion($ruta, $cum),
+        );
+    }
+
+    /**
+     * Hojas de detalle de la valorización administrativa referencial, separadas
+     * del costo A. El resumen por servicio va en SEGUIMIENTO MENSUAL.
+     *
+     * @param  array<string, ValorizacionAdministrativa>  $valorizaciones  Por ruta.
+     * @param  array<string, array<string, mixed>>  $resultados  Resultado económico por ruta.
+     * @return list<array<int, mixed>> Comparación por tipo RIPS con la ruta, para la pantalla.
+     */
+    private function writeAdministrativeSheets(Writer $writer, array $valorizaciones, array $resultados): array
+    {
+        $costoAPorRuta = [];
+
+        foreach ($resultados as $ruta => $resultado) {
+            foreach ($resultado['costos'] as $costo) {
+                if (isset($costo[1]) && $costo[1] !== 'TOTAL PERIODO') {
+                    $costoAPorRuta[$ruta][(string) $costo[1]] = (float) $costo[3];
+                }
+            }
+        }
+
+        $prefijar = static fn (string $ruta, array $filas): array => array_map(static fn (array $fila): array => [$ruta, ...$fila], $filas);
+        $comparacion = [];
+
+        foreach ($valorizaciones as $ruta => $valorizacion) {
+            $comparacion = [...$comparacion, ...$prefijar($ruta, $valorizacion->filasComparacion($costoAPorRuta[$ruta] ?? []))];
+        }
+
+        $sheets = [
+            'TRATAMIENTOS INTEGRALES' => ['RUTA', ...ValorizacionAdministrativa::TRATAMIENTOS_HEADERS],
+            'MEDICAMENTOS ASOCIADOS' => ['RUTA', ...ValorizacionAdministrativa::MEDICAMENTOS_HEADERS],
+            'COBERTURA AM RN14' => ['RUTA', ...ValorizacionAdministrativa::COBERTURA_MEDICAMENTOS_HEADERS],
+            'ESTIMACIÓN CONDICIONADA' => ['RUTA', ...ValorizacionAdministrativa::DETALLE_HEADERS],
+            'REGLAS APLICADAS' => ['RUTA', 'REGLA', 'ELEMENTO', 'DESCRIPCION'],
+            'DETALLE POR CÓDIGO' => ['RUTA', ...ValorizacionAdministrativa::DETALLE_HEADERS],
+            'DIFERENCIAS HISTÓRICAS' => ['RUTA', ...ValorizacionAdministrativa::DIFERENCIAS_HEADERS],
+            'PENDIENTES DE VALORIZACIÓN' => ['RUTA', ...ValorizacionAdministrativa::PENDIENTES_HEADERS],
+        ];
+
+        foreach ($sheets as $name => $headers) {
+            $sheet = $writer->addNewSheetAndMakeItCurrent();
+            $sheet->setName($name);
+            $this->configureSheet($sheet, $this->columnWidths($headers));
+            $writer->addRow(Row::fromValues($headers, $this->headerStyle()));
+            $styles = $this->economicColumnStyles($headers);
+
+            foreach ($valorizaciones as $ruta => $valorizacion) {
+                $filas = match ($name) {
+                    'TRATAMIENTOS INTEGRALES' => $valorizacion->filasTratamientos(),
+                    'MEDICAMENTOS ASOCIADOS' => $valorizacion->filasMedicamentosAsociados(),
+                    'COBERTURA AM RN14' => $valorizacion->filasCoberturaMedicamentos(),
+                    'ESTIMACIÓN CONDICIONADA' => $valorizacion->filasCondicionadas(),
+                    'REGLAS APLICADAS' => $valorizacion->filasReglas(),
+                    'DETALLE POR CÓDIGO' => $valorizacion->filasDetalle(),
+                    'DIFERENCIAS HISTÓRICAS' => $valorizacion->filasDiferencias(),
+                    default => $valorizacion->filasPendientes(),
+                };
+
+                foreach ($prefijar($ruta, $filas) as $fila) {
+                    $writer->addRow(Row::fromValuesWithStyles($fila, null, $styles));
+                }
+            }
+        }
+
+        return $comparacion;
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $resultados
+     * @param  array{declarados: int|null, recibidos: int, omitidos: list<string>, archivos: list<array{nombre: string, tamano: int}>}  $recepcion
+     * @param  array<int, array<string, mixed>>  $controlRows
+     * @param  list<array<int, mixed>>  $estimacionAdministrativa
+     */
+    private function storeResultInSession(Request $request, string $clave, array $resultados, array $recepcion, array $controlRows, array $estimacionAdministrativa = []): void
+    {
+        $limit = static fn (array $rows, int $count): array => array_slice($rows, 0, $count);
+        $request->session()->put('la-maria.resultado.'.$clave, [
+            'generado' => now()->format('Y-m-d H:i'),
+            'costos' => array_merge(...array_map(static fn (array $resultado): array => $resultado['costos'], $resultados)),
+            'explicacion' => array_merge(...array_map(static fn (array $resultado): array => $resultado['explicacion'], $resultados)),
+            'medicamentos' => array_merge(...array_map(static fn (array $resultado): array => array_map(
+                static fn (array $fila): array => [$resultado['ruta'], ...$fila], $limit($resultado['medicamentos'], 25)), $resultados)),
+            'sinTarifa' => array_merge(...array_map(static fn (array $resultado): array => array_map(
+                static fn (array $fila): array => [$resultado['ruta'], ...$fila], $limit($resultado['sinTarifa'], 25)), $resultados)),
+            'hospitalizacion' => array_merge(...array_map(static fn (array $resultado): array => array_map(
+                static fn (array $fila): array => [$resultado['ruta'], ...$fila], $resultado['hospitalizacion']), $resultados)),
+            'recepcion' => $this->receptionRows($recepcion, $controlRows),
+            'archivos' => array_map(static fn (array $control): array => [
+                $control['archivoOrigen'], $control['factura'], $control['firstMonth'], $control['lastMonth'],
+                $control['userCount'], $control['serviceCount'], $control['estadoCargue'],
+            ], $controlRows),
+            'estimacion' => $estimacionAdministrativa,
+        ]);
+    }
+
     private function monthlySummaries(array $profiles, array $sharedProfiles): array
     {
         $summaries = [];

@@ -37,6 +37,11 @@ class CatalogoReferenciaProgramaIsolationTest extends TestCase
                 'archivo' => $this->annexWorkbook(),
             ])
             ->assertRedirectToRoute('catalogos-referencia.index');
+        $laMaria = CatalogoReferencia::query()->where('version', 'la-maria-2026')->firstOrFail();
+
+        $this->actingAs($admin)
+            ->post(route('catalogos-referencia.toggle-file', $laMaria), ['activos_esperados' => ''])
+            ->assertSessionHasNoErrors();
 
         $this->assertTrue($otherProgramaCatalog->fresh()->activo);
         $this->assertDatabaseHas('catalogo_referencias', [

@@ -5,10 +5,12 @@ namespace App\Services;
 use App\Models\CatalogoReferencia;
 use App\Models\CatalogoReferenciaItem;
 use App\Models\ReferenciaManual;
+use App\Programas\LaMaria\EstadoContractual;
 use App\Programas\LaMaria\EstadoTarifario;
 use App\Programas\LaMaria\FormaCruce;
 use App\Programas\LaMaria\FuenteTarifa;
 use App\Programas\LaMaria\LaMariaPrograma;
+use App\Programas\LaMaria\PoliticaDispensacion;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 
@@ -64,6 +66,54 @@ class ReferenciaRutaMatcher
     private array $dispensationReferences = [];
 
     /**
+     * Dispensaciones por ruta, documento y mes (con o sin precio): evidencia
+     * para identificar el medicamento entregado al paciente en el período.
+     *
+     * @var array<string, list<array<string, mixed>>>
+     */
+    private array $dispensationEvidence = [];
+
+    /**
+     * Precios unitarios administrativos de dispensación por ruta y CUM, con su
+     * mes. Solo sirven de referencia histórica; no son tarifa contractual.
+     *
+     * @var array<string, array<string, list<array{mes: string, tarifa: float}>>>
+     */
+    private array $dispensationPriceHistory = [];
+
+    /**
+     * Registros del CUM por IUM (identificador único de medicamento).
+     *
+     * @var array<string, list<array<string, mixed>>>
+     */
+    private array $iumIndex = [];
+
+    /**
+     * Registros del CUM por los primeros caracteres del IUM. Solo se usan para
+     * comprobar que una familia del registro tiene una única presentación.
+     *
+     * @var array<string, list<array<string, mixed>>>
+     */
+    private array $iumFamilyIndex = [];
+
+    /**
+     * Complemento contractual de medicamentos por ruta y CUM (todas sus filas:
+     * precios, vigencias y estados contractuales).
+     *
+     * @var array<string, array<string, list<array<string, mixed>>>>
+     */
+    private array $complementByCum = [];
+
+    /**
+     * Caracteres del IUM que agrupan una familia del registro (principio,
+     * concentración y forma). La regla nunca confía solo en el prefijo: exige
+     * que todos los registros de la familia compartan una sola presentación.
+     */
+    private const IUM_LONGITUD_FAMILIA = 10;
+
+    private PoliticaDispensacion $politicaDispensacion;
+
+    /**
      * @var array<int, array{catalogo: CatalogoReferencia, coincidencias: int}>
      */
     private array $usage = [];
@@ -71,8 +121,10 @@ class ReferenciaRutaMatcher
     /**
      * @param  Collection<int, CatalogoReferencia>|null  $catalogos
      */
-    public function __construct(?Collection $catalogos = null, ?string $rutaEjecucion = null)
+    public function __construct(?Collection $catalogos = null, ?string $rutaEjecucion = null, ?PoliticaDispensacion $politicaDispensacion = null)
     {
+        $this->politicaDispensacion = $politicaDispensacion ?? PoliticaDispensacion::configurada();
+
         if ($catalogos === null) {
             // Solo catálogos del programa La María; opcionalmente acotados a la ejecución.
             $catalogos = CatalogoReferencia::query()
@@ -103,7 +155,16 @@ class ReferenciaRutaMatcher
                 $this->cumCatalogs[$catalogo->tipo] = $catalogo;
             }
 
-            foreach ($catalogo->items as $item) {
+            $cumSinPrecarga = $catalogo->tipo === CatalogoReferenciaImporter::TYPE_MEDICAMENTOS_CUM
+                && ! $catalogo->relationLoaded('items');
+            $items = $cumSinPrecarga
+                ? $catalogo->items()->where('activo', true)->cursor()
+                : $catalogo->items;
+
+            foreach ($items as $item) {
+                if ($cumSinPrecarga && ($item->metadatos['ium'] ?? '') === '') {
+                    continue;
+                }
                 $entry = $this->entry($catalogo, $item);
 
                 if ($catalogo->tipo === CatalogoReferenciaImporter::TYPE_ANEXOS_2706) {
@@ -136,6 +197,16 @@ class ReferenciaRutaMatcher
 
                 if ($catalogo->tipo === CatalogoReferenciaImporter::TYPE_MEDICAMENTOS_CUM) {
                     $this->cumCache[$item->codigo] = $entry;
+                    $ium = $this->normaliseCode((string) ($entry['metadatos']['ium'] ?? ''));
+
+                    if ($ium !== '') {
+                        $this->iumIndex[$ium][] = $entry;
+                        $this->iumFamilyIndex[substr($ium, 0, self::IUM_LONGITUD_FAMILIA)][] = $entry;
+                    }
+                }
+
+                if ($catalogo->tipo === CatalogoReferenciaImporter::TYPE_COMPLEMENTO_MEDICAMENTOS_PROSTATA && $item->activo !== false) {
+                    $this->complementByCum[$item->ruta ?? LaMariaPrograma::RUTA_PROSTATA][$this->normaliseCode((string) $item->codigo)][] = $entry;
                 }
 
                 if (in_array($catalogo->tipo, [
@@ -178,26 +249,55 @@ class ReferenciaRutaMatcher
         $official = $this->officialReference($serviceType, $code);
         $technical = $this->technicalCodes[$route][$code] ?? null;
         $isMedication = $serviceType === 'medicamentos';
-        $cum = $isMedication ? $this->cumReference($code) : null;
+        $resolution = $isMedication ? $this->resolveMedication($record, $route) : null;
+        $cum = $resolution['cum'] ?? null;
+        // El precio de dispensación solo aplica cuando el propio RIPS trae el CUM
+        // dispensado; una presentación deducida (IUM o dispensación) no lo hereda.
         $dispensation = $isMedication
-            ? $this->dispensationReference($record, $route, $cum)
+            ? $this->dispensationReference(
+                $record,
+                $route,
+                ($resolution['metodo'] ?? '') === FormaCruce::CumExacto->value ? $cum : null
+            )
             : null;
-        $medicationLookup = $isMedication
-            ? $this->medicationTechnicalReference(
-                $code,
+        $resolutionBlocksTariff = in_array($resolution['estado'] ?? '', ['MUESTRA_MEDICA', 'AMBIGUO', 'CONFLICTO'], true);
+        // Presentación deducida (IUM o dispensación): el precio administrativo del
+        // mismo paciente, mes y CUM solo se informa como externo potencial; nunca suma.
+        $deducedDispensation = $isMedication && $dispensation === null && $cum !== null && ! $resolutionBlocksTariff
+            && ($resolution['metodo'] ?? '') !== FormaCruce::CumExacto->value
+                ? $this->dispensationReference($record, $route, $cum)
+                : null;
+        $medicationLookup = match (true) {
+            ! $isMedication => null,
+            $resolutionBlocksTariff => [
+                'entry' => null,
+                'forma' => FormaCruce::PrincipioAmbiguo->value,
+                'candidatos' => $resolution['candidatos'],
+            ],
+            default => $this->medicationTechnicalReferenceForCodes(
+                $resolution['codigos'] === [] ? [$code] : $resolution['codigos'],
                 (string) ($record['nombreServicio'] ?? ''),
                 $route,
                 (string) ($cum['metadatos']['principio_activo'] ?? $cum['descripcion'] ?? '')
-            )
-            : null;
+            ),
+        };
+
+        if ($medicationLookup !== null && ($medicationLookup['forma'] ?? '') === FormaCruce::CumExacto->value
+            && in_array($resolution['metodo'] ?? '', [FormaCruce::IumExacto->value, FormaCruce::DispensacionPacientePeriodo->value, FormaCruce::IumFamiliaDispensacion->value], true)) {
+            $medicationLookup['forma'] = $resolution['metodo'];
+        }
+
         $medicationNt = $medicationLookup['entry'] ?? null;
         $isAmbiguous = ($medicationLookup['forma'] ?? null) === FormaCruce::PrincipioAmbiguo->value;
         $manual = $this->manualReference($route, $serviceType, $code);
+        $complement = $isMedication && ! $resolutionBlocksTariff
+            ? $this->complementReference($resolution['codigos'] === [] ? [$code] : $resolution['codigos'], $route, substr((string) ($record['fechaAtencion'] ?? ''), 0, 10))
+            : ['entry' => null, 'pendiente' => null, 'motivo' => ''];
         $oncologyScheme = $isMedication
             ? $this->oncologyScheme($route, (string) ($record['nombreServicio'] ?? ''), $cum)
             : '';
 
-        foreach ([$official, $technical, $cum, $medicationNt, $manual, $dispensation] as $reference) {
+        foreach ([$official, $technical, $cum, $medicationNt, $complement['entry'], $manual, $dispensation] as $reference) {
             if ($reference !== null) {
                 $this->registerUsage($reference);
             }
@@ -205,17 +305,22 @@ class ReferenciaRutaMatcher
 
         $notaTecnica = $isMedication ? $medicationNt : $technical;
         $nombreNotaTecnica = (string) ($notaTecnica['descripcion'] ?? '');
+        // La tarifa de radioterapia es por tratamiento: no se aplica a las líneas
+        // del RIPS hasta que el negocio confirme qué representa cada línea.
+        $radioterapiaPendiente = ! $isMedication && ($technical['categoria'] ?? null) === 'ONCOLOGIA_RADIOTERAPIA';
 
         $description = $official['descripcion'] ?? $technical['descripcion'] ?? $cum['descripcion'] ?? '';
         $catalogNames = array_values(array_unique(array_filter([
             $official['catalogoLabel'] ?? '',
             $technical['catalogoLabel'] ?? '',
             $medicationNt['catalogoLabel'] ?? '',
+            $complement['entry']['catalogoLabel'] ?? '',
             $cum['catalogoLabel'] ?? '',
             $dispensation['catalogoLabel'] ?? '',
         ])));
         $isComplement = ($technical['categoria'] ?? null) === 'MEDICAMENTOS_NUEVOS';
         [$rate, $rateSource, $matchForm] = match (true) {
+            $radioterapiaPendiente => [null, FuenteTarifa::Ninguna, FormaCruce::CodigoExacto->value],
             ($notaTecnica['tarifaReferencia'] ?? null) !== null => [
                 $notaTecnica['tarifaReferencia'],
                 FuenteTarifa::NotaTecnica,
@@ -226,12 +331,18 @@ class ReferenciaRutaMatcher
                 $isComplement ? FuenteTarifa::Complemento : FuenteTarifa::NotaTecnica,
                 $isMedication ? FormaCruce::CumExacto->value : FormaCruce::CodigoExacto->value,
             ],
+            // Complemento contractual: solo un precio VERIFICADO y vigente en la fecha de atención.
+            ($complement['entry']['tarifaReferencia'] ?? null) !== null => [
+                $complement['entry']['tarifaReferencia'],
+                FuenteTarifa::Complemento,
+                (string) ($resolution['metodo'] ?? FormaCruce::CumExacto->value),
+            ],
             ($manual['tarifaReferencia'] ?? null) !== null => [
                 $manual['tarifaReferencia'],
                 FuenteTarifa::ReferenciaManual,
                 FormaCruce::ManualCodigo->value,
             ],
-            ($dispensation['tarifaReferencia'] ?? null) !== null => [
+            $this->politicaDispensacion === PoliticaDispensacion::Fase1 && ($dispensation['tarifaReferencia'] ?? null) !== null => [
                 $dispensation['tarifaReferencia'],
                 FuenteTarifa::Dispensacion,
                 FormaCruce::DocumentoCumMes->value,
@@ -252,14 +363,42 @@ class ReferenciaRutaMatcher
             $isAmbiguous => EstadoTarifario::RevisarPresentacion,
             default => EstadoTarifario::SinTarifa,
         };
-        $quantity = $this->numberOrDefault($record['cantidad'] ?? null, 1.0);
+        $reportedQuantity = $record['cantidad'] ?? null;
+        $quantityState = match (true) {
+            $reportedQuantity === null || $reportedQuantity === '' => 'NO_INFORMADA',
+            ! is_numeric($reportedQuantity) || ! is_finite((float) $reportedQuantity) || (float) $reportedQuantity < 0 => 'INVALIDA',
+            (float) $reportedQuantity === 0.0 => 'CERO',
+            default => 'POSITIVA_VALIDA',
+        };
+        $quantity = $this->numberOrDefault($reportedQuantity, $isMedication ? 0.0 : 1.0);
+
+        if ($quantityState === 'INVALIDA') {
+            $quantity = 0.0;
+        }
+
         $estimatedCost = $tariffState === EstadoTarifario::ConTarifa ? round($rate * $quantity, 2) : 0.0;
+        // Escenario referencial ampliado (FASE_1): el mismo cruce, pero el precio
+        // administrativo de dispensación suma cuando no hay tarifa contractual.
+        $referentialRate = $tariffState !== EstadoTarifario::ConTarifa && $rate === null && ! $radioterapiaPendiente
+            && (float) ($dispensation['tarifaReferencia'] ?? 0) > 0
+                ? (float) $dispensation['tarifaReferencia']
+                : null;
+        // Valor que no suma porque su fuente no es contractual o no está verificada.
+        [$conditionedRate, $conditionedReason] = match (true) {
+            $tariffState === EstadoTarifario::ConTarifa => [null, ''],
+            $complement['pendiente'] !== null => [$complement['pendiente']['tarifa'], $complement['pendiente']['motivo']],
+            $complement['motivo'] !== '' => [null, $complement['motivo']],
+            $this->politicaDispensacion === PoliticaDispensacion::Condicionada && ($dispensation['tarifaReferencia'] ?? null) !== null => [(float) $dispensation['tarifaReferencia'], 'DISPENSACION_ADMINISTRATIVA_CONDICIONADA'],
+            (float) ($deducedDispensation['tarifaReferencia'] ?? 0) > 0 => [(float) $deducedDispensation['tarifaReferencia'], 'PRESENTACION_DEDUCIDA_PRECIO_ADMINISTRATIVO_MISMO_PACIENTE'],
+            default => [null, ''],
+        };
         $status = $dispensation !== null && $notaTecnica === null && $technical === null && $manual === null
             ? 'MEDICAMENTO_CON_DISPENSACION'
             : $this->statusFor($official, $notaTecnica ?? $technical ?? $manual, $cum, $serviceType);
         $referenceCategory = (string) ($notaTecnica['categoria'] ?? $technical['categoria'] ?? '');
         $referenceValueType = match (true) {
-            $dispensation !== null && $rate === $dispensation['tarifaReferencia'] => 'TARIFA_DISPENSACION_ADMINISTRATIVA',
+            $radioterapiaPendiente => 'TARIFA_TRATAMIENTO_PENDIENTE',
+            $rateSource === FuenteTarifa::Dispensacion => 'TARIFA_DISPENSACION_ADMINISTRATIVA',
             $serviceType === 'medicamentos' => 'TARIFA_UNITARIA_MEDICAMENTO',
             in_array($referenceCategory, ['ONCOLOGIA_QUIMIOTERAPIA', 'ONCOLOGIA_RADIOTERAPIA'], true) => 'TARIFA_APLICACION_CICLO',
             $referenceCategory === 'TRANSPORTE_ALBERGUE' => 'TARIFA_TRANSPORTE_ALBERGUE',
@@ -281,6 +420,8 @@ class ReferenciaRutaMatcher
             'valorRipsReportado' => $this->numberOrDefault($record['valorRips'] ?? null, 0.0),
             'tarifaReferencia' => $rate ?? 0.0,
             'costoEstimadoReferencia' => $estimatedCost,
+            'estadoCantidad' => $quantityState,
+            'cantidadAplicada' => $isMedication && $quantityState === 'NO_INFORMADA' ? null : $quantity,
             'estadoCruce' => $status,
             'estadoTarifario' => $tariffState->value,
             'fuenteTarifa' => $rateSource->value,
@@ -291,17 +432,79 @@ class ReferenciaRutaMatcher
             'candidatosPresentacion' => $isAmbiguous
                 ? $this->presentationCandidates($medicationLookup['candidatos'])
                 : '',
-            'cum' => $code !== '' && $serviceType === 'medicamentos'
-                ? $code
-                : ($cum === null ? '' : (string) $cum['codigo']),
+            'cum' => $cum !== null ? (string) $cum['codigo'] : ($isMedication ? $code : ''),
             'principioActivo' => $medicationNt['metadatos']['principio_activo']
                 ?? $medicationLookup['candidatos'][0]['metadatos']['principio_activo']
                 ?? $cum['metadatos']['principio_activo']
                 ?? '',
             'atc' => $cum['metadatos']['atc'] ?? '',
+            'resolucionMedicamento' => $resolution['estado'] ?? '',
+            'metodoResolucion' => $resolution['metodo'] ?? '',
+            'cumResuelto' => (string) ($cum['codigo'] ?? ''),
+            'evidenciaResolucion' => $resolution['evidencia'] ?? '',
+            'muestraMedica' => ($resolution['estado'] ?? '') === 'MUESTRA_MEDICA',
+            'servicioNotaTecnica' => (string) ($technical['metadatos']['servicio'] ?? ''),
+            'agrupadorNotaTecnica' => (string) ($technical['metadatos']['agrupador'] ?? ''),
             'esquemaOncologico' => $oncologyScheme,
             'tipoValorReferencia' => $referenceValueType,
+            'tarifaCondicionada' => $conditionedRate ?? 0.0,
+            'valorCondicionado' => $conditionedRate === null ? 0.0 : round($conditionedRate * $quantity, 2),
+            'motivoCondicionado' => $conditionedReason,
+            'estadoContractualComplemento' => (string) ($complement['entry']['metadatos']['estado_contractual'] ?? ($complement['pendiente'] === null ? '' : EstadoContractual::Pendiente->value)),
+            'politicaDispensacion' => $this->politicaDispensacion->value,
+            'tarifaEscenarioReferencial' => $tariffState === EstadoTarifario::ConTarifa ? (float) $rate : ($referentialRate ?? 0.0),
+            'costoEscenarioReferencial' => $tariffState === EstadoTarifario::ConTarifa
+                ? $estimatedCost
+                : ($referentialRate === null ? 0.0 : round($referentialRate * $quantity, 2)),
+            'fuenteEscenarioReferencial' => $tariffState === EstadoTarifario::ConTarifa
+                ? $rateSource->value
+                : ($referentialRate === null ? '' : FuenteTarifa::Dispensacion->value),
+            'presentacionCum' => $cum === null ? '' : implode(' / ', array_values(array_filter([
+                (string) ($cum['metadatos']['producto'] ?? ''),
+                trim(($cum['metadatos']['cantidad'] ?? '').' '.($cum['metadatos']['unidad_medida'] ?? '')),
+                (string) ($cum['metadatos']['forma_farmaceutica'] ?? ''),
+                (string) ($cum['metadatos']['unidad_referencia'] ?? ''),
+            ]))),
+            'categoriaNotaTecnica' => $radioterapiaPendiente ? 'ONCOLOGIA_RADIOTERAPIA' : $referenceCategory,
+            'codigoNotaTecnica' => (string) (($isMedication ? $medicationNt : $technical)['codigo'] ?? ''),
         ];
+    }
+
+    /**
+     * Precios unitarios administrativos de dispensación del CUM en la ruta
+     * (cualquier paciente), para la valorización administrativa referencial.
+     *
+     * @return list<array{mes: string, tarifa: float}>
+     */
+    public function historialPreciosDispensacion(string $route, string $cum): array
+    {
+        return $this->dispensationPriceHistory[$route][$this->normaliseCode($cum)] ?? [];
+    }
+
+    /**
+     * Conceptos de la nota técnica de la ruta (servicios, oncología, resumen,
+     * hospitalización y transporte) con su proyección mensual.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function entradasNotaTecnica(string $route): array
+    {
+        return array_values(array_filter(
+            $this->technicalReferences,
+            static fn (array $reference): bool => ($reference['ruta'] ?? null) === $route
+        ));
+    }
+
+    /**
+     * Tarifa de la nota técnica de la ruta para un código, sin registrar uso
+     * del catálogo (por ejemplo, la consulta de urgencias de una estancia de
+     * menos de 24 horas).
+     */
+    public function technicalTariff(string $route, string $code): ?float
+    {
+        $rate = $this->technicalCodes[$route][$this->normaliseCode($code)]['tarifaReferencia'] ?? null;
+
+        return $rate !== null && (float) $rate > 0 ? (float) $rate : null;
     }
 
     /**
@@ -338,10 +541,15 @@ class ReferenciaRutaMatcher
         $code = $this->normaliseCode((string) ($reference['codigo'] ?? ''));
         $rate = (float) ($reference['tarifaReferencia'] ?? 0);
 
+        if ($document !== '' && $date !== '' && $route !== '' && $code !== '') {
+            $this->dispensationEvidence[implode('|', [$route, $document, $date])][] = $reference;
+        }
+
         if ($document === '' || $date === '' || $route === '' || $code === '' || $rate <= 0) {
             return;
         }
 
+        $this->dispensationPriceHistory[$route][$code][] = ['mes' => $date, 'tarifa' => $rate];
         $key = implode('|', [$route, $document, $code, $date]);
         $existing = $this->dispensationReferences[$key] ?? null;
 
@@ -592,8 +800,8 @@ class ReferenciaRutaMatcher
 
         $catalogo = $this->cumCatalogs[CatalogoReferenciaImporter::TYPE_MEDICAMENTOS_CUM] ?? null;
 
-        if ($catalogo === null) {
-            return null;
+        if ($catalogo === null || $catalogo->relationLoaded('items')) {
+            return $this->cumCache[$code] = null;
         }
 
         $item = CatalogoReferenciaItem::query()
@@ -609,6 +817,469 @@ class ReferenciaRutaMatcher
         }
 
         return $this->cumCache[$code] = $this->entry($catalogo, $item);
+    }
+
+    /**
+     * Identifica el medicamento del RIPS con relaciones exactas y verificables:
+     * 1) CUM exacto; 2) IUM exacto con una sola presentación comercial;
+     * 3) dispensación del mismo paciente y mes con un único CUM del mismo
+     * principio activo (y, si se conoce, misma concentración y forma). Nunca
+     * usa prefijos de IUM ni elige el primer registro: si quedan varias
+     * presentaciones devuelve AMBIGUO, y una muestra médica sin evidencia de la
+     * presentación comercial devuelve MUESTRA_MEDICA.
+     *
+     * @param  array<string, mixed>  $record
+     * @return array{estado: string, metodo: string, cum: array<string, mixed>|null, codigos: list<string>, evidencia: string, candidatos: list<array<string, mixed>>}
+     */
+    private function resolveMedication(array $record, string $route): array
+    {
+        $code = $this->normaliseCode((string) ($record['codigo'] ?? ''));
+        $result = static fn (string $estado, string $metodo, ?array $cum = null, array $codigos = [], string $evidencia = '', array $candidatos = []): array => [
+            'estado' => $estado,
+            'metodo' => $metodo,
+            'cum' => $cum,
+            'codigos' => $codigos,
+            'evidencia' => $evidencia,
+            'candidatos' => $candidatos,
+        ];
+
+        if ($code === '') {
+            return $result('SIN_CODIGO', FormaCruce::SinCruce->value);
+        }
+
+        $cum = $this->cumReference($code);
+
+        if ($cum !== null) {
+            return $result('RESUELTO', FormaCruce::CumExacto->value, $cum, [$code], 'CUM '.$code);
+        }
+
+        $byIum = $this->cumReferencesByIum($code);
+        $reference = null;
+
+        if ($byIum !== []) {
+            $commercial = array_values(array_filter($byIum, fn (array $entry): bool => ! $this->isMedicalSample($entry)));
+            // Un CUM de varios principios activos tiene una fila por principio: la
+            // presentación se compara por CUM, uniendo sus filas.
+            $ingredientsByCode = [];
+
+            foreach ($commercial as $entry) {
+                $ingredientsByCode[(string) $entry['codigo']][] = $this->presentationKey($entry);
+            }
+
+            $presentations = array_unique(array_map(static function (array $keys): string {
+                $keys = array_unique($keys);
+                sort($keys);
+
+                return implode('+', $keys);
+            }, $ingredientsByCode));
+
+            if (count($presentations) === 1) {
+                $codes = array_keys($ingredientsByCode);
+                $conflict = $this->dispensationConflict($record, $route, $commercial[0]);
+
+                // El IUM y la dispensación del mismo paciente y mes muestran presentaciones
+                // distintas: no se elige ninguna ni se reconoce costo hasta revisarlo.
+                if ($conflict !== null) {
+                    return $result(
+                        'CONFLICTO',
+                        FormaCruce::IumExacto->value,
+                        null,
+                        [],
+                        'IUM '.$code.' corresponde al CUM '.implode(', ', $codes).', pero la dispensación del período registra '.$conflict,
+                        [$commercial[0]]
+                    );
+                }
+
+                return $result('RESUELTO', FormaCruce::IumExacto->value, $commercial[0], array_map('strval', $codes), 'IUM '.$code.' → CUM '.implode(', ', $codes));
+            }
+
+            if (count($presentations) > 1) {
+                return $result('AMBIGUO', FormaCruce::IumExacto->value, null, [], 'IUM '.$code.' con varias presentaciones', $commercial);
+            }
+
+            // Solo hay muestras médicas: se busca la presentación comercial en la dispensación.
+            $reference = $byIum[0];
+        }
+
+        $principios = $this->principioCandidates((string) ($record['nombreServicio'] ?? ''));
+
+        if ($reference !== null) {
+            $principios[] = $this->normalisePrincipio((string) ($reference['metadatos']['principio_activo'] ?? ''));
+        }
+
+        $dispensed = [];
+
+        foreach ($this->dispensationEvidenceFor($record, $route) as $evidence) {
+            $dispensedCum = $this->cumReference($this->normaliseCode((string) $evidence['codigo']));
+            $principio = $this->normalisePrincipio((string) ($dispensedCum['metadatos']['principio_activo'] ?? ''));
+
+            if ($dispensedCum === null || ! $this->samePrincipio($principio, $principios) || $this->isMedicalSample($dispensedCum)) {
+                continue;
+            }
+
+            if ($reference !== null && $this->strengthKey($dispensedCum) !== $this->strengthKey($reference)) {
+                continue;
+            }
+
+            $dispensed[(string) $dispensedCum['codigo']] = [$dispensedCum, $evidence];
+        }
+
+        if (count($dispensed) === 1) {
+            [$dispensedCum, $evidence] = array_values($dispensed)[0];
+
+            return $result(
+                'RESUELTO',
+                FormaCruce::DispensacionPacientePeriodo->value,
+                $dispensedCum,
+                [(string) $dispensedCum['codigo']],
+                sprintf(
+                    'Código RIPS %s%s; dispensación del %s del CUM %s (fila %s)',
+                    $code,
+                    $reference !== null ? ' (IUM de muestra médica '.$reference['codigo'].')' : '',
+                    $evidence['metadatos']['fecha_dispensacion'] ?? '',
+                    $dispensedCum['codigo'],
+                    $evidence['metadatos']['fila'] ?? 's/d'
+                )
+            );
+        }
+
+        if (count($dispensed) > 1) {
+            $family = $byIum === [] ? $this->resolveByIumFamily($code, $record, $route) : null;
+
+            if ($family !== null && $family['cum'] !== null) {
+                return $result('RESUELTO', FormaCruce::IumFamiliaDispensacion->value, $family['cum'], [(string) $family['cum']['codigo']], $family['evidencia']);
+            }
+
+            return $result(
+                'AMBIGUO',
+                FormaCruce::DispensacionPacientePeriodo->value,
+                null,
+                [],
+                'Varios CUM dispensados en el período'.($family === null ? '' : '. AMBIGUO — NO SUMA AUTOMÁTICAMENTE: '.$family['evidencia']),
+                array_column($dispensed, 0)
+            );
+        }
+
+        if ($reference !== null) {
+            return $result('MUESTRA_MEDICA', FormaCruce::IumExacto->value, null, [], 'IUM '.$code.' de muestra médica sin dispensación comercial verificable', [$reference]);
+        }
+
+        return $result('SIN_RESOLUCION', FormaCruce::SinCruce->value);
+    }
+
+    /**
+     * Resolución controlada de un IUM ausente del registro cuando al paciente se
+     * le dispensaron varias presentaciones del principio en el mes. Se acepta solo
+     * si se cumplen todas las condiciones: (1) el IUM no existe en el registro;
+     * (2) los registros comerciales de su familia (primeros caracteres del IUM)
+     * comparten un único principio, concentración y forma farmacéutica; (3) ese
+     * principio es el del nombre del servicio RIPS; (4) en la dispensación del
+     * mismo paciente y mes hay un único CUM comercial con esa presentación; (5)
+     * ese CUM pertenece a la familia; (6) la cantidad del RIPS es igual a las
+     * unidades dispensadas de ese CUM. Nunca usa importes. Devuelve null si el
+     * código no tiene forma de IUM; si falla una condición, cum es null y la
+     * evidencia indica cuál.
+     *
+     * @param  array<string, mixed>  $record
+     * @return array{cum: array<string, mixed>|null, evidencia: string}|null
+     */
+    private function resolveByIumFamily(string $code, array $record, string $route): ?array
+    {
+        if (preg_match('/^\d[A-Z]\d{13}$/', $code) !== 1 || isset($this->iumIndex[$code])) {
+            return null;
+        }
+
+        $prefix = substr($code, 0, self::IUM_LONGITUD_FAMILIA);
+        $fail = static fn (string $motivo): array => ['cum' => null, 'evidencia' => $motivo.' (IUM '.$code.', familia '.$prefix.')'];
+        $family = array_values(array_filter($this->iumFamilyIndex[$prefix] ?? [], fn (array $entry): bool => ! $this->isMedicalSample($entry)));
+
+        if ($family === []) {
+            return $fail('FAMILIA_IUM_SIN_REGISTROS_COMERCIALES');
+        }
+
+        $principios = array_unique(array_map(fn (array $entry): string => $this->normalisePrincipio((string) ($entry['metadatos']['principio_activo'] ?? '')), $family));
+        $strengths = array_unique(array_map(fn (array $entry): string => $this->strengthKey($entry), $family));
+        $forms = array_unique(array_map(fn (array $entry): string => $this->normalisePrincipio((string) ($entry['metadatos']['forma_farmaceutica'] ?? '')), $family));
+
+        if (count($principios) !== 1 || count($strengths) !== 1 || count($forms) !== 1) {
+            return $fail('FAMILIA_IUM_CON_VARIAS_PRESENTACIONES');
+        }
+
+        $principio = $principios[array_key_first($principios)];
+        $strength = $strengths[array_key_first($strengths)];
+        $form = $forms[array_key_first($forms)];
+
+        if (! $this->samePrincipio($principio, $this->principioCandidates((string) ($record['nombreServicio'] ?? '')))) {
+            return $fail('PRINCIPIO_DEL_RIPS_DISTINTO_AL_DE_LA_FAMILIA');
+        }
+
+        $candidates = [];
+        $others = [];
+
+        foreach ($this->dispensationEvidenceFor($record, $route) as $evidence) {
+            $dispensedCum = $this->cumReference($this->normaliseCode((string) $evidence['codigo']));
+
+            if ($dispensedCum === null || $this->isMedicalSample($dispensedCum)
+                || ! $this->samePrincipio($this->normalisePrincipio((string) ($dispensedCum['metadatos']['principio_activo'] ?? '')), [$principio])) {
+                continue;
+            }
+
+            $key = (string) $dispensedCum['codigo'];
+
+            if ($this->strengthKey($dispensedCum) === $strength
+                && $this->normalisePrincipio((string) ($dispensedCum['metadatos']['forma_farmaceutica'] ?? '')) === $form) {
+                $candidates[$key]['cum'] = $dispensedCum;
+                $candidates[$key]['unidades'] = ($candidates[$key]['unidades'] ?? 0.0) + (float) ($evidence['metadatos']['unidades_dispensadas'] ?? 0);
+                $candidates[$key]['filas'][] = $evidence['metadatos']['fila'] ?? 's/d';
+            } else {
+                $others[$key] = $key;
+            }
+        }
+
+        if ($candidates === []) {
+            return $fail('SIN_DISPENSACION_DE_LA_PRESENTACION_DE_LA_FAMILIA');
+        }
+
+        if (count($candidates) > 1) {
+            return $fail('VARIOS_CUM_DISPENSADOS_CON_LA_PRESENTACION: '.implode(', ', array_keys($candidates)));
+        }
+
+        $candidate = $candidates[array_key_first($candidates)];
+
+        if (! str_starts_with($this->normaliseCode((string) ($candidate['cum']['metadatos']['ium'] ?? '')), $prefix)) {
+            return $fail('CUM_DISPENSADO_FUERA_DE_LA_FAMILIA: '.$candidate['cum']['codigo']);
+        }
+
+        $quantity = $this->numberOrDefault($record['cantidad'] ?? null, 0.0);
+
+        if (abs($quantity - $candidate['unidades']) > 0.0001) {
+            return $fail(sprintf('CANTIDAD_NO_COINCIDE: RIPS %s, dispensado %s del CUM %s', $quantity + 0, $candidate['unidades'] + 0, $candidate['cum']['codigo']));
+        }
+
+        return [
+            'cum' => $candidate['cum'],
+            'evidencia' => sprintf(
+                'IUM %s no existe en el registro; familia %s con %d registros comerciales de una sola presentación (%s %s %s); dispensación del CUM %s (filas %s) con %s unidades = cantidad RIPS%s',
+                $code,
+                $prefix,
+                count($family),
+                $principio,
+                str_replace('|', ' ', $strength),
+                $form,
+                $candidate['cum']['codigo'],
+                implode(', ', $candidate['filas']),
+                $quantity + 0,
+                $others === [] ? '' : '; otras presentaciones del principio en el período, descartadas por concentración o forma: CUM '.implode(', ', $others)
+            ),
+        ];
+    }
+
+    /**
+     * Precio del complemento contractual para los CUM identificados. Solo un
+     * precio VERIFICADO cuya vigencia cubre la fecha de atención fija tarifa;
+     * un precio PENDIENTE se informa como condicionado y nunca suma.
+     *
+     * @param  list<string>  $codes
+     * @return array{entry: array<string, mixed>|null, pendiente: array{tarifa: float, motivo: string}|null, motivo: string}
+     */
+    private function complementReference(array $codes, string $route, string $date): array
+    {
+        $rows = [];
+
+        foreach ($codes as $code) {
+            foreach ($this->complementByCum[$route][$this->normaliseCode($code)] ?? [] as $entry) {
+                $rows[] = $entry;
+            }
+        }
+
+        $none = ['entry' => null, 'pendiente' => null, 'motivo' => ''];
+
+        if ($rows === []) {
+            return $none;
+        }
+
+        $covers = static function (array $entry) use ($date): ?bool {
+            $from = (string) ($entry['metadatos']['vigencia_desde'] ?? '');
+            $to = (string) ($entry['metadatos']['vigencia_hasta'] ?? '');
+
+            if ($from === '' && $to === '') {
+                return null;
+            }
+
+            return $date !== '' && ($from === '' || $from <= $date) && ($to === '' || $date <= $to);
+        };
+        $state = static fn (array $entry): string => (string) ($entry['metadatos']['estado_contractual'] ?? '');
+        $rates = static fn (array $entries): array => array_values(array_unique(array_map(
+            static fn (array $entry): string => number_format((float) $entry['tarifaReferencia'], 4, '.', ''),
+            $entries
+        )));
+        $verified = array_values(array_filter($rows, static fn (array $entry): bool => $state($entry) === EstadoContractual::Verificado->value
+            && $entry['tarifaReferencia'] !== null && $covers($entry) === true));
+
+        if (count($rates($verified)) === 1) {
+            return [...$none, 'entry' => $verified[0]];
+        }
+
+        if ($verified !== []) {
+            return [...$none, 'motivo' => 'COMPLEMENTO_VERIFICADO_CON_VARIOS_PRECIOS_VIGENTES'];
+        }
+
+        $pending = array_values(array_filter($rows, static fn (array $entry): bool => $state($entry) === EstadoContractual::Pendiente->value
+            && $entry['tarifaReferencia'] !== null && $covers($entry) !== false));
+        $pendingRates = $rates($pending);
+
+        return match (true) {
+            count($pendingRates) === 1 => [...$none, 'pendiente' => ['tarifa' => (float) $pending[0]['tarifaReferencia'], 'motivo' => 'COMPLEMENTO_PENDIENTE_VERIFICACION']],
+            count($pendingRates) > 1 => [...$none, 'motivo' => 'COMPLEMENTO_PENDIENTE_CON_VARIOS_PRECIOS: '.implode(' / ', array_map(static fn (string $rate): string => (string) ((float) $rate), $pendingRates))],
+            collect($rows)->contains(static fn (array $entry): bool => $state($entry) === EstadoContractual::Verificado->value) => [...$none, 'motivo' => 'COMPLEMENTO_VERIFICADO_FUERA_DE_VIGENCIA'],
+            default => $none,
+        };
+    }
+
+    /**
+     * Presentaciones comerciales del mismo principio dispensadas al paciente en el
+     * mes que no coinciden con la del IUM; null si no hay dispensación de ese
+     * principio o si alguna coincide.
+     *
+     * @param  array<string, mixed>  $record
+     * @param  array<string, mixed>  $iumEntry
+     */
+    private function dispensationConflict(array $record, string $route, array $iumEntry): ?string
+    {
+        $principios = [$this->normalisePrincipio((string) ($iumEntry['metadatos']['principio_activo'] ?? ''))];
+        $expected = $this->strengthKey($iumEntry);
+        $different = [];
+
+        foreach ($this->dispensationEvidenceFor($record, $route) as $evidence) {
+            $dispensedCum = $this->cumReference($this->normaliseCode((string) $evidence['codigo']));
+
+            if ($dispensedCum === null || $this->isMedicalSample($dispensedCum)
+                || ! $this->samePrincipio($this->normalisePrincipio((string) ($dispensedCum['metadatos']['principio_activo'] ?? '')), $principios)) {
+                continue;
+            }
+
+            if ($this->strengthKey($dispensedCum) === $expected) {
+                return null;
+            }
+
+            $different[(string) $dispensedCum['codigo']] = sprintf(
+                'CUM %s (fila %s)',
+                $dispensedCum['codigo'],
+                $evidence['metadatos']['fila'] ?? 's/d'
+            );
+        }
+
+        return $different === [] ? null : implode(', ', $different);
+    }
+
+    /**
+     * @param  list<string>  $codes
+     * @return array{entry: array<string, mixed>|null, forma: string, candidatos: array<int, array<string, mixed>>}|null
+     */
+    private function medicationTechnicalReferenceForCodes(array $codes, string $nombreServicio, string $route, string $principioAlterno): ?array
+    {
+        if (count($codes) <= 1) {
+            return $this->medicationTechnicalReference($codes[0] ?? '', $nombreServicio, $route, $principioAlterno);
+        }
+
+        $entries = [];
+
+        foreach ($codes as $candidate) {
+            foreach ([$route, '*'] as $scope) {
+                if (isset($this->medicationByCum[$scope][$candidate])) {
+                    $entries[] = $this->medicationByCum[$scope][$candidate];
+
+                    break;
+                }
+            }
+        }
+
+        $rates = array_unique(array_map(static fn (array $entry): string => number_format((float) $entry['tarifaReferencia'], 4, '.', ''), $entries));
+
+        return match (true) {
+            $entries === [] => $this->medicationTechnicalReference('', $nombreServicio, $route, $principioAlterno),
+            count($rates) === 1 => ['entry' => $entries[0], 'forma' => FormaCruce::CumExacto->value, 'candidatos' => []],
+            default => ['entry' => null, 'forma' => FormaCruce::PrincipioAmbiguo->value, 'candidatos' => $entries],
+        };
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function cumReferencesByIum(string $code): array
+    {
+        return $this->iumIndex[$code] ?? [];
+    }
+
+    /**
+     * @param  array<string, mixed>  $record
+     * @return list<array<string, mixed>>
+     */
+    private function dispensationEvidenceFor(array $record, string $route): array
+    {
+        $document = $this->normaliseCode((string) ($record['numDocumentoIdentificacion'] ?? ''));
+        $month = substr((string) ($record['fechaAtencion'] ?? ''), 0, 7);
+
+        return $this->dispensationEvidence[implode('|', [$route, $document, $month])] ?? [];
+    }
+
+    /**
+     * El principio del registro CUM empieza por uno de los principios del RIPS
+     * (el registro puede traer la sal o la equivalencia a continuación).
+     *
+     * @param  list<string>  $candidatos
+     */
+    private function samePrincipio(string $principio, array $candidatos): bool
+    {
+        foreach ($candidatos as $candidato) {
+            if (mb_strlen($candidato) >= 5 && $principio !== '' && str_starts_with($principio, $candidato)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  array<string, mixed>  $entry
+     */
+    private function isMedicalSample(array $entry): bool
+    {
+        return in_array(strtoupper(trim((string) ($entry['metadatos']['muestra_medica'] ?? ''))), ['SI', 'SÍ', 'S'], true);
+    }
+
+    /**
+     * Presentación del registro CUM: principio, concentración, forma y, si se
+     * pide, cantidad por envase.
+     *
+     * @param  array<string, mixed>  $entry
+     */
+    private function presentationKey(array $entry, bool $withPackage = true): string
+    {
+        $metadata = $entry['metadatos'] ?? [];
+
+        return implode('|', array_filter([
+            $this->normalisePrincipio((string) ($metadata['principio_activo'] ?? '')),
+            number_format((float) ($metadata['cantidad'] ?? 0), 4, '.', ''),
+            $this->normalisePrincipio((string) ($metadata['unidad_medida'] ?? '')),
+            $this->normalisePrincipio((string) ($metadata['forma_farmaceutica'] ?? '')),
+            $withPackage ? number_format((float) ($metadata['cantidad_cum'] ?? 0), 4, '.', '') : '',
+        ], static fn (string $part): bool => $part !== ''));
+    }
+
+    /**
+     * Concentración del registro CUM. Sirve para comparar presentaciones de un
+     * principio ya verificado: el registro describe el mismo principio con textos
+     * distintos según el titular (p. ej. "PEGFILGRASTIM (FACTOR ESTIMULANTE…)").
+     *
+     * @param  array<string, mixed>  $entry
+     */
+    private function strengthKey(array $entry): string
+    {
+        $metadata = $entry['metadatos'] ?? [];
+
+        return number_format((float) ($metadata['cantidad'] ?? 0), 4, '.', '').'|'
+            .$this->normalisePrincipio((string) ($metadata['unidad_medida'] ?? ''));
     }
 
     /**
@@ -860,6 +1531,17 @@ class ReferenciaRutaMatcher
      */
     private function entry(CatalogoReferencia $catalogo, CatalogoReferenciaItem $item): array
     {
+        $rate = $item->tarifa_referencia;
+        $sourceRate = $item->metadatos['tarifa_fuente_precision'] ?? null;
+
+        if (in_array($catalogo->tipo, [
+            CatalogoReferenciaImporter::TYPE_NOTA_PROSTATA,
+            CatalogoReferenciaImporter::TYPE_NOTA_CERVIX,
+            CatalogoReferenciaImporter::TYPE_NOTA_MEDICAMENTOS,
+        ], true) && is_numeric($sourceRate) && (float) $sourceRate >= 0) {
+            $rate = (float) $sourceRate;
+        }
+
         return [
             'catalogo' => $catalogo,
             'catalogoTipo' => $catalogo->tipo,
@@ -870,7 +1552,7 @@ class ReferenciaRutaMatcher
             'ruta' => $item->ruta,
             'categoria' => $item->categoria,
             'descripcion' => $item->descripcion ?? '',
-            'tarifaReferencia' => $item->tarifa_referencia,
+            'tarifaReferencia' => $rate,
             'metadatos' => $item->metadatos ?? [],
         ];
     }

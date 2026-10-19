@@ -67,6 +67,9 @@ Route::middleware('auth')->group(function () {
         ->defaults('programa', 'la-maria')
         ->name('la-maria');
 
+    Route::post('/la-maria/consolidado/export', [SeguimientoRutaController::class, 'exportConsolidated'])
+        ->name('la-maria.consolidado.export');
+
     Route::get('/la-maria/prostata', [SeguimientoRutaController::class, 'index'])
         ->defaults('ejecucion', 'prostata')
         ->name('la-maria.prostata');
@@ -116,6 +119,8 @@ Route::middleware('auth')->group(function () {
             ->name('catalogos-referencia.consolidado.toggle-file');
         Route::post('/catalogos-referencia/{catalogoReferencia}/toggle-file', [CatalogoReferenciaController::class, 'toggleTechnicalFile'])
             ->name('catalogos-referencia.toggle-file');
+        Route::post('/catalogos-referencia/operaciones/{operacion}/revertir', [CatalogoReferenciaController::class, 'revertOperation'])
+            ->name('catalogos-referencia.operaciones.revertir');
     });
 
     /*

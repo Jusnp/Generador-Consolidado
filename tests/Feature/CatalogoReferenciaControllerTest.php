@@ -41,6 +41,21 @@ class CatalogoReferenciaControllerTest extends TestCase
             ->assertOk();
     }
 
+    public function test_admin_can_find_a_medication_by_ium_without_returning_other_presentations(): void
+    {
+        $admin = User::factory()->create(['role' => 'admin']);
+        $catalog = CatalogoReferencia::create(['programa_slug' => 'la-maria', 'tipo' => 'MEDICAMENTOS_CUM',
+            'version' => 'ium-consulta', 'archivo_origen' => 'cum.xlsx', 'activo' => true]);
+        $catalog->items()->create(['codigo' => '20052945-1', 'descripcion' => 'Presentacion encontrada', 'activo' => true,
+            'metadatos' => ['ium' => 'IUM123456789']]);
+        $catalog->items()->create(['codigo' => '20052945-2', 'descripcion' => 'Presentacion diferente', 'activo' => true,
+            'metadatos' => ['ium' => 'IUM987654321']]);
+
+        $this->actingAs($admin)->get(route('catalogos-referencia.show', [$catalog, 'q' => 'IUM123456789']))
+            ->assertSee('Presentacion encontrada')
+            ->assertDontSee('Presentacion diferente');
+    }
+
     public function test_non_admin_user_cannot_read_or_write_any_catalog_resource(): void
     {
         $user = User::factory()->create(['role' => 'user']);
@@ -111,7 +126,7 @@ class CatalogoReferenciaControllerTest extends TestCase
             ]);
     }
 
-    public function test_admin_can_import_annex_reference_catalog_and_replace_the_active_version(): void
+    public function test_admin_imports_annex_catalog_as_inactive_and_then_replaces_the_active_version(): void
     {
         $admin = User::factory()->create(['role' => 'admin']);
         $oldCatalog = CatalogoReferencia::create([
@@ -130,6 +145,14 @@ class CatalogoReferenciaControllerTest extends TestCase
             ])
             ->assertRedirectToRoute('catalogos-referencia.index')
             ->assertSessionHas('success');
+
+        $newCatalog = CatalogoReferencia::query()->where('version', '2026-09-18')->firstOrFail();
+        $this->assertFalse($newCatalog->activo);
+        $this->assertTrue($oldCatalog->fresh()->activo);
+
+        $this->actingAs($admin)
+            ->post(route('catalogos-referencia.toggle-file', $newCatalog), ['activos_esperados' => (string) $oldCatalog->id])
+            ->assertSessionHasNoErrors();
 
         $this->assertDatabaseHas('catalogo_referencias', [
             'programa_slug' => 'la-maria',
@@ -189,7 +212,7 @@ class CatalogoReferenciaControllerTest extends TestCase
 
         $catalog = CatalogoReferencia::query()
             ->where('tipo', 'NOTA_MEDICAMENTOS')
-            ->where('activo', true)
+            ->where('activo', false)
             ->firstOrFail();
 
         $this->assertSame('la-maria', $catalog->programa_slug);

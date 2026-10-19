@@ -32,5 +32,8 @@
         <env name="PULSE_ENABLED" value="false"/>
         <env name="TELESCOPE_ENABLED" value="false"/>
         <env name="NIGHTWATCH_ENABLED" value="false"/>
+        <env name="LA_MARIA_INFORMES_ADMIN_REQUERIDOS" value="false"/>
+        <env name="LA_MARIA_INFORME_ADMIN_PROSTATA" value=""/>
+        <env name="LA_MARIA_INFORME_ADMIN_CERVIX" value=""/>
     </php>
 </phpunit>
