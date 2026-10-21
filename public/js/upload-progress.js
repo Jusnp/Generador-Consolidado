@@ -150,6 +150,12 @@
                     if (mode === 'download' && isSpreadsheet) {
                         setProgress(form, 100, 'Excel generado. Iniciando descarga…');
                         downloadResponse(request);
+
+                        if (form.dataset.uploadProgressReload === 'true') {
+                            window.setTimeout(function () {
+                                window.location.reload();
+                            }, 1500);
+                        }
                     } else if (mode === 'redirect') {
                         setProgress(form, 100, 'Catálogo actualizado. Recargando…');
                         window.setTimeout(function () {
