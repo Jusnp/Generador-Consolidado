@@ -79,10 +79,7 @@ class SeguimientoRutaController extends Controller
         'codDiagnosticoCausaMuerteCIE11', 'nomCodDiagnosticoCausaMuerteCIE11',
     ];
 
-    private const MONTHLY_SUMMARY_HEADERS = [
-        'MES', 'PACIENTES', 'SERVICIOS', 'COSTO ACTIVO (A + CONDICIONADO)', 'CASOS A REVISAR',
-        'SERVICIOS SIN TARIFA APLICADA',
-    ];
+    private const MONTHLY_SUMMARY_HEADERS = ['MES', 'PACIENTES', 'SERVICIOS'];
 
     private const PATIENT_HEADERS = [
         'MES', 'tipoDocumentoIdentificacion', 'numDocumentoIdentificacion', 'codSexo',
@@ -285,11 +282,11 @@ class SeguimientoRutaController extends Controller
 
             $summarySheet = $writer->getCurrentSheet();
             $summarySheet->setName('SEGUIMIENTO MENSUAL');
-            $this->configureSheet($summarySheet, $this->summarySheetWidths(self::MONTHLY_SUMMARY_HEADERS));
+            $this->configureSheet($summarySheet, $this->columnWidths(self::MONTHLY_SUMMARY_HEADERS));
             $writer->addRow(Row::fromValues(self::MONTHLY_SUMMARY_HEADERS, $this->headerStyle()));
 
             foreach ($this->monthlySummaries($profiles, $sharedProfiles) as $summary) {
-                $writer->addRow(Row::fromValuesWithStyles($summary, null, $this->moneyColumnStyles(self::MONTHLY_SUMMARY_HEADERS)));
+                $writer->addRow(Row::fromValues(array_slice($summary, 0, 3)));
             }
 
             $patientSheet = $writer->addNewSheetAndMakeItCurrent();
@@ -435,6 +432,16 @@ class SeguimientoRutaController extends Controller
                 $writer->addRow(Row::fromValues($catalog));
             }
 
+            if ($sqlFile instanceof UploadedFile) {
+                $sqlSheet = $writer->addNewSheetAndMakeItCurrent();
+                $sqlSheet->setName('VALIDACION SQL');
+                $this->configureSheet($sqlSheet, [24, 30, 80]);
+                $writer->addRow(Row::fromValues(self::SQL_HEADERS, $this->headerStyle()));
+                foreach ($this->sqlValidationRows($sqlFile, $profiles, $allProfiles) as $row) {
+                    $writer->addRow(Row::fromValues($row));
+                }
+            }
+
             $controlSheet = $writer->addNewSheetAndMakeItCurrent();
             $controlSheet->setName('CONTROL DE CARGUE');
             $this->configureSheet($controlSheet, [34, 18, 12, 12, 12, 12, 18, 14, 14, 16, 90]);
@@ -482,26 +489,11 @@ class SeguimientoRutaController extends Controller
                 $writer->addRow(Row::fromValues($ledgerRow));
             }
 
-            if ($sqlFile instanceof UploadedFile) {
-                $sqlSheet = $writer->addNewSheetAndMakeItCurrent();
-                $sqlSheet->setName('VALIDACION SQL');
-                $this->configureSheet($sqlSheet, [24, 30, 80]);
-                $writer->addRow(Row::fromValues(self::SQL_HEADERS, $this->headerStyle()));
-                foreach ($this->sqlValidationRows($sqlFile, $profiles, $allProfiles) as $row) {
-                    $writer->addRow(Row::fromValues($row));
-                }
-            }
-
             $resultadoEconomico = $this->economicResult($resumenEconomico, $profiles, $sharedProfiles, $ruta);
             $conciliacionRipsNota->atribuirPaquetes($resultadoEconomico['hospitalizacion']);
             $valorizacion->atribuirPaquetes($resultadoEconomico['hospitalizacion']);
             $valorizacion->atribuirUrgencias($conciliacionRipsNota->filasEpisodiosUrgencias(), $conciliacionRipsNota->costoUrgenciasPorTipo());
-            $estimacionAdministrativa = $this->writeAdministrativeSheets($writer, [$ruta => $valorizacion], [$ruta => $resultadoEconomico]);
-            $writer->addNewSheetAndMakeItCurrent()->setName('ESTADOS ECONOMICOS');
-            $writer->addRow(Row::fromValues(self::ECONOMIC_STATE_HEADERS, $this->headerStyle()));
-            foreach ($estadosEconomicos as $filaEstado) {
-                $writer->addRow(Row::fromValues($filaEstado));
-            }
+            $estimacionAdministrativa = $this->administrativeComparison([$ruta => $valorizacion], [$ruta => $resultadoEconomico]);
             $hospitalizacionDemo = $resultadoEconomico['hospitalizacion'];
             foreach ($hospitalizacionDemo as $filaHospital) {
                 if ($filaHospital[0] !== 'TOTAL') {
@@ -515,13 +507,6 @@ class SeguimientoRutaController extends Controller
                 }
             }
             unset($filaCategoria);
-            $writer->addNewSheetAndMakeItCurrent()->setName('COSTOS POR CATEGORIA');
-            $writer->addRow(Row::fromValues(['MES', 'CATEGORIA', 'REGISTROS / PAQUETES', 'COSTO RESPALDADO', 'CONDICIONADO INCLUIDO', 'CONDICIONADO EXTERNO NO SUMADO'], $this->headerStyle()));
-            foreach ($categoriasEconomicas as $filaCategoria) {
-                $writer->addRow(Row::fromValues($filaCategoria));
-            }
-            $writer->setCurrentSheet($summarySheet);
-            $this->writeServiceSummary($writer, [$ruta => $valorizacion], [$ruta => $resultadoEconomico], $historialAdministrativo);
             $writer->close();
             $writerClosed = true;
 
@@ -673,17 +658,25 @@ class SeguimientoRutaController extends Controller
             $summaryHeaders = ['RUTA', ...self::MONTHLY_SUMMARY_HEADERS];
             $summarySheet = $writer->getCurrentSheet();
             $summarySheet->setName('SEGUIMIENTO MENSUAL');
-            $this->configureSheet($summarySheet, $this->summarySheetWidths($summaryHeaders));
+            $this->configureSheet($summarySheet, $this->columnWidths($summaryHeaders));
             $writer->addRow(Row::fromValues($summaryHeaders, $this->headerStyle()));
 
             foreach ($resultados as $resultado) {
                 foreach ($resultado['mensual'] as $summary) {
-                    $writer->addRow(Row::fromValuesWithStyles([$resultado['ruta'], ...$summary], null, $this->moneyColumnStyles($summaryHeaders)));
+                    $writer->addRow(Row::fromValues([$resultado['ruta'], ...array_slice($summary, 0, 3)]));
                 }
             }
 
-            $this->writeServiceSummary($writer, $valorizaciones, $resultados, $historialAdministrativo);
-            $estimacionAdministrativa = $this->writeAdministrativeSheets($writer, $valorizaciones, $resultados);
+            $estimacionAdministrativa = $this->administrativeComparison($valorizaciones, $resultados);
+
+            $catalogSheet = $writer->addNewSheetAndMakeItCurrent();
+            $catalogSheet->setName('CATALOGOS APLICADOS');
+            $this->configureSheet($catalogSheet, [48, 24, 38, 22, 28, 16]);
+            $writer->addRow(Row::fromValues(self::CATALOG_HEADERS, $this->headerStyle()));
+
+            foreach ($referenciaRutaMatcher->catalogUsageRows() as $catalog) {
+                $writer->addRow(Row::fromValues($catalog));
+            }
 
             $controlSheet = $writer->addNewSheetAndMakeItCurrent();
             $controlSheet->setName('CONTROL DE CARGUE');
@@ -699,15 +692,6 @@ class SeguimientoRutaController extends Controller
 
             foreach ($this->receptionRows($recepcion, $controlRows) as $receptionRow) {
                 $writer->addRow(Row::fromValues($receptionRow));
-            }
-
-            $catalogSheet = $writer->addNewSheetAndMakeItCurrent();
-            $catalogSheet->setName('CATALOGOS APLICADOS');
-            $this->configureSheet($catalogSheet, [48, 24, 38, 22, 28, 16]);
-            $writer->addRow(Row::fromValues(self::CATALOG_HEADERS, $this->headerStyle()));
-
-            foreach ($referenciaRutaMatcher->catalogUsageRows() as $catalog) {
-                $writer->addRow(Row::fromValues($catalog));
             }
 
             $writer->close();
@@ -2258,14 +2242,13 @@ class SeguimientoRutaController extends Controller
     }
 
     /**
-     * Hojas de detalle de la valorización administrativa referencial, separadas
-     * del costo A. El resumen por servicio va en SEGUIMIENTO MENSUAL.
+     * Comparación administrativa para la sesión, sin agregar hojas al Excel.
      *
      * @param  array<string, ValorizacionAdministrativa>  $valorizaciones  Por ruta.
      * @param  array<string, array<string, mixed>>  $resultados  Resultado económico por ruta.
      * @return list<array<int, mixed>> Comparación por tipo RIPS con la ruta, para la pantalla.
      */
-    private function writeAdministrativeSheets(Writer $writer, array $valorizaciones, array $resultados): array
+    private function administrativeComparison(array $valorizaciones, array $resultados): array
     {
         $costoAPorRuta = [];
 
@@ -2282,42 +2265,6 @@ class SeguimientoRutaController extends Controller
 
         foreach ($valorizaciones as $ruta => $valorizacion) {
             $comparacion = [...$comparacion, ...$prefijar($ruta, $valorizacion->filasComparacion($costoAPorRuta[$ruta] ?? []))];
-        }
-
-        $sheets = [
-            'TRATAMIENTOS INTEGRALES' => ['RUTA', ...ValorizacionAdministrativa::TRATAMIENTOS_HEADERS],
-            'MEDICAMENTOS ASOCIADOS' => ['RUTA', ...ValorizacionAdministrativa::MEDICAMENTOS_HEADERS],
-            'COBERTURA AM RN14' => ['RUTA', ...ValorizacionAdministrativa::COBERTURA_MEDICAMENTOS_HEADERS],
-            'ESTIMACIÓN CONDICIONADA' => ['RUTA', ...ValorizacionAdministrativa::DETALLE_HEADERS],
-            'REGLAS APLICADAS' => ['RUTA', 'REGLA', 'ELEMENTO', 'DESCRIPCION'],
-            'DETALLE POR CÓDIGO' => ['RUTA', ...ValorizacionAdministrativa::DETALLE_HEADERS],
-            'DIFERENCIAS HISTÓRICAS' => ['RUTA', ...ValorizacionAdministrativa::DIFERENCIAS_HEADERS],
-            'PENDIENTES DE VALORIZACIÓN' => ['RUTA', ...ValorizacionAdministrativa::PENDIENTES_HEADERS],
-        ];
-
-        foreach ($sheets as $name => $headers) {
-            $sheet = $writer->addNewSheetAndMakeItCurrent();
-            $sheet->setName($name);
-            $this->configureSheet($sheet, $this->columnWidths($headers));
-            $writer->addRow(Row::fromValues($headers, $this->headerStyle()));
-            $styles = $this->economicColumnStyles($headers);
-
-            foreach ($valorizaciones as $ruta => $valorizacion) {
-                $filas = match ($name) {
-                    'TRATAMIENTOS INTEGRALES' => $valorizacion->filasTratamientos(),
-                    'MEDICAMENTOS ASOCIADOS' => $valorizacion->filasMedicamentosAsociados(),
-                    'COBERTURA AM RN14' => $valorizacion->filasCoberturaMedicamentos(),
-                    'ESTIMACIÓN CONDICIONADA' => $valorizacion->filasCondicionadas(),
-                    'REGLAS APLICADAS' => $valorizacion->filasReglas(),
-                    'DETALLE POR CÓDIGO' => $valorizacion->filasDetalle(),
-                    'DIFERENCIAS HISTÓRICAS' => $valorizacion->filasDiferencias(),
-                    default => $valorizacion->filasPendientes(),
-                };
-
-                foreach ($prefijar($ruta, $filas) as $fila) {
-                    $writer->addRow(Row::fromValuesWithStyles($fila, null, $styles));
-                }
-            }
         }
 
         return $comparacion;

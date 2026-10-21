@@ -210,7 +210,7 @@ class LibroPaquetesPersistenteTest extends TestCase
 
         $libro = array_map(static fn (array $fila): mixed => is_numeric($fila['VALOR']) ? (int) $fila['VALOR'] : $fila['VALOR'], $this->block($workbook, 'LIBRO DE PAQUETES'));
         $control = $this->block($workbook, 'CONTROL HOSPITALARIO (MES)');
-        $costoTotal = round((float) collect($this->records($workbook, 'SEGUIMIENTO MENSUAL'))->sum(static fn (array $row): float => (float) $row['COSTO ACTIVO (A + CONDICIONADO)']), 2);
+        $costoTotal = round((float) collect($this->records($workbook, 'SEGUIMIENTO PACIENTE MES'))->sum(static fn (array $row): float => (float) $row['COSTO ACTIVO (A + CONDICIONADO)']), 2);
         $detalle = round((float) collect($this->records($workbook, 'DETALLE RIPS'))->sum(static fn (array $row): float => (float) $row['COSTO']), 2);
         $paquetes = (int) $control['TOTAL']['PAQUETES'];
         $valorPaquetes = round((float) $control['TOTAL']['COSTO PAQUETES'], 2);

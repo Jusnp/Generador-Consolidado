@@ -41,55 +41,17 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             if (is_string($auditExport) && $auditExport !== '') {
                 copy($path, $auditExport);
             }
-            $resumen = $this->readMonthlyReport($path, '2026-09')['summary']['PROSTATA'];
-
-            $this->assertSame(2137528852.70, round((float) $resumen['TOTAL'][3], 2));
-            $this->assertSame(3564010500.79, round((float) $resumen['TOTAL'][4], 2));
-            $this->assertSame(59061015.53, round((float) $resumen['AT'][4], 2));
-            $this->assertSame(14172581.38, round((float) $resumen['AM'][4], 2));
-            $cobertura = $this->readSeptemberMedicationCoverage($path);
-            $this->assertSame(2947, array_sum(array_column($cobertura, 'registros')));
-            $this->assertSame(414, $cobertura['CONDICIONADO AP']['registros']);
-            $this->assertSame(754852071.28, round($cobertura['CONDICIONADO AP']['potencial'], 2));
-            $this->assertSame(1374, ($cobertura['INCLUIDO DEMOSTRADO EN AH']['registros'] ?? 0)
-                + ($cobertura['CONDICIONADO AH']['registros'] ?? 0));
+            $this->assertWorkbookStructure($path);
+            $resumen = $this->internalSummaries()['2026-09']['PROSTATA'];
+            $this->assertSame(2137528852.70, round((float) $resumen['TOTAL'][5], 2));
+            $this->assertSame(3564010500.79, round((float) $resumen['TOTAL'][6], 2));
+            $this->assertSame(59061015.53, round((float) $resumen['AT'][6], 2));
+            $this->assertSame(14172581.38, round((float) $resumen['AM'][6], 2));
+            $this->assertGreaterThan(0, (float) $resumen['AM'][7]);
         } finally {
             DB::rollBack();
             @unlink($path);
         }
-    }
-
-    /** @return array<string, array{registros: int, potencial: float}> */
-    private function readSeptemberMedicationCoverage(string $path): array
-    {
-        $reader = new Reader;
-        $reader->open($path);
-        $coverage = [];
-
-        try {
-            foreach ($reader->getSheetIterator() as $sheet) {
-                if ($sheet->getName() !== 'COBERTURA AM RN14') {
-                    continue;
-                }
-
-                foreach ($sheet->getRowIterator() as $row) {
-                    $values = $row->toArray();
-
-                    if (($values[0] ?? '') !== 'PROSTATA' || ($values[1] ?? '') !== '2026-09') {
-                        continue;
-                    }
-
-                    $class = (string) ($values[17] ?? '');
-                    $coverage[$class] ??= ['registros' => 0, 'potencial' => 0.0];
-                    $coverage[$class]['registros']++;
-                    $coverage[$class]['potencial'] += (float) ($values[19] ?? 0);
-                }
-            }
-        } finally {
-            $reader->close();
-        }
-
-        return $coverage;
     }
 
     public function test_sixteen_json_batch_matches_the_finished_monthly_exports(): void
@@ -133,22 +95,23 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             $response = $this->actingAs($user)->post(route('la-maria.consolidado.export'), ['archivos' => $uploads]);
             $response->assertDownload();
             file_put_contents($destination, $response->streamedContent());
-            $batch = $this->readCombinedSummaries($destination);
+            $this->assertWorkbookStructure($destination);
+            $batch = $this->internalSummaries();
 
             foreach ($baseline as $month => $routes) {
                 foreach ($routes as $route => $expected) {
                     foreach ($expected['porTipo'] as $type => $values) {
-                        $row = $batch['summary'][$month][$route][$type] ?? null;
+                        $row = $batch[$month][$route][$type] ?? null;
                         $this->assertNotNull($row, "$month $route $type");
 
-                        foreach (['registros' => 2, 'costoA' => 3, 'central' => 4,
-                            'condicionado' => 6, 'unidades' => 8, 'pendiente' => 10] as $metric => $column) {
+                        foreach (['registros' => 3, 'costoA' => 5, 'central' => 6,
+                            'condicionado' => 7, 'unidades' => 4] as $metric => $column) {
                             $this->assertSame(round((float) $values[$metric], 2), round((float) ($row[$column] ?? 0), 2),
                                 "$month $route $type $metric");
                         }
                     }
 
-                    $this->assertSame(round((float) $expected['central'], 2), $batch['manager'][$month][$route] ?? null);
+                    $this->assertSame(round((float) $expected['central'], 2), round((float) ($batch[$month][$route]['TOTAL'][6] ?? 0), 2));
                 }
             }
         } finally {
@@ -208,42 +171,23 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
                 $response->assertDownload();
                 $path = $destination.'/FUENTE_ADMINISTRATIVA_'.$month.'.xlsx';
                 file_put_contents($path, $response->streamedContent());
-                $result[$month] = $this->readMonthlyReport($path, $month);
+                $this->assertWorkbookStructure($path);
+                $result[$month] = $this->internalSummaries()[$month] ?? [];
 
                 foreach (['PROSTATA', 'CERVIX'] as $route) {
-                    $this->assertArrayHasKey($route, $result[$month]['summary']);
-                    $rows = $result[$month]['summary'][$route];
-                    $this->assertSame(['AC', 'AP', 'AT', 'AU', 'AM', 'AH', 'TOTAL'], array_keys($rows));
-                    $this->assertSame($expectedAdministrative[$month][$route], round((float) $rows['TOTAL'][4], 2));
-                    $this->assertSame(round((float) $rows['TOTAL'][4], 2), $result[$month]['manager'][$route]);
-                    $reference = $route === 'PROSTATA' ? 4000000000.0 : 2000000000.0;
-                    $this->assertSame($reference, $result[$month]['indicators'][$route]['INDICADOR GERENCIAL FIJO']);
-                    $this->assertSame(round((float) $rows['TOTAL'][4] - $reference, 2),
-                        $result[$month]['indicators'][$route]['VARIACIÓN CONTRA INDICADOR']);
-                    $this->assertSame((float) $result[$month]['patients'][$route],
-                        $result[$month]['indicators'][$route]['PACIENTES ÚNICOS']);
-                    $this->assertEqualsWithDelta((float) $rows['TOTAL'][4] / $reference,
-                        $result[$month]['indicators'][$route]['PORCENTAJE DEL INDICADOR'], 1e-9);
-                    $this->assertSame((float) $rows['TOTAL'][10], $result[$month]['indicators'][$route]['REGISTROS PENDIENTES']);
-                    $differences = array_values(array_filter($result[$month]['differences'],
-                        static fn (array $row): bool => $row[0] === $route));
-
-                    if ($month !== '2026-09') {
-                        $observado = array_sum(array_map(static fn (array $row): float => (float) ($row[16] ?? 0), $differences));
-                        $desviacion = array_sum(array_map(static fn (array $row): float => (float) ($row[17] ?? 0), $differences));
-                        $this->assertEqualsWithDelta((float) $rows['TOTAL'][4] - $observado, $desviacion, 0.05);
-                    } else {
-                        $this->assertSame('', $differences[0][16] ?? '');
-                    }
+                    $this->assertArrayHasKey($route, $result[$month]);
+                    $rows = $result[$month][$route];
+                    $this->assertSame($expectedAdministrative[$month][$route], round((float) $rows['TOTAL'][6], 2));
+                    $this->assertSame(round((float) $rows['TOTAL'][6] + (float) $rows['TOTAL'][7], 2), round((float) $rows['TOTAL'][8], 2));
                 }
 
                 if ($month === '2026-09') {
-                    $this->assertSame(2137528852.70, round((float) $result[$month]['summary']['PROSTATA']['TOTAL'][3], 2));
-                    $this->assertSame(3564010500.79, round((float) $result[$month]['summary']['PROSTATA']['TOTAL'][4], 2));
-                    $this->assertSame(521906976.77, round((float) $result[$month]['summary']['CERVIX']['TOTAL'][3], 2));
-                    $this->assertSame(1397026965.97, round((float) $result[$month]['summary']['CERVIX']['TOTAL'][4], 2));
-                    $this->assertGreaterThan(0, (float) $result[$month]['summary']['PROSTATA']['AU'][9]);
-                    $this->assertGreaterThan(0, (float) $result[$month]['summary']['CERVIX']['AU'][9]);
+                    $this->assertSame(2137528852.70, round((float) $result[$month]['PROSTATA']['TOTAL'][5], 2));
+                    $this->assertSame(3564010500.79, round((float) $result[$month]['PROSTATA']['TOTAL'][6], 2));
+                    $this->assertSame(521906976.77, round((float) $result[$month]['CERVIX']['TOTAL'][5], 2));
+                    $this->assertSame(1397026965.97, round((float) $result[$month]['CERVIX']['TOTAL'][6], 2));
+                    $this->assertGreaterThan(0, (float) $result[$month]['PROSTATA']['AU'][12]);
+                    $this->assertGreaterThan(0, (float) $result[$month]['CERVIX']['AU'][12]);
                 }
             } finally {
                 DB::rollBack();
@@ -269,31 +213,22 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             $response->assertDownload();
             $batchPath = $destination.'/FUENTE_ADMINISTRATIVA_LOTE_16.xlsx';
             file_put_contents($batchPath, $response->streamedContent());
-            $batch = $this->readCombinedSummaries($batchPath);
+            $this->assertWorkbookStructure($batchPath);
+            $batch = $this->internalSummaries();
 
             foreach (array_keys($groups) as $month) {
                 foreach (['PROSTATA', 'CERVIX'] as $route) {
                     foreach (['AC', 'AP', 'AT', 'AU', 'AM', 'AH', 'TOTAL'] as $type) {
-                        foreach ([2, 3, 4, 5, 6, 8, 9, 10] as $column) {
+                        foreach ([3, 4, 5, 6, 7, 12] as $column) {
                             $this->assertSame(
-                                round((float) ($result[$month]['summary'][$route][$type][$column] ?? 0), 2),
-                                round((float) ($batch['summary'][$month][$route][$type][$column] ?? 0), 2),
+                                round((float) ($result[$month][$route][$type][$column] ?? 0), 2),
+                                round((float) ($batch[$month][$route][$type][$column] ?? 0), 2),
                                 "$month $route $type columna $column"
                             );
                         }
                     }
 
-                    foreach (['AC', 'AP', 'AT', 'AU', 'AM', 'AH'] as $type) {
-                        foreach ([2, 3, 4] as $column) {
-                            $this->assertSame(
-                                round((float) ($result[$month]['managerRows'][$route][$type][$column] ?? 0), 2),
-                                round((float) ($batch['managerRows'][$month][$route][$type][$column] ?? 0), 2),
-                                "$month $route vista gerencial $type columna $column"
-                            );
-                        }
-                    }
-
-                    $this->assertSame($result[$month]['manager'][$route], $batch['manager'][$month][$route] ?? null);
+                    $this->assertSame($result[$month][$route]['TOTAL'][6], $batch[$month][$route]['TOTAL'][6] ?? null);
                 }
             }
         } finally {
@@ -301,116 +236,37 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
         }
 
         file_put_contents($destination.'/resultados_mensuales.json', json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-        $this->assertNotSame($result['2026-06']['summary']['PROSTATA']['TOTAL'][4], $result['2026-07']['summary']['PROSTATA']['TOTAL'][4]);
-        $this->assertNotSame($result['2026-07']['summary']['CERVIX']['TOTAL'][4], $result['2026-08']['summary']['CERVIX']['TOTAL'][4]);
+        $this->assertNotSame($result['2026-06']['PROSTATA']['TOTAL'][6], $result['2026-07']['PROSTATA']['TOTAL'][6]);
+        $this->assertNotSame($result['2026-07']['CERVIX']['TOTAL'][6], $result['2026-08']['CERVIX']['TOTAL'][6]);
         $this->assertSame($before, DB::table('programa_ejecuciones')->count());
     }
 
-    /** @return array<string, mixed> */
-    private function readCombinedSummaries(string $path): array
+    /** @return array<string, array<string, array<string, array<int, mixed>>>> */
+    private function internalSummaries(): array
     {
-        $reader = new Reader;
-        $reader->open($path);
-        $result = ['summary' => [], 'managerRows' => [], 'manager' => []];
+        $result = [];
 
-        try {
-            foreach ($reader->getSheetIterator() as $sheet) {
-                if ($sheet->getName() !== 'SEGUIMIENTO MENSUAL') {
-                    continue;
-                }
-
-                $route = '';
-                $month = '';
-                $inSummary = false;
-                $inManager = false;
-
-                foreach ($sheet->getRowIterator() as $row) {
-                    $values = $row->toArray();
-                    $first = (string) ($values[0] ?? '');
-
-                    if (str_starts_with($first, 'RESUMEN ECONÓMICO POR SERVICIO')) {
-                        $route = str_contains($first, 'PRÓSTATA') ? 'PROSTATA' : 'CERVIX';
-                        preg_match('/20\d{2}-\d{2}/', $first, $matches);
-                        $month = $matches[0] ?? '';
-                        $inSummary = false;
-                        $inManager = false;
-                    } elseif ($first === 'TIPO RIPS' && ($values[2] ?? '') === 'REGISTROS') {
-                        $inSummary = true;
-                        $inManager = false;
-                    } elseif (str_starts_with($first, 'VISTA GERENCIAL RECLASIFICADA')) {
-                        $inSummary = false;
-                        $inManager = true;
-                    } elseif ($inSummary && in_array($first, ['AC', 'AP', 'AT', 'AU', 'AM', 'AH', 'TOTAL'], true)) {
-                        $result['summary'][$month][$route][$first] = $values;
-
-                        if ($first === 'TOTAL') {
-                            $inSummary = false;
-                        }
-                    } elseif ($inManager && in_array($first, ['AC', 'AP', 'AT', 'AU', 'AM', 'AH'], true)) {
-                        $result['managerRows'][$month][$route][$first] = $values;
-                    } elseif ($inManager && $first === 'TOTAL') {
-                        $result['manager'][$month][$route] = round((float) ($values[4] ?? 0), 2);
-                        $inManager = false;
-                    }
-                }
-            }
-        } finally {
-            $reader->close();
+        foreach (session('la-maria.resultado.consolidado.estimacion', []) as $row) {
+            $result[(string) $row[1]][(string) $row[0]][(string) $row[2]] = $row;
         }
 
         return $result;
     }
 
-    /** @return array<string, mixed> */
-    private function readMonthlyReport(string $path, string $month): array
+    private function assertWorkbookStructure(string $path): void
     {
         $reader = new Reader;
         $reader->open($path);
-        $result = ['summary' => [], 'manager' => [], 'managerRows' => [], 'differences' => [], 'pending' => [], 'rules' => [], 'indicators' => [], 'patients' => []];
+        $sheets = [];
+        $monthlyRows = [];
 
         try {
             foreach ($reader->getSheetIterator() as $sheet) {
-                $sheetName = $sheet->getName();
-                $route = '';
-                $inSummary = false;
-                $inManager = false;
+                $sheets[] = $sheet->getName();
 
-                foreach ($sheet->getRowIterator() as $row) {
-                    $values = $row->toArray();
-                    $first = (string) ($values[0] ?? '');
-
-                    if ($sheetName === 'SEGUIMIENTO MENSUAL') {
-                        if (in_array($first, ['PROSTATA', 'CERVIX'], true) && ($values[1] ?? '') === $month) {
-                            $result['patients'][$first] = (int) ($values[2] ?? 0);
-                        } elseif (str_starts_with($first, 'RESUMEN ECONÓMICO POR SERVICIO')) {
-                            $route = str_contains($first, 'PRÓSTATA') ? 'PROSTATA' : 'CERVIX';
-                            $inSummary = false;
-                            $inManager = false;
-                        } elseif ($first === 'TIPO RIPS' && ($values[2] ?? '') === 'REGISTROS') {
-                            $inSummary = true;
-                            $inManager = false;
-                        } elseif ($route !== '' && in_array($first, ['PACIENTES ÚNICOS', 'INDICADOR GERENCIAL FIJO', 'VARIACIÓN CONTRA INDICADOR', 'PORCENTAJE DEL INDICADOR', 'REGISTROS PENDIENTES'], true)) {
-                            $result['indicators'][$route][$first] = (float) ($values[3] ?? 0);
-                        } elseif (str_starts_with($first, 'VISTA GERENCIAL RECLASIFICADA')) {
-                            $inSummary = false;
-                            $inManager = true;
-                        } elseif ($inSummary && in_array($first, ['AC', 'AP', 'AT', 'AU', 'AM', 'AH', 'TOTAL'], true)) {
-                            $result['summary'][$route][$first] = $values;
-                            if ($first === 'TOTAL') {
-                                $inSummary = false;
-                            }
-                        } elseif ($inManager && in_array($first, ['AC', 'AP', 'AT', 'AU', 'AM', 'AH'], true)) {
-                            $result['managerRows'][$route][$first] = $values;
-                        } elseif ($inManager && $first === 'TOTAL') {
-                            $result['manager'][$route] = round((float) ($values[4] ?? 0), 2);
-                            $inManager = false;
-                        }
-                    } elseif ($sheetName === 'DIFERENCIAS HISTÓRICAS' && in_array($first, ['PROSTATA', 'CERVIX'], true) && ($values[1] ?? '') === $month) {
-                        $result['differences'][] = $values;
-                    } elseif ($sheetName === 'PENDIENTES DE VALORIZACIÓN' && in_array($first, ['PROSTATA', 'CERVIX'], true) && ($values[1] ?? '') === $month) {
-                        $result['pending'][] = $values;
-                    } elseif ($sheetName === 'REGLAS APLICADAS' && in_array($first, ['PROSTATA', 'CERVIX'], true)) {
-                        $result['rules'][] = $values;
+                if ($sheet->getName() === 'SEGUIMIENTO MENSUAL') {
+                    foreach ($sheet->getRowIterator() as $row) {
+                        $monthlyRows[] = $row->toArray();
                     }
                 }
             }
@@ -418,6 +274,12 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             $reader->close();
         }
 
-        return $result;
+        $this->assertSame(['SEGUIMIENTO MENSUAL', 'CATALOGOS APLICADOS', 'CONTROL DE CARGUE'], $sheets);
+        $this->assertSame('CONTROL DE CARGUE', end($sheets));
+        $this->assertSame(['RUTA', 'MES', 'PACIENTES', 'SERVICIOS'], $monthlyRows[0]);
+
+        foreach (array_slice($monthlyRows, 1) as $row) {
+            $this->assertCount(4, $row);
+        }
     }
 }
