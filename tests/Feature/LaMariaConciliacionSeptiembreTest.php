@@ -15,7 +15,7 @@ class LaMariaConciliacionSeptiembreTest extends TestCase
         'RESUMEN POR TIPO RIPS', 'SERVICIOS POR CODIGO', 'CATEGORIAS NOTA', 'AT Y AU', 'EPISODIOS AU', 'CONTROL DOS VISTAS',
         'COSTO A ACTUAL', 'ESTIMACIÓN ADMINISTRATIVA'];
 
-    public function test_four_september_jsons_generate_clean_route_workbooks_without_changing_internal_totals(): void
+    public function test_four_september_jsons_generate_clean_route_workbooks_with_temporally_linked_schemes(): void
     {
         if (getenv('SIRUTA_PRUEBA_SEPTIEMBRE') !== '1' || getenv('DB_DATABASE') !== 'json_excel_demo_lamaria_20261008') {
             $this->markTestSkipped('Solo se ejecuta en la base aislada de demostración, con autorización expresa.');
@@ -45,8 +45,8 @@ class LaMariaConciliacionSeptiembreTest extends TestCase
             $user = User::factory()->create(['role' => 'admin', 'active' => true]);
 
             foreach ([
-                'prostata' => ['pacientes' => 1034, 'registros' => 11360, 'principal' => 2137528852.70, 'central' => 3564010500.79],
-                'cervix' => ['pacientes' => 442, 'registros' => 6954, 'principal' => 521906976.77, 'central' => 1397026965.97],
+                'prostata' => ['pacientes' => 1034, 'registros' => 11360, 'principal' => 2137528852.70, 'central' => 3636194275.15],
+                'cervix' => ['pacientes' => 442, 'registros' => 6954, 'principal' => 521906976.77, 'central' => 1342631575.46],
             ] as $route => $expected) {
                 $uploads = array_map(static fn (string $invoice): UploadedFile => new UploadedFile(
                     $sources.$invoice.'.json', $invoice.'.json', 'application/json', null, true

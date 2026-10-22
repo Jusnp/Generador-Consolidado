@@ -10,6 +10,112 @@ class ValorizacionAdministrativaTest extends TestCase
 {
     private const ESQUEMA = 'Abiraterona, apalutamida, enzalutamida';
 
+    public function test_integral_scheme_requires_temporal_link_within_the_same_invoice(): void
+    {
+        $valorizacion = $this->valorizacionCervix(static fn (string $cum): array => []);
+        $caso = ['mesAtencion' => '2026-10', 'casoId' => 'C1', 'factura' => 'F1'];
+
+        $valorizacion->registrar($this->detalle('procedimientos', '992511', 1.0, [...$caso, 'fechaAtencion' => '2026-10-03 08:00']), ['respaldado' => 444690.0]);
+        $valorizacion->registrar($this->detalle('procedimientos', '992511', 1.0, [...$caso, 'fechaAtencion' => '2026-10-23 08:00']), ['respaldado' => 444690.0]);
+        $valorizacion->registrar($this->detalle('medicamentos', 'PEMBRO', 1.0, [...$caso,
+            'fechaAtencion' => '2026-10-03 09:00', 'principioActivo' => 'PEMBROLIZUMAB',
+            'cumResuelto' => 'CUM-PEMBRO']), ['respaldado' => 0.0]);
+
+        $tratamientos = $valorizacion->filasTratamientos();
+        $this->assertSame(34000000.0, array_sum(array_column($tratamientos, 8)));
+        $precios = array_values(array_unique(array_column($tratamientos, 6)));
+        sort($precios);
+        $this->assertSame([2000000.0, 32000000.0], $precios);
+        $this->assertContains('PRECIO BASE PROVISIONAL; MEDICAMENTO DISTINTIVO EN OTRA FECHA DE LA FACTURA', array_column($tratamientos, 3));
+        $this->assertContains('MEDICAMENTO DISTINTIVO EN LA FECHA DEL AP (PEMB)', array_column($tratamientos, 3));
+        $this->assertSame(ValorizacionAdministrativa::COBERTURA_INCLUIDO_AP,
+            collect($valorizacion->filasCoberturaMedicamentos())->firstWhere(6, 'CUM-PEMBRO')[16]);
+    }
+
+    public function test_session_with_its_own_medication_joins_the_scheme_series_of_another_integral_in_the_invoice(): void
+    {
+        $valorizacion = $this->valorizacionCervix(static fn (string $cum): array => []);
+        $caso = ['mesAtencion' => '2026-10', 'casoId' => 'C1', 'factura' => 'F1'];
+        $medicamento = fn (string $fecha, string $principio, string $cum): array => $this->detalle('medicamentos', $cum, 1.0,
+            [...$caso, 'fechaAtencion' => $fecha.' 09:00', 'principioActivo' => $principio, 'cumResuelto' => $cum]);
+
+        foreach (['2026-10-02', '2026-10-09', '2026-10-22'] as $fecha) {
+            $valorizacion->registrar($this->detalle('procedimientos', '992511', 1.0, [...$caso, 'fechaAtencion' => $fecha.' 08:00']), ['respaldado' => 444690.0]);
+        }
+
+        $valorizacion->registrar($medicamento('2026-10-02', 'CARBOPLATINO', 'CUM-CARBO'), ['respaldado' => 0.0]);
+        $valorizacion->registrar($medicamento('2026-10-09', 'PACLITAXEL', 'CUM-PACLI'), ['respaldado' => 0.0]);
+        $valorizacion->registrar($medicamento('2026-10-22', 'PEMBROLIZUMAB', 'CUM-PEMBRO'), ['respaldado' => 0.0]);
+
+        $tratamientos = collect($valorizacion->filasTratamientos())->keyBy(3);
+
+        // La sesión con carboplatino pertenece a la serie con pembrolizumab; el distintivo propio de la base (paclitaxel) la conserva.
+        $this->assertSame([32000000.0, 0.0], [$tratamientos['DISTINTIVO EN OTRA SESION INTEGRAL DEL MISMO CUPS Y FACTURA (PEMB): SERIE DEL ESQUEMA'][8],
+            $tratamientos['DISTINTIVO EN OTRA SESION INTEGRAL DEL MISMO CUPS Y FACTURA (PEMB): SERIE DEL ESQUEMA'][9]]);
+        $this->assertSame(32000000.0, $tratamientos['MEDICAMENTO DISTINTIVO EN LA FECHA DEL AP (PEMB)'][8]);
+        $this->assertSame(2000000.0, $tratamientos['MEDICAMENTO DISTINTIVO EN LA FECHA DEL AP (PACL)'][8]);
+        $this->assertSame(66000000.0, $tratamientos->sum(8));
+        $this->assertSame(0.0, $tratamientos->sum(9));
+        $this->assertSame(ValorizacionAdministrativa::COBERTURA_INCLUIDO_AP,
+            collect($valorizacion->filasCoberturaMedicamentos())->firstWhere(6, 'CUM-PEMBRO')[16]);
+    }
+
+    public function test_session_without_temporal_link_keeps_provisional_base_and_conditions_only_the_scheme_difference(): void
+    {
+        $valorizacion = $this->valorizacionCervix(static fn (string $cum): array => [['mes' => '2026-09', 'tarifa' => 9000000.0]]);
+        $caso = ['mesAtencion' => '2026-10', 'casoId' => 'C1', 'factura' => 'F1'];
+
+        $valorizacion->registrar($this->detalle('procedimientos', '992511', 1.0, [...$caso, 'fechaAtencion' => '2026-10-09 08:00']), ['respaldado' => 444690.0]);
+
+        foreach (['2026-10-04', '2026-10-29'] as $fecha) {
+            $valorizacion->registrar($this->detalle('medicamentos', 'PEMBRO', 1.0, [...$caso, 'fechaAtencion' => $fecha.' 09:00',
+                'principioActivo' => 'PEMBROLIZUMAB', 'cumResuelto' => 'CUM-PEMBRO']), ['respaldado' => 0.0]);
+        }
+
+        [$tratamiento] = $valorizacion->filasTratamientos();
+        $this->assertStringStartsWith('ESQUEMA INDETERMINADO · ', $tratamiento[2]);
+        $this->assertSame(['PRECIO BASE PROVISIONAL; MEDICAMENTO DISTINTIVO EN OTRA FECHA DE LA FACTURA', 2000000.0, 30000000.0],
+            [$tratamiento[3], $tratamiento[8], $tratamiento[9]]);
+
+        // El pembrolizumab de otras fechas no suma ni agrega otro potencial: su valor ya está en la diferencia condicionada.
+        $coberturas = collect($valorizacion->filasCoberturaMedicamentos())->where(6, 'CUM-PEMBRO');
+        $this->assertSame([ValorizacionAdministrativa::COBERTURA_CONDICIONADO_AP], $coberturas->pluck(16)->unique()->values()->all());
+        $this->assertSame(0.0, $coberturas->sum(18));
+        $resumen = collect($valorizacion->resumenServicios('2026-10')['filas'])->keyBy(0);
+        $this->assertSame([2000000.0, 30000000.0], [$resumen['AP'][4], $resumen['AP'][6]]);
+        $this->assertSame([0.0, 0.0], [$resumen['AM'][4], $resumen['AM'][6]]);
+        $this->assertSame('Vínculo de la sesión con el esquema de mayor precio registrado en otra fecha de la factura (orden o protocolo de la sesión).',
+            collect($valorizacion->filasPendientes())->firstWhere(4, ValorizacionAdministrativa::CONDICIONADA.' / ESQUEMA INDETERMINADO')[10]);
+    }
+
+    public function test_hospital_estimate_counts_one_unit_per_discharge_record_and_keeps_cost_a_packages(): void
+    {
+        $valorizacion = $this->valorizacion();
+        $estancia = fn (string $mes, string $ingreso, string $egreso, string $destino): array => $this->detalle('hospitalizacion', '', 1.0,
+            ['mesAtencion' => $mes, 'fechaAtencion' => $ingreso, 'servicioJson' => ['fechaEgreso' => $egreso, 'condicionDestinoUsuarioEgreso' => $destino]]);
+
+        // Septiembre: estancia de 30 días (2 paquetes), menor de 24 h (sin paquete) y corte 08 (1 paquete por mes independiente).
+        $valorizacion->registrar($estancia('2026-09', '2026-09-01 08:00', '2026-09-30 10:00', '01'), ['respaldado' => 0.0]);
+        $valorizacion->registrar($estancia('2026-09', '2026-09-10 08:00', '2026-09-10 20:00', '01'), ['respaldado' => 0.0]);
+        $valorizacion->registrar($estancia('2026-09', '2026-09-20 08:00', '2026-09-30 23:59', '08'), ['respaldado' => 0.0]);
+        // Octubre: solo la continuación del corte, que egresa; su mes se valora con sus propios registros.
+        $valorizacion->registrar($estancia('2026-10', '2026-10-01 00:00', '2026-10-05 10:00', '01'), ['respaldado' => 0.0]);
+        $valorizacion->atribuirPaquetes([['2026-09', 3, 18045943.59], ['2026-10', 1, 6015314.53], ['TOTAL', 4, 24061258.12]]);
+
+        $septiembre = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0);
+        $octubre = collect($valorizacion->resumenServicios('2026-10')['filas'])->keyBy(0);
+
+        $this->assertSame([3, 18045943.59, 12030629.06, 0.0], array_map(static fn (int $i): mixed => $septiembre['AH'][$i], [2, 3, 4, 6]));
+        $this->assertSame([1, 6015314.53, 6015314.53], array_map(static fn (int $i): mixed => $octubre['AH'][$i], [2, 3, 4]));
+        $this->assertStringContainsString('RN-16', $septiembre['AH'][7]);
+        $estados = collect($valorizacion->filasDetalle())->where(1, 'AH')->pluck(6)->unique()->sort()->values()->all();
+        $this->assertSame(['CORTE DE ESTANCIA (CONTINUA)', 'REGISTRO DE INTERNACION CON EGRESO', 'REGISTRO DE INTERNACION x VALOR DEL PAQUETE'], $estados);
+        $pendiente = collect($valorizacion->filasPendientes())->first(static fn (array $fila): bool => $fila[0] === '2026-09' && $fila[2] === 'REGISTRO_INTERNACION_EGRESO');
+        $this->assertSame([2.0, 12030629.06], [$pendiente[6], $pendiente[7]]);
+        $this->assertStringContainsString('2 registros con egreso', $pendiente[9]);
+        $this->assertStringContainsString('1 cortes 08 sin unidad', $pendiente[9]);
+    }
+
     public function test_integral_scheme_requires_a_shared_invoice_and_keeps_other_invoice_medication_conditional(): void
     {
         $historial = new HistorialAdministrativo;
@@ -453,25 +559,25 @@ class ValorizacionAdministrativaTest extends TestCase
         $porTipo = $comparacion->filter(static fn (array $fila): bool => in_array($fila[1], ValorizacionAdministrativa::TIPOS_ORDEN, true))->keyBy(1);
         $total = $comparacion->firstWhere(1, 'TOTAL');
 
-        // Costo A conservado al centavo y controles AC/AH iguales al costo A.
+        // Costo A conservado al centavo; AC igual al costo A y AH por registro con egreso (RN-16), no por paquetes.
         $this->assertSame(['2026-09', 'TOTAL', 18, 126.0, 16060319.06, 'IGUAL AL COSTO RESPALDADO DE COSTOS Y BRECHAS'], end($costos));
         $this->assertSame(16060319.06, $total[4]);
         $this->assertSame($porTipo['AC'][4], $porTipo['AC'][5]);
-        $this->assertSame($porTipo['AH'][4], $porTipo['AH'][5]);
+        $this->assertSame([12030629.06, 6015314.53], [$porTipo['AH'][4], $porTipo['AH'][5]]);
         $this->assertSame(0.0, $porTipo['AU'][5]);
 
         // AP integral + 911107 estimado; AT por unidad compatible; AM A + C.
         $this->assertSame(8531868.98, $porTipo['AP'][5]);
         $this->assertSame(1826629.32, $porTipo['AT'][5]);
         $this->assertSame(29527552.0, $porTipo['AM'][5]);
-        $this->assertSame(52001679.36, $total[5]);
+        $this->assertSame(45986364.83, $total[5]);
         $this->assertSame(round($porTipo->sum(5), 2), $total[5]);
 
         // Componente condicionado: medicamento sin asociación demostrada (no suma) y unidad no compatible.
         $this->assertSame(500000.0, $porTipo['AM'][6]);
         $this->assertSame(1000.0, $porTipo['AT'][6]);
         $this->assertSame(501000.0, $total[6]);
-        $this->assertSame(52502679.36, $total[7]);
+        $this->assertSame(46487364.83, $total[7]);
 
         // Importes no aditivos visibles y separados.
         $noAditivos = $comparacion->where(1, 'NO ADITIVO')->pluck(11, 12);
@@ -603,9 +709,9 @@ class ValorizacionAdministrativaTest extends TestCase
         $am = collect($valorizacion->filasComparacion([]))->firstWhere(1, 'AM');
 
         // RN-03: un precio por esquema real; sin evidencia, base + mezcla condicionada.
-        $pembro = $tratamientos['MEDICAMENTO DISTINTIVO EN EL CASO-MES (PEMB)'];
+        $pembro = $tratamientos['MEDICAMENTO DISTINTIVO EN LA FECHA DEL AP (PEMB)'];
         $this->assertSame([1, 26194690.0, 26194690.0, 0.0], [$pembro[4], $pembro[6], $pembro[8], $pembro[9]]);
-        $this->assertSame(1875872.14, $tratamientos['MEDICAMENTO DISTINTIVO EN EL CASO-MES (CISP)'][8]);
+        $this->assertSame(1875872.14, $tratamientos['MEDICAMENTO DISTINTIVO EN LA FECHA DEL AP (CISP)'][8]);
         $this->assertSame(1875872.14, $tratamientos['MEDICAMENTO SOLO EN LA COMPOSICION HISTORICA DE ESTA CLASE (GEMC)'][8]);
         $mezcla = $tratamientos['SIN EVIDENCIA DEL ESQUEMA (BASE + MEZCLA CONDICIONADA)'];
         $this->assertSame([1875872.14, 7295645.36], [$mezcla[8], $mezcla[9]]);

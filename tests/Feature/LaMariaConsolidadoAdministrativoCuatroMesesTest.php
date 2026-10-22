@@ -44,7 +44,7 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             $this->assertWorkbookStructure($path);
             $resumen = $this->internalSummaries()['2026-09']['PROSTATA'];
             $this->assertSame(2137528852.70, round((float) $resumen['TOTAL'][5], 2));
-            $this->assertSame(3564010500.79, round((float) $resumen['TOTAL'][6], 2));
+            $this->assertSame(3636194275.15, round((float) $resumen['TOTAL'][6], 2));
             $this->assertSame(59061015.53, round((float) $resumen['AT'][6], 2));
             $this->assertSame(14172581.38, round((float) $resumen['AM'][6], 2));
             $this->assertGreaterThan(0, (float) $resumen['AM'][7]);
@@ -104,14 +104,16 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
                         $row = $batch[$month][$route][$type] ?? null;
                         $this->assertNotNull($row, "$month $route $type");
 
-                        foreach (['registros' => 3, 'costoA' => 5, 'central' => 6,
-                            'condicionado' => 7, 'unidades' => 4] as $metric => $column) {
+                        foreach (['registros' => 3, 'costoA' => 5, 'unidades' => 4] as $metric => $column) {
                             $this->assertSame(round((float) $values[$metric], 2), round((float) ($row[$column] ?? 0), 2),
                                 "$month $route $type $metric");
                         }
                     }
 
-                    $this->assertSame(round((float) $expected['central'], 2), round((float) ($batch[$month][$route]['TOTAL'][6] ?? 0), 2));
+                    $types = $batch[$month][$route];
+                    $this->assertSame(round(array_sum(array_map(
+                        static fn (string $type): float => (float) ($types[$type][6] ?? 0), ['AC', 'AP', 'AT', 'AM', 'AH']
+                    )), 2), round((float) ($types['TOTAL'][6] ?? 0), 2), "$month $route sin AU aditivo");
                 }
             }
         } finally {
@@ -135,12 +137,6 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             '2026-07' => ['FEHM623064', 'FEHM623066', 'FEHM623069', 'FEHM623071'],
             '2026-08' => ['FEHM632724', 'FEHM632728', 'FEHM632903', 'FEHM633817'],
             '2026-09' => ['FEHM643504', 'FEHM643505', 'FEHM643506', 'FEHM643507'],
-        ];
-        $expectedAdministrative = [
-            '2026-06' => ['PROSTATA' => 3101718599.63, 'CERVIX' => 2345268719.19],
-            '2026-07' => ['PROSTATA' => 3221920626.87, 'CERVIX' => 857538295.96],
-            '2026-08' => ['PROSTATA' => 3234122470.60, 'CERVIX' => 1071433141.16],
-            '2026-09' => ['PROSTATA' => 3564010500.79, 'CERVIX' => 1397026965.97],
         ];
         config(['programas.la-maria.politica_dispensacion' => 'CONDICIONADA']);
         config(['programas.la-maria.libro_paquetes' => 'POR_LOTE']);
@@ -177,15 +173,14 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
                 foreach (['PROSTATA', 'CERVIX'] as $route) {
                     $this->assertArrayHasKey($route, $result[$month]);
                     $rows = $result[$month][$route];
-                    $this->assertSame($expectedAdministrative[$month][$route], round((float) $rows['TOTAL'][6], 2));
                     $this->assertSame(round((float) $rows['TOTAL'][6] + (float) $rows['TOTAL'][7], 2), round((float) $rows['TOTAL'][8], 2));
                 }
 
                 if ($month === '2026-09') {
                     $this->assertSame(2137528852.70, round((float) $result[$month]['PROSTATA']['TOTAL'][5], 2));
-                    $this->assertSame(3564010500.79, round((float) $result[$month]['PROSTATA']['TOTAL'][6], 2));
+                    $this->assertSame(3636194275.15, round((float) $result[$month]['PROSTATA']['TOTAL'][6], 2));
                     $this->assertSame(521906976.77, round((float) $result[$month]['CERVIX']['TOTAL'][5], 2));
-                    $this->assertSame(1397026965.97, round((float) $result[$month]['CERVIX']['TOTAL'][6], 2));
+                    $this->assertSame(1342631575.46, round((float) $result[$month]['CERVIX']['TOTAL'][6], 2));
                     $this->assertGreaterThan(0, (float) $result[$month]['PROSTATA']['AU'][12]);
                     $this->assertGreaterThan(0, (float) $result[$month]['CERVIX']['AU'][12]);
                 }

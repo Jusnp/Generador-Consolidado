@@ -11,11 +11,11 @@ use Closure;
  * cinco estados; lo que no suma se separa en condicionado (estimación
  * condicionada), alternativa (otra unidad) o informativo. No es facturación.
  *
- * RN-01 conservación de A, AC y AH · RN-02/03 AP y quimioterapia según el
+ * RN-01 conservación de A y AC · RN-02/03 AP y quimioterapia según el
  * esquema real · RN-04 medicamentos oncológicos incluidos, de otro esquema o
  * de asociación desconocida · RN-05 demás AP con el histórico · RN-06 AT por
  * unidad comparable · RN-07 AU no aditivo · RN-08 radioterapia por registro y
- * por tratamiento, sin mezclar unidades.
+ * por tratamiento, sin mezclar unidades · RN-16 AH por registro con egreso.
  */
 final class ValorizacionAdministrativa
 {
@@ -163,6 +163,9 @@ final class ValorizacionAdministrativa
     /** @var array<string, array<string, array{registros: int, unidades: float, costoA: int}>> */
     private array $tipos = [];
 
+    /** @var array<string, array{cierres?: int, cortes?: int}> mes => registros AH con egreso y cortes 08 (la estancia continúa) */
+    private array $internaciones = [];
+
     /** @var array<string, array<string, mixed>> */
     private array $diferidos = [];
 
@@ -175,7 +178,7 @@ final class ValorizacionAdministrativa
     /** @var array<string, array<string, mixed>> */
     private array $radioPendientes = [];
 
-    /** @var array<string, array<string, array<string, bool>>> mes => caso => medicamentos (prefijos) */
+    /** @var array<string, array<string, array<string, array<string, bool>>>> mes => caso/factura => fecha => prefijos */
     private array $medicamentosCaso = [];
 
     /** @var list<array<string, mixed>> */
@@ -290,8 +293,12 @@ final class ValorizacionAdministrativa
         $absorcion = self::ABSORCIONES[(string) ($detalle['decisionPaquete'] ?? '')] ?? null;
 
         if ($tipo === 'AH') {
-            $this->agregar($linea, self::INCLUIDA, false, 'REGISTRO DE ESTANCIA', 'LIBRO DE PAQUETES',
-                'La estancia se valora por paquetes de 25 días (control AH).');
+            // El historial registra una fila AH al egreso; el corte 08 continúa y no es unidad del mes.
+            $corte = (string) ($detalle['servicioJson']['condicionDestinoUsuarioEgreso'] ?? '') === ReconstructorEpisodiosHospitalarios::DESTINO_CORTE_FACTURACION;
+            $this->internaciones[$mes][$corte ? 'cortes' : 'cierres'] = ($this->internaciones[$mes][$corte ? 'cortes' : 'cierres'] ?? 0) + 1;
+            $this->agregar($linea, self::INCLUIDA, false, $corte ? 'CORTE DE ESTANCIA (CONTINUA)' : 'REGISTRO DE INTERNACION CON EGRESO', 'LIBRO DE PAQUETES',
+                $corte ? 'Corte 08: la estancia continúa; la unidad administrativa AH corresponde a su egreso.'
+                    : 'Una unidad administrativa AH por registro con egreso (RN-16); el costo A conserva los paquetes de 25 días.');
 
             return;
         }
@@ -304,9 +311,10 @@ final class ValorizacionAdministrativa
         }
 
         if ($tipo === 'AM') {
-            // Evidencia del esquema del caso-mes: todos sus medicamentos, incluidos los absorbidos.
+            // Evidencia del esquema del caso, factura y fecha: incluye medicamentos absorbidos.
             foreach (self::medicamentosLinea($detalle) as $token) {
-                $this->medicamentosCaso[$mes][$casoFactura][$token] = true;
+                $fecha = substr((string) ($detalle['fechaAtencion'] ?? ''), 0, 10);
+                $this->medicamentosCaso[$mes][$casoFactura][$fecha][$token] = true;
             }
 
             $this->registrarMedicamento($linea, $detalle, $economico, $absorcion, $caso, $casoFactura);
@@ -337,7 +345,8 @@ final class ValorizacionAdministrativa
 
         if ($tipo === 'AP' && $quimio !== null && $precio !== null && $precio['mediana'] > $quimio['tarifa'] * self::FACTOR_INTEGRAL) {
             // RN-02/RN-03: el precio depende del esquema real; se decide al cerrar el mes.
-            $this->integralesPendientes[] = ['linea' => $linea, 'caso' => $caso, 'casoFactura' => $casoFactura];
+            $this->integralesPendientes[] = ['linea' => $linea, 'caso' => $caso, 'casoFactura' => $casoFactura,
+                'fecha' => substr((string) ($detalle['fechaAtencion'] ?? ''), 0, 10)];
 
             return;
         }
@@ -393,6 +402,8 @@ final class ValorizacionAdministrativa
      */
     public function atribuirPaquetes(array $filasHospitalizacion): void
     {
+        $paquetes = [];
+
         foreach ($filasHospitalizacion as $fila) {
             $mes = (string) ($fila[0] ?? '');
 
@@ -403,9 +414,20 @@ final class ValorizacionAdministrativa
             $costo = ResumenEconomico::centavos($fila[2] ?? 0);
             $this->tipos[$mes]['AH'] ??= ['registros' => 0, 'unidades' => 0.0, 'costoA' => 0];
             $this->tipos[$mes]['AH']['costoA'] += $costo;
-            $this->agregar(['mes' => $mes, 'tipo' => 'AH', 'codigo' => 'PAQUETE_HOSPITALARIO_25D', 'cantidad' => (float) ($fila[1] ?? 0),
-                'costoA' => $costo, 'descripcion' => 'Paquetes netos de 25 días'], self::RESPALDADA, true, 'CONTROL AH',
-                'NOTA TECNICA / LIBRO DE PAQUETES', 'AH se conserva igual al costo A.', null, $costo, 0, 'PAQUETE', registros: 0);
+            $paquetes[$mes] = [($paquetes[$mes][0] ?? 0.0) + (float) ($fila[1] ?? 0), ($paquetes[$mes][1] ?? 0) + $costo];
+        }
+
+        // RN-16: la estimación cuenta registros con egreso × valor del paquete, sin bloques de 25 días.
+        foreach (array_unique([...array_keys($paquetes), ...array_keys($this->internaciones)]) as $mes) {
+            [$netos, $costo] = $paquetes[$mes] ?? [0.0, 0];
+            $cierres = $this->internaciones[$mes]['cierres'] ?? 0;
+            $this->agregar(['mes' => (string) $mes, 'tipo' => 'AH', 'codigo' => 'REGISTRO_INTERNACION_EGRESO', 'cantidad' => (float) $cierres,
+                'costoA' => $costo, 'descripcion' => 'Registros de internación con egreso'], self::ESTIMADA, true, 'REGISTRO DE INTERNACION x VALOR DEL PAQUETE',
+                'INFORME ADMINISTRATIVO (UNA FILA AH POR EGRESO) / NOTA TECNICA',
+                sprintf('%d registros con egreso × $%s; %d cortes 08 sin unidad en el mes. El costo A conserva %s paquetes de 25 días.',
+                    $cierres, number_format(PoliticaPaqueteHospitalario::VALOR_PAQUETE, 2, ',', '.'),
+                    $this->internaciones[$mes]['cortes'] ?? 0, number_format($netos, 0, ',', '.')),
+                null, $costo, ResumenEconomico::centavos($cierres * PoliticaPaqueteHospitalario::VALOR_PAQUETE), 'REGISTRO', registros: 0);
         }
     }
 
@@ -466,7 +488,7 @@ final class ValorizacionAdministrativa
                     .($costoASinCobertura > 0
                         ? '; ASOCIADOS A AP SIN COBERTURA DEMOSTRADA, CONDICIONADOS (COSTO A NO SUMADO: $'.number_format($costoASinCobertura / 100.0, 2, ',', '.').')'
                         : ''),
-                'AH' => 'COSTO A ACREDITADO (PAQUETES DE 25 DIAS); LA ESTIMACION CONSERVA EL COSTO A (CONTROL)',
+                'AH' => 'REGISTROS DE INTERNACION CON EGRESO x VALOR DEL PAQUETE (RN-16); EL COSTO A CONSERVA LOS PAQUETES DE 25 DIAS',
                 default => 'ESTIMACION REFERENCIAL',
             };
             $filas[] = [$tipo, self::SERVICIOS[$tipo], $datos['registros'], $datos['costoA'] / 100.0, $sumas['estimado'] / 100.0,
@@ -1001,12 +1023,13 @@ final class ValorizacionAdministrativa
     public function filasReglas(): array
     {
         $filas = [
-            ['RN-01', 'Conservación', 'El costo A, los catálogos, los JSON y las bases no cambian. AC y AH de la estimación son iguales al costo A. La estimación es un consolidado separado y no es facturación.'],
+            ['RN-01', 'Conservación', 'El costo A, los catálogos, los JSON y las bases no cambian. AC de la estimación es igual al costo A; AH sigue RN-16 sin modificar los paquetes del costo A. La estimación es un consolidado separado y no es facturación.'],
             ['RN-BASE', 'Cálculo', 'UNIDADES REALES DEL MES × PRECIO HISTÓRICO COMPARABLE, solo con correspondencia de código, unidad, presentación, alcance y esquema.'],
             ['RN-BASE', 'Ventana histórica', 'Tres meses más recientes anteriores al mes valorizado; precio = mediana de registros positivos. Sin datos recientes se usan los tres meses anteriores disponibles y se señala.'],
             ['RN-BASE', 'Estados y totales', 'Respaldada · Estimada · Condicionada · Incluida · Sin valorización. Estimación central = lo que suma. Componente condicionado = valores sin evidencia suficiente (no suma a la central). Alternativas de unidad e importes informativos no se suman a ningún total.'],
             ['RN-02', 'AP según esquema real', 'Cada CUPS integral se valora con la clase de precio histórica de su esquema: los precios del informe se agrupan por valor y por los medicamentos anotados (columna MEDICAMENTO). La asociación de medicamentos RIPS requiere paciente, mes y factura compartida; la coincidencia mensual sola queda condicionada. Si el histórico tiene un solo precio por CUPS, no se inventan tarifas distintas para sus medicamentos.'],
-            ['RN-03', 'Asignación del esquema', 'Si el caso-mes tiene el medicamento distintivo de una clase (p. ej. pembrolizumab), se usa esa clase. Si tiene medicamentos del CUPS sin distintivo de otra clase, se usa la clase base. Sin evidencia: precio base en la central y la diferencia con la mezcla histórica como componente condicionado.'],
+            ['RN-03', 'Asignación del esquema', 'La clase se asigna con los medicamentos del mismo caso, factura y fecha del AP: el medicamento distintivo de una clase (p. ej. pembrolizumab) la determina; un medicamento que solo figura en la composición de una clase la determina; con medicamentos del CUPS sin distintivo de otra clase se usa la clase base. Si el distintivo de una clase de mayor precio está en otra fecha de la misma factura dentro de otra sesión integral del mismo CUPS y la sesión registra medicamentos del CUPS, la sesión pertenece a esa serie del esquema (patrón del historial administrativo). Si ese distintivo está en otra fecha sin esa evidencia, el esquema queda indeterminado: precio provisional de la clase de la fecha en la central y diferencia con la clase de mayor precio como componente condicionado. Sin evidencia en la fecha, o con varios esquemas posibles: precio base en la central y diferencia con la mezcla histórica como componente condicionado.'],
+
             ['RN-04', 'Medicamentos oncológicos', 'La composición histórica relaciona medicamento y CUPS integral; los de otro esquema se valoran como AM independiente. La relación con el mismo CUPS exige RN-14 para demostrar cobertura económica.'],
             ['RN-05', 'Demás procedimientos', 'Con tarifa aplicable: costo A. Sin tarifa o con regla pendiente: mediana administrativa por registro cuando la unidad es compatible.'],
             ['RN-06', 'AT', 'Solo transporte y albergue identificados por código y descripción pueden tener valoración AT independiente con precio histórico y unidad compatible. La base (registro o unidad) compara la mediana de filas administrativas de la ventana anterior con la actividad RIPS del código; fuera de 0,5 a 2 veces queda condicionada. Los demás AT sin tarifa acreditada permanecen pendientes y no suman aparte; los absorbidos en AH tampoco.'],
@@ -1014,9 +1037,10 @@ final class ValorizacionAdministrativa
             ['RN-08', 'Radioterapia', 'Se conservan por separado: por registro (metodología administrativa) como componente condicionado y por tratamiento (un tratamiento por caso-mes × tarifa de la nota) como alternativa. No se mezclan unidades.'],
             ['RN-AM', 'A · B · C · D', 'A: costo A. B: incluido en tratamiento integral. C: cantidad × mediana del precio unitario de dispensación del mismo CUM en meses anteriores (sin tarifa contractual). Si el único precio es la dispensación del mismo paciente, CUM y mes, es el registro del propio evento: queda condicionado y no suma. D: sin presentación o cantidad: no se valoriza.'],
             ['RN-11', 'Conciliación de medicamentos', 'Una línea AM es un registro, no una unidad. Su cantidad RIPS se conserva por separado; solo la presentación CUM resuelta con precio unitario compatible admite cantidad × precio. Los medicamentos incluidos en AP integral o AH no vuelven a sumar en AM. Un conteo administrativo externo exige identificación de su filtro antes de compararlo.'],
-            ['RN-12', 'Conciliación AC/AT por código y unidad', 'Se exponen registros, unidades, base de cobro y precio histórico por código. AC y AH conservan costo A; AT solo usa la unidad históricamente comparable. Un total administrativo agregado no crea una tarifa ni modifica el costo A.'],
-            ['RN-14', 'Cobertura económica de medicamentos (toda ruta y mes)', 'Cada AM queda incluido demostrado en AP, incluido demostrado en AH, independiente, condicionado o pendiente. Factura y composición histórica del CUPS no acreditan por sí solas inclusión económica: la cobertura AP solo queda demostrada si el medicamento distingue la clase de precio histórica aplicada al integral de la misma factura (al menos la mitad de sus registros y no más del 10 % de las demás clases). Esto aplica a todo AM de la factura que figure en la composición del integral, aunque la nota técnica no lo nombre en el esquema. Con precio único del CUPS o sin distintivo, el posible valor se calcula con cantidad RIPS y precio unitario histórico del mismo CUM como condicionado no aditivo (en cero mientras no haya CUM y precio compatibles); si el integral se valoró con mezcla de varios esquemas, ese valor ya está en la mezcla condicionada y no se repite. Un integral del mismo paciente y mes en otra factura que contenga el medicamento lo deja condicionado. AH conserva la decisión de paquete y requiere un bloque neto en el episodio para acreditar su cobertura.'],
-            ['RN-15', 'Valorización mensual automática', 'Cada ruta y mes se calculan exclusivamente desde sus RIPS con RN-01 a RN-14 y precios históricos comparables anteriores al mes. La referencia gerencial fija solo muestra una variación: nunca modifica cantidades, precios, inclusión, costo A ni estimación central. Los CUPS principales comparan actividad y valor aditivo entre meses cargados.'],
+            ['RN-12', 'Conciliación AC/AT por código y unidad', 'Se exponen registros, unidades, base de cobro y precio histórico por código. AC conserva costo A, AH sigue RN-16; AT solo usa la unidad históricamente comparable. Un total administrativo agregado no crea una tarifa ni modifica el costo A.'],
+            ['RN-14', 'Cobertura económica de medicamentos (toda ruta y mes)', 'Cada AM queda incluido demostrado en AP, incluido demostrado en AH, independiente, condicionado o pendiente. Factura y composición histórica del CUPS no acreditan por sí solas inclusión económica: la cobertura AP solo queda demostrada si el medicamento distingue la clase de precio histórica aplicada al integral de la misma factura (al menos la mitad de sus registros y no más del 10 % de las demás clases). Esto aplica a todo AM de la factura que figure en la composición del integral, aunque la nota técnica no lo nombre en el esquema. Con precio único del CUPS o sin distintivo, el posible valor se calcula con cantidad RIPS y precio unitario histórico del mismo CUM como condicionado no aditivo (en cero mientras no haya CUM y precio compatibles); si el integral se valoró con mezcla de varios esquemas o con esquema indeterminado (RN-03), ese valor ya está en su componente condicionado y no se repite. Un integral del mismo paciente y mes en otra factura que contenga el medicamento lo deja condicionado. AH conserva la decisión de paquete y requiere un bloque neto en el episodio para acreditar su cobertura.'],
+            ['RN-15', 'Valorización mensual automática', 'Cada ruta y mes se calculan exclusivamente desde sus RIPS con RN-01 a RN-16 y precios históricos comparables anteriores al mes. La referencia gerencial fija solo muestra una variación: nunca modifica cantidades, precios, inclusión, costo A ni estimación central. Los CUPS principales comparan actividad y valor aditivo entre meses cargados.'],
+            ['RN-16', 'AH por registro de internación', 'El historial registra una fila AH por registro de internación con egreso, al valor del paquete, sin dividir en bloques de 25 días y también en estancias menores de 24 horas; el corte 08 (la estancia continúa) no es unidad del mes. Estimación AH = registros con egreso del mes × valor del paquete de la nota. Es una estimación administrativa: no tiene equivalencia exacta con todas las filas del informe externo. El costo A y el libro de paquetes no cambian.'],
         ];
 
         foreach ($this->historial->fuentes() as $fuente) {
@@ -1325,13 +1349,41 @@ final class ValorizacionAdministrativa
      */
     private function cerrarIntegrales(): void
     {
-        foreach ($this->integralesPendientes as ['linea' => $linea, 'caso' => $caso, 'casoFactura' => $casoFactura]) {
+        $sesiones = [];
+
+        foreach ($this->integralesPendientes as ['linea' => $linea, 'casoFactura' => $casoFactura, 'fecha' => $fecha]) {
+            $sesiones[$linea['mes']][$casoFactura][$linea['codigo']][$fecha] = true;
+        }
+
+        foreach ($this->integralesPendientes as ['linea' => $linea, 'caso' => $caso, 'casoFactura' => $casoFactura, 'fecha' => $fecha]) {
             $clases = $this->historial->clasesPrecio($this->ruta, $linea['mes'], 'AP', $linea['codigo']);
             $precio = $this->historial->precio($this->ruta, $linea['mes'], 'AP', $linea['codigo']);
-            $medicamentos = array_keys($this->medicamentosCaso[$linea['mes']][$casoFactura] ?? []);
+            $medicamentos = array_keys($this->medicamentosCaso[$linea['mes']][$casoFactura][$fecha] ?? []);
             $asignacion = $this->claseIntegral($clases, $medicamentos);
             [$clase, $metodo, $condicionado, $composicion, $evidencia] = $asignacion;
             $esquema = $this->etiquetaClase($clase, count($clases));
+            $mezcla = ['MEZCLA HISTORICA DE ESQUEMAS', 'INFORME ADMINISTRATIVO (MEZCLA DE CLASES)', 'Sin evidencia del esquema en la fecha del AP: diferencia entre la mezcla histórica del CUPS y el precio base.'];
+            [$serie, $alternativa] = $this->esquemaOtraFecha($clases, $clase, $medicamentos,
+                array_diff_key($this->medicamentosCaso[$linea['mes']][$casoFactura] ?? [], [$fecha => true]),
+                $sesiones[$linea['mes']][$casoFactura][$linea['codigo']] ?? []);
+
+            if ($serie !== null) {
+                [$clase, $condicionado] = [$serie, 0];
+                $metodo = 'DISTINTIVO EN OTRA SESION INTEGRAL DEL MISMO CUPS Y FACTURA ('.implode('/', $clase['distintivos']).'): SERIE DEL ESQUEMA';
+                $composicion = array_map('strval', array_keys($clase['composicion']));
+                $esquema = $this->etiquetaClase($clase, count($clases));
+            } elseif ($alternativa !== null) {
+                $metodo = ($clase['precio'] <= min(array_column($clases, 'precio')) ? 'PRECIO BASE PROVISIONAL' : 'PRECIO PROVISIONAL DE LA CLASE DE LA FECHA')
+                    .'; MEDICAMENTO DISTINTIVO EN OTRA FECHA DE LA FACTURA';
+                $esquema = 'ESQUEMA INDETERMINADO · '.$esquema;
+                // El potencial es la clase evidenciada en otra fecha (reemplaza la mezcla); sus medicamentos ya están en él.
+                $condicionado = ResumenEconomico::centavos($alternativa['precio'] - $clase['precio']);
+                $composicion = array_values(array_unique([...$composicion, ...array_map('strval', array_keys($alternativa['composicion']))]));
+                $asignacion[5] = array_map('strval', $alternativa['distintivos']);
+                $mezcla = ['ESQUEMA INDETERMINADO', 'INFORME ADMINISTRATIVO (PRECIO DEL ESQUEMA)',
+                    'Distintivo de un esquema de mayor precio en otra fecha de la factura sin vínculo con esta sesión: diferencia entre ese esquema y el precio base.'];
+            }
+
             $valor = ResumenEconomico::centavos($clase['precio']);
             $quimio = $this->quimioterapia[$linea['codigo']];
 
@@ -1341,8 +1393,7 @@ final class ValorizacionAdministrativa
                 $precio, $linea['costoA'], $valor, 'REGISTRO');
 
             if ($condicionado > 0) {
-                $this->agregar([...$linea, 'cantidad' => 0.0, 'costoA' => 0], self::CONDICIONADA, false, 'MEZCLA HISTORICA DE ESQUEMAS',
-                    'INFORME ADMINISTRATIVO (MEZCLA DE CLASES)', 'Sin evidencia del esquema en el caso-mes: diferencia entre la mezcla histórica del CUPS y el precio base.',
+                $this->agregar([...$linea, 'cantidad' => 0.0, 'costoA' => 0], self::CONDICIONADA, false, $mezcla[0], $mezcla[1], $mezcla[2],
                     $precio, 0, $condicionado, 'REGISTRO', registros: 0);
             }
 
@@ -1368,12 +1419,12 @@ final class ValorizacionAdministrativa
 
     /**
      * @param  list<array{precio: float, registros: int, participacion: float, composicion: array<string, float>, distintivos: list<string>, ejemplo: string}>  $clases
-     * @param  list<string>  $medicamentos  Prefijos de los medicamentos del caso-mes.
+     * @param  list<string>  $medicamentos  Prefijos de los medicamentos del caso, factura y fecha del AP.
      * @return array{0: array<string, mixed>, 1: string, 2: int, 3: list<string>, 4: string, 5?: list<string>}
      */
     private function claseIntegral(array $clases, array $medicamentos): array
     {
-        $evidencia = $medicamentos === [] ? 'SIN MEDICAMENTOS EN EL CASO-MES' : 'MEDICAMENTOS: '.implode('/', $medicamentos);
+        $evidencia = $medicamentos === [] ? 'SIN MEDICAMENTOS EN LA FECHA DEL AP' : 'MEDICAMENTOS DE LA FECHA: '.implode('/', $medicamentos);
         $todos = array_values(array_unique(array_merge(...array_map(static fn (array $clase): array => array_map('strval', array_keys($clase['composicion'])), $clases))));
 
         if (count($clases) === 1) {
@@ -1386,7 +1437,7 @@ final class ValorizacionAdministrativa
         $base = $bases[0] ?? array_reduce($clases, static fn (?array $menor, array $clase): array => $menor === null || $clase['precio'] < $menor['precio'] ? $clase : $menor);
 
         if (count($candidatas) === 1) {
-            return [$candidatas[0], 'MEDICAMENTO DISTINTIVO EN EL CASO-MES ('.implode('/', array_intersect($candidatas[0]['distintivos'], $medicamentos)).')',
+            return [$candidatas[0], 'MEDICAMENTO DISTINTIVO EN LA FECHA DEL AP ('.implode('/', array_intersect($candidatas[0]['distintivos'], $medicamentos)).')',
                 0, array_map('strval', array_keys($candidatas[0]['composicion'])), $evidencia];
         }
 
@@ -1409,6 +1460,35 @@ final class ValorizacionAdministrativa
         return [$base, $candidatas === [] ? 'SIN EVIDENCIA DEL ESQUEMA (BASE + MEZCLA CONDICIONADA)' : 'VARIOS ESQUEMAS POSIBLES (BASE + MEZCLA CONDICIONADA)',
             max(0, ResumenEconomico::centavos($mezcla - $base['precio'])), $todos, $evidencia,
             array_values(array_unique(array_merge([], ...array_map(static fn (array $clase): array => array_map('strval', $clase['distintivos']), $candidatas))))];
+    }
+
+    /**
+     * RN-03 temporal: clase de mayor precio cuyo distintivo está solo en otra fecha del caso-factura.
+     * Es serie del esquema si ese distintivo está en otra sesión integral del mismo CUPS y la sesión
+     * registra medicamentos del CUPS (patrón del historial); si no, queda como alternativa indeterminada.
+     *
+     * @param  list<array{precio: float, registros: int, participacion: float, composicion: array<string, float>, distintivos: list<string>, ejemplo: string}>  $clases
+     * @param  array<string, mixed>  $clase  Clase asignada con los medicamentos de la fecha.
+     * @param  list<string>  $medicamentos  Prefijos de la fecha de la sesión.
+     * @param  array<string, array<string, bool>>  $otrosDias  fecha => prefijos del caso-factura en otras fechas.
+     * @param  array<string, bool>  $fechasSesiones  Fechas con sesión integral del mismo CUPS en el caso-factura.
+     * @return array{0: array<string, mixed>|null, 1: array<string, mixed>|null} [serie del esquema, alternativa indeterminada]
+     */
+    private function esquemaOtraFecha(array $clases, array $clase, array $medicamentos, array $otrosDias, array $fechasSesiones): array
+    {
+        if (count($clases) < 2 || array_intersect($clase['distintivos'], $medicamentos) !== []) {
+            return [null, null];
+        }
+
+        $conDistintivo = static fn (array $otra, array $dias): bool => array_filter($dias,
+            static fn (array $tokens): bool => array_intersect($otra['distintivos'], array_keys($tokens)) !== []) !== [];
+        $alternativas = array_values(array_filter($clases, static fn (array $otra): bool => $otra['precio'] > $clase['precio'] && $conDistintivo($otra, $otrosDias)));
+        usort($alternativas, static fn (array $a, array $b): int => $b['precio'] <=> $a['precio']);
+        $composicionCups = array_merge([], ...array_map(static fn (array $otra): array => array_keys($otra['composicion']), $clases));
+        $serie = array_intersect($medicamentos, $composicionCups) === [] ? []
+            : array_values(array_filter($alternativas, static fn (array $otra): bool => $conDistintivo($otra, array_intersect_key($otrosDias, $fechasSesiones))));
+
+        return [$serie[0] ?? null, $serie === [] ? ($alternativas[0] ?? null) : null];
     }
 
     /**
@@ -1819,7 +1899,7 @@ final class ValorizacionAdministrativa
             'AT' => 'Mediana administrativa por código con unidad compatible · '.$historico,
             'AU' => 'Atribución no aditiva · '.$historico,
             'AM' => 'AM independiente (A + precio histórico de dispensación por CUM); el incluido en AP integral no suma · el administrativo no registra AM aparte',
-            'AH' => 'Paquetes de 25 días (control) · '.$historico,
+            'AH' => 'Registro de internación con egreso × valor del paquete (RN-16) · '.$historico,
             default => $historico,
         };
     }
@@ -1849,7 +1929,8 @@ final class ValorizacionAdministrativa
         }
 
         return match ($tipo) {
-            'AC', 'AH' => 'CONTROL: IGUAL AL COSTO A',
+            'AC' => 'CONTROL: IGUAL AL COSTO A',
+            'AH' => 'REGISTRO DE INTERNACION CON EGRESO (RN-16)',
             'AU' => 'NO ADITIVO',
             default => 'ESTIMACION REFERENCIAL',
         };
@@ -1889,6 +1970,8 @@ final class ValorizacionAdministrativa
         return match (true) {
             str_starts_with($codigo['subtipo'], 'RADIOTERAPIA') => 'Unidad contractual (tratamiento, sesión o fracción) y tarifa vigente.',
             in_array($codigo['subtipo'], ['MEZCLA HISTORICA DE ESQUEMAS', self::SUBTIPO_RN14_MEZCLA], true) => 'Esquema real (medicamentos) de cada registro de quimioterapia.',
+            $codigo['subtipo'] === 'REGISTRO DE INTERNACION x VALOR DEL PAQUETE' => 'Acuerdo de la unidad de cobro AH: registro con egreso (historial) frente a paquete de 25 días (costo A).',
+            $codigo['subtipo'] === 'ESQUEMA INDETERMINADO' => 'Vínculo de la sesión con el esquema de mayor precio registrado en otra fecha de la factura (orden o protocolo de la sesión).',
             str_starts_with($codigo['subtipo'], 'ASOCIACION DESCONOCIDA') => 'Asociación del medicamento con el tratamiento (esquema y CUPS) del caso-mes.',
             $codigo['subtipo'] === self::SUBTIPO_RN14_AP => 'Prueba de que el precio del AP integral cubre esta presentación, o de que el medicamento se cobra aparte.',
             $codigo['subtipo'] === self::SUBTIPO_DISPENSACION_MISMO_PERIODO => 'Precio del CUM en meses anteriores o tarifa contractual; la dispensación del mismo evento no es referencia histórica.',
