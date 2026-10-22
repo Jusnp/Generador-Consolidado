@@ -45,8 +45,8 @@ class LaMariaConciliacionSeptiembreTest extends TestCase
             $user = User::factory()->create(['role' => 'admin', 'active' => true]);
 
             foreach ([
-                'prostata' => ['pacientes' => 1034, 'registros' => 11360, 'principal' => 2137528852.70, 'central' => 3672150294.72],
-                'cervix' => ['pacientes' => 442, 'registros' => 6954, 'principal' => 521906976.77, 'central' => 1458169640.93],
+                'prostata' => ['pacientes' => 1034, 'registros' => 11360, 'principal' => 2137528852.70, 'central' => 3708242181.90],
+                'cervix' => ['pacientes' => 442, 'registros' => 6954, 'principal' => 521906976.77, 'central' => 1470200269.99],
             ] as $route => $expected) {
                 $uploads = array_map(static fn (string $invoice): UploadedFile => new UploadedFile(
                     $sources.$invoice.'.json', $invoice.'.json', 'application/json', null, true

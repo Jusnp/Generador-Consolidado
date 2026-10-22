@@ -864,6 +864,49 @@ class ValorizacionAdministrativaTest extends TestCase
         $this->assertSame([ValorizacionAdministrativa::INCLUIDA, 'INCLUIDO EN PAQUETE HOSPITALARIO AH'], [$detalle->firstWhere(2, 'DM00114')[4], $detalle->firstWhere(2, 'DM00114')[6]]);
     }
 
+    public function test_hospitalization_registered_only_as_a_service_counts_once_for_a_case_without_a_stay(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
+            $historial->registrar('PROSTATA', $mes, 'AH', '129M02', 6015314.53, 'INTERNACIÓN ADULTOS COMPLEJIDAD MEDIANA HABITACION MÚLTIPLE');
+            $historial->registrar('PROSTATA', $mes, 'AH', '890466', 6015314.53, 'INTERCONSULTA POR ESPECIALISTA EN MEDICINA INTERNA');
+        }
+
+        $valorizacion = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $estancia = ['fechaAtencion' => '2026-09-10 08:00', 'servicioJson' => ['fechaEgreso' => '2026-09-14 10:00', 'condicionDestinoUsuarioEgreso' => '01']];
+
+        // P1 solo trae la internación como servicio (dos fechas): una unidad. P2 tiene hospitalización: su línea no agrega otra.
+        $valorizacion->registrar($this->detalle('otrosServicios', '129M02', 1.0, ['casoId' => 'P1', 'fechaAtencion' => '2026-09-03 08:00']), ['respaldado' => 0.0]);
+        $valorizacion->registrar($this->detalle('otrosServicios', '129M02', 1.0, ['casoId' => 'P1', 'fechaAtencion' => '2026-09-20 08:00']), ['respaldado' => 0.0]);
+        $valorizacion->registrar($this->detalle('otrosServicios', '129M02', 1.0, ['casoId' => 'P2', 'fechaAtencion' => '2026-09-12 08:00']), ['respaldado' => 0.0]);
+        $valorizacion->registrar($this->detalle('hospitalizacion', '', 1.0, ['casoId' => 'P2', ...$estancia]), ['respaldado' => 0.0]);
+        // P3: código clasificado AH en el historial pero sin descripción de internación.
+        $valorizacion->registrar($this->detalle('consultas', '890466', 1.0, ['casoId' => 'P3']), ['respaldado' => 0.0]);
+        // P4: la línea ocurre en una urgencia que egresa a hospitalización (preingreso de una estancia del mes siguiente).
+        $valorizacion->registrar($this->detalle('urgencias', '', 1.0, ['casoId' => 'P4', 'fechaAtencion' => '2026-09-29 14:00',
+            'servicioJson' => ['fechaEgreso' => '2026-09-30 23:00', 'condicionDestinoUsuarioEgreso' => '03']]), ['respaldado' => 0.0]);
+        $valorizacion->registrar($this->detalle('otrosServicios', '129M02', 1.0, ['casoId' => 'P4', 'fechaAtencion' => '2026-09-29 20:00']), ['respaldado' => 0.0]);
+        // P5: urgencia que egresa a domicilio: la internación es una estancia propia.
+        $valorizacion->registrar($this->detalle('urgencias', '', 1.0, ['casoId' => 'P5', 'fechaAtencion' => '2026-09-15 08:00',
+            'servicioJson' => ['fechaEgreso' => '2026-09-16 10:00', 'condicionDestinoUsuarioEgreso' => '01']]), ['respaldado' => 0.0]);
+        $valorizacion->registrar($this->detalle('otrosServicios', '129M02', 1.0, ['casoId' => 'P5', 'fechaAtencion' => '2026-09-15 12:00']), ['respaldado' => 0.0]);
+        // P6: corte 08 del mismo caso (la unidad corresponde a su egreso) y caso sin documento: no suman.
+        $valorizacion->registrar($this->detalle('otrosServicios', '129M02', 1.0, ['casoId' => 'P6', 'fechaAtencion' => '2026-09-01 08:00']), ['respaldado' => 0.0]);
+        $valorizacion->registrar($this->detalle('hospitalizacion', '', 1.0, ['casoId' => 'P6', 'fechaAtencion' => '2026-09-27 08:00',
+            'servicioJson' => ['fechaEgreso' => '2026-09-30 23:59', 'condicionDestinoUsuarioEgreso' => '08']]), ['respaldado' => 0.0]);
+        $valorizacion->registrar($this->detalle('otrosServicios', '129M02', 1.0, ['casoId' => 'SIN_DOCUMENTO-F1-U1-2026-09', 'fechaAtencion' => '2026-09-05 08:00']), ['respaldado' => 0.0]);
+        $valorizacion->atribuirPaquetes([['2026-09', 2, 12030629.06]]);
+
+        $ah = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0)['AH'];
+        $unidad = collect($valorizacion->filasPendientes())->firstWhere(2, 'REGISTRO_INTERNACION_EGRESO');
+
+        // Unidades: egreso de P2 + estancias solo como servicio de P1 y P5. El costo A conserva sus paquetes.
+        $this->assertSame([12030629.06, 18045943.59], [$ah[3], $ah[4]]);
+        $this->assertStringContainsString('3 registros con egreso (2 internaciones registradas solo como servicio', $unidad[9]);
+        $this->assertStringContainsString('1 cortes 08 sin unidad', $unidad[9]);
+    }
+
     public function test_without_administrative_history_only_cost_a_and_medication_history_are_used(): void
     {
         $valorizacion = new ValorizacionAdministrativa('CERVIX', new HistorialAdministrativo, [], static fn (string $cum): array => []);
