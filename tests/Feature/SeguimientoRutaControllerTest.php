@@ -127,7 +127,7 @@ class SeguimientoRutaControllerTest extends TestCase
 
         $this->assertCount(1, $summary);
         $this->assertSame('2026-06', $summary[0]['MES']);
-        $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS'], $this->headers($workbook->getSheetByName('SEGUIMIENTO MENSUAL')));
+        $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS', 'VALOR TOTAL MES'], $this->headers($workbook->getSheetByName('SEGUIMIENTO MENSUAL')));
         $this->assertSame(1, (int) $summary[0]['PACIENTES']);
         $this->assertSame(1, (int) $summary[0]['SERVICIOS']);
         $this->assertSame('M', $patient['codSexo']);
@@ -162,7 +162,7 @@ class SeguimientoRutaControllerTest extends TestCase
             $this->assertEquals(5000, $cell->getValue());
         }
 
-        $this->assertNull($workbook->getSheetByName('SEGUIMIENTO MENSUAL')->getCell('D2')->getValue());
+        $this->assertSame(5000.0, (float) $workbook->getSheetByName('SEGUIMIENTO MENSUAL')->getCell('D2')->getValue());
 
         foreach (['ID CASO', 'ORIGEN RUTA', 'ESTADO CLINICO', 'ESTADO TARIFARIO', 'FUENTE TARIFA', 'FORMA CRUCE', 'EN NOTA TECNICA', 'ESTADO DUPLICIDAD', 'CONDICION ARCHIVO', 'SUMA AL RESUMEN', 'MOTIVO NO SUMA', 'CLASE COSTO', 'ATC', 'GRUPO TECNICO', 'RUTA', 'MES ATENCION', 'ÁMBITO', 'ESTADO CRUCE', 'ARCHIVO ORIGEN'] as $internal) {
             $this->assertNotContains($internal, $detailHeaders);
@@ -215,7 +215,7 @@ class SeguimientoRutaControllerTest extends TestCase
             $workbook->getSheetNames()
         );
         $this->assertSame(
-            ['MES', 'PACIENTES', 'SERVICIOS'],
+            ['MES', 'PACIENTES', 'SERVICIOS', 'VALOR TOTAL MES'],
             $this->headers($workbook->getSheetByName('SEGUIMIENTO MENSUAL'))
         );
         $this->assertSame(
@@ -240,7 +240,7 @@ class SeguimientoRutaControllerTest extends TestCase
         );
     }
 
-    public function test_monthly_sheet_has_only_activity_rows_and_control_is_last_for_multiple_months(): void
+    public function test_monthly_sheet_has_monthly_totals_and_control_is_last_for_multiple_months(): void
     {
         $user = User::factory()->create();
         $this->createReferenceCatalogs();
@@ -252,10 +252,10 @@ class SeguimientoRutaControllerTest extends TestCase
 
         $sheet = $workbook->getSheetByName('SEGUIMIENTO MENSUAL');
         $this->assertSame('CONTROL DE CARGUE', $workbook->getSheetNames()[array_key_last($workbook->getSheetNames())]);
-        $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS'], $this->headers($sheet));
+        $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS', 'VALOR TOTAL MES'], $this->headers($sheet));
         $this->assertSame([
-            ['MES' => '2026-06', 'PACIENTES' => 1, 'SERVICIOS' => 1],
-            ['MES' => '2026-07', 'PACIENTES' => 1, 'SERVICIOS' => 1],
+            ['MES' => '2026-06', 'PACIENTES' => 1, 'SERVICIOS' => 1, 'VALOR TOTAL MES' => 5000],
+            ['MES' => '2026-07', 'PACIENTES' => 1, 'SERVICIOS' => 1, 'VALOR TOTAL MES' => 5000],
         ], $this->records($sheet));
         $this->assertSame('FF4472C4', $sheet->getCell('A1')->getStyle()->getFill()->getStartColor()->getARGB());
     }
@@ -1527,8 +1527,8 @@ class SeguimientoRutaControllerTest extends TestCase
         foreach ($comparison as $month) {
             $this->assertSame(5000.0, (float) $month['TOTAL']['COSTO A']);
         }
-        $this->assertCount(3, $this->headers($workbook->getSheetByName('SEGUIMIENTO MENSUAL')));
-        $this->assertCount(3, $this->records($workbook->getSheetByName('SEGUIMIENTO MENSUAL'))[0]);
+        $this->assertCount(4, $this->headers($workbook->getSheetByName('SEGUIMIENTO MENSUAL')));
+        $this->assertCount(4, $this->records($workbook->getSheetByName('SEGUIMIENTO MENSUAL'))[0]);
     }
 
     public function test_consolidated_export_combines_both_routes_with_the_figures_of_each_route(): void
@@ -1653,8 +1653,8 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->assertSame(5000.0, (float) $comparison['TOTAL']['COSTO A']);
         $this->assertSame(5000.0, (float) $comparison['AC']['ESTIMACION ADMINISTRATIVA CENTRAL']);
         $this->assertSame(10000.0, (float) $estimate['AC'][10], 'Mediana del total mensual: dos registros de $5.000 por mes.');
-        $this->assertSame(1200.0, (float) $comparison['AT']['ESTIMACION ADMINISTRATIVA CENTRAL']);
-        $this->assertSame(6200.0, (float) $comparison['TOTAL']['ESTIMACION ADMINISTRATIVA CENTRAL']);
+        $this->assertSame(0.0, (float) $comparison['AT']['ESTIMACION ADMINISTRATIVA CENTRAL']);
+        $this->assertSame(5000.0, (float) $comparison['TOTAL']['ESTIMACION ADMINISTRATIVA CENTRAL']);
         $this->assertSame('ESTIMACION ADMINISTRATIVA REFERENCIAL; NO ES FACTURACION', $estimate['TOTAL'][14]);
         $this->assertNull($workbook->getSheetByName('DETALLE POR CÓDIGO'));
 
@@ -1680,7 +1680,7 @@ class SeguimientoRutaControllerTest extends TestCase
         ])->assertSessionHasErrors(['informes_administrativos.0' => 'Cada informe administrativo debe ser un archivo .xlsx.']);
     }
 
-    public function test_first_sheet_shows_only_monthly_activity_while_au_stays_internal_and_non_additive(): void
+    public function test_first_sheet_shows_monthly_total_and_non_additive_au(): void
     {
         $user = User::factory()->create();
         $this->createReferenceCatalogs();
@@ -1710,13 +1710,16 @@ class SeguimientoRutaControllerTest extends TestCase
 
         $this->assertSame([], array_values(array_intersect(self::HOJAS_RETIRADAS, $workbook->getSheetNames())));
         $this->assertSame('CONTROL DE CARGUE', $workbook->getSheetNames()[array_key_last($workbook->getSheetNames())]);
-        $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS'], $this->headers($sheet));
-        $this->assertSame([['MES' => '2026-09', 'PACIENTES' => 1, 'SERVICIOS' => 3]], $this->records($sheet));
+        $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS', 'VALOR TOTAL MES'], $this->headers($sheet));
+        $this->assertSame([['MES' => '2026-09', 'PACIENTES' => 1, 'SERVICIOS' => 3, 'VALOR TOTAL MES' => 5000]], $this->records($sheet));
         $this->assertSame('FF4472C4', $sheet->getCell('A1')->getStyle()->getFill()->getStartColor()->getARGB());
         $this->assertSame(5000.0, (float) $comparison['TOTAL']['COSTO A']);
-        $this->assertSame(6200.0, (float) $comparison['TOTAL']['ESTIMACION ADMINISTRATIVA CENTRAL']);
+        $this->assertSame(5000.0, (float) $comparison['TOTAL']['ESTIMACION ADMINISTRATIVA CENTRAL']);
         $this->assertSame(0.0, (float) $comparison['AU']['ESTIMACION ADMINISTRATIVA CENTRAL']);
         $this->assertSame(5000.0, (float) $comparison['AU']['IMPORTES INFORMATIVOS NO ADITIVOS']);
+        $this->assertSame('AU — Urgencias (atribuido, no aditivo)', (string) $sheet->getCell('A9')->getValue());
+        $this->assertSame(5000.0, (float) $sheet->getCell('B9')->getValue());
+        $this->assertSame(5000.0, (float) $sheet->getCell('B12')->getValue());
         $this->assertSame(4000000000.0, ValorizacionAdministrativa::REFERENCIAS_GERENCIALES['PROSTATA']);
     }
 
@@ -1741,8 +1744,10 @@ class SeguimientoRutaControllerTest extends TestCase
             File::delete([$configured, $uploaded]);
         }
 
-        $this->assertSame(1200.0, (float) $automatic['AT']['ESTIMACION ADMINISTRATIVA CENTRAL']);
-        $this->assertSame(1500.0, (float) $replaced['AT']['ESTIMACION ADMINISTRATIVA CENTRAL'], 'El informe cargado reemplaza al configurado de su ruta, sin mezclarlos.');
+        $this->assertSame(0.0, (float) $automatic['AT']['ESTIMACION ADMINISTRATIVA CENTRAL']);
+        $this->assertSame(0.0, (float) $replaced['AT']['ESTIMACION ADMINISTRATIVA CENTRAL']);
+        $this->assertSame(1200.0, (float) $automatic['AT']['COMPONENTE CONDICIONADO']);
+        $this->assertSame(1500.0, (float) $replaced['AT']['COMPONENTE CONDICIONADO'], 'El informe cargado reemplaza al configurado de su ruta, sin convertir el insumo en cobro independiente.');
     }
 
     public function test_missing_administrative_source_stops_the_report_with_a_clear_error(): void

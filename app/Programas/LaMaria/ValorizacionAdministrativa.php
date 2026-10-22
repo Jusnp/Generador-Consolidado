@@ -74,6 +74,9 @@ final class ValorizacionAdministrativa
 
     public const REFERENCIAS_GERENCIALES = ['PROSTATA' => 4000000000.0, 'CERVIX' => 2000000000.0];
 
+    /** Códigos de transporte identificados tanto en RIPS como en el histórico administrativo. */
+    private const TRANSPORTES_AT = ['T34004', 'T34003', '601T01', '601T02'];
+
     public const COSTO_A_HEADERS = ['MES', 'TIPO RIPS', 'REGISTROS', 'UNIDADES', 'COSTO A', 'CONTROL'];
 
     public const RESUMEN_SERVICIOS_HEADERS = [
@@ -454,7 +457,7 @@ final class ValorizacionAdministrativa
             $estado = match ($tipo) {
                 'AC' => 'COSTO A ACREDITADO; LA ESTIMACION CONSERVA EL COSTO A (CONTROL)',
                 'AP' => 'ESTIMACION REFERENCIAL POR CUPS Y ESQUEMA INTEGRAL; MEDICAMENTOS DEL ESQUEMA INCLUIDOS UNA SOLA VEZ',
-                'AT' => 'PRECIO HISTORICO POR CODIGO Y UNIDAD COMPATIBLE (REFERENCIAL); COSTO ACREDITADO CONTRACTUAL = COSTO A',
+                'AT' => 'TRANSPORTE Y ALBERGUE CON PRECIO HISTORICO Y UNIDAD COMPATIBLE; DEMAS AT PENDIENTES SIN COBRO INDEPENDIENTE DEMOSTRADO',
                 'AU' => 'ATRIBUIDO, NO ADITIVO: '.$episodios.' EPISODIOS; COSTO YA RECONOCIDO EN '
                     .(implode('/', array_keys($porTipo)) ?: 'LOS SERVICIOS ENLAZADOS')
                     .'; COBRO INDEPENDIENTE DEMOSTRADO $'.number_format($cobroUrgencias, 2, ',', '.'),
@@ -1006,7 +1009,7 @@ final class ValorizacionAdministrativa
             ['RN-03', 'Asignación del esquema', 'Si el caso-mes tiene el medicamento distintivo de una clase (p. ej. pembrolizumab), se usa esa clase. Si tiene medicamentos del CUPS sin distintivo de otra clase, se usa la clase base. Sin evidencia: precio base en la central y la diferencia con la mezcla histórica como componente condicionado.'],
             ['RN-04', 'Medicamentos oncológicos', 'La composición histórica relaciona medicamento y CUPS integral; los de otro esquema se valoran como AM independiente. La relación con el mismo CUPS exige RN-14 para demostrar cobertura económica.'],
             ['RN-05', 'Demás procedimientos', 'Con tarifa aplicable: costo A. Sin tarifa o con regla pendiente: mediana administrativa por registro cuando la unidad es compatible.'],
-            ['RN-06', 'AT', 'Precio histórico por código solo con unidad comparable, igual para todo código (incluido T34004), ruta y mes: la base (registro o unidad) es la que más se acerca a los registros administrativos por mes de la ventana anterior al mes, comparados con todas las líneas RIPS del código en el mes (con o sin tarifa); fuera de 0,5 a 2 veces queda condicionada. La cantidad valorizada es la de las líneas sin tarifa del RIPS y el precio de la ventana; el conteo administrativo del mismo mes solo se muestra como control. Lo absorbido en AH no suma aparte.'],
+            ['RN-06', 'AT', 'Solo transporte y albergue identificados por código y descripción pueden tener valoración AT independiente con precio histórico y unidad compatible. La base (registro o unidad) compara la mediana de filas administrativas de la ventana anterior con la actividad RIPS del código; fuera de 0,5 a 2 veces queda condicionada. Los demás AT sin tarifa acreditada permanecen pendientes y no suman aparte; los absorbidos en AH tampoco.'],
             ['RN-07', 'AU', 'No suma. Sus componentes ya están en AC/AP/AM; la atribución se muestra como informativa.'],
             ['RN-08', 'Radioterapia', 'Se conservan por separado: por registro (metodología administrativa) como componente condicionado y por tratamiento (un tratamiento por caso-mes × tarifa de la nota) como alternativa. No se mezclan unidades.'],
             ['RN-AM', 'A · B · C · D', 'A: costo A. B: incluido en tratamiento integral. C: cantidad × mediana del precio unitario de dispensación del mismo CUM en meses anteriores (sin tarifa contractual). Si el único precio es la dispensación del mismo paciente, CUM y mes, es el registro del propio evento: queda condicionado y no suma. D: sin presentación o cantidad: no se valoriza.'],
@@ -1271,6 +1274,16 @@ final class ValorizacionAdministrativa
                 continue;
             }
 
+            if ($diferido['tipo'] === 'AT' && ! $this->esTransporteOAlbergue($diferido, $precio)) {
+                $this->agregar($linea, self::CONDICIONADA, false, 'INDEPENDENCIA AT NO DEMOSTRADA',
+                    'INFORME ADMINISTRATIVO (REFERENCIA NO ADITIVA)',
+                    'El código AT permanece en RIPS; no hay evidencia de cobro independiente frente a procedimientos o paquetes.',
+                    $precio, 0, ResumenEconomico::centavos($diferido['registros'] * $precio['mediana']),
+                    'NO VERIFICADA', registros: $diferido['registros']);
+
+                continue;
+            }
+
             [$base, $cantidadBase, $evidencia] = $this->baseUnidad($diferido, $precio);
 
             if ($base === null) {
@@ -1287,6 +1300,24 @@ final class ValorizacionAdministrativa
                 $fuente, $evidencia, $precio, 0,
                 ResumenEconomico::centavos($cantidadBase * $precio['mediana']), $base, registros: $diferido['registros']);
         }
+    }
+
+    /**
+     * Los códigos de transporte están verificados en los RIPS y el histórico;
+     * el código de albergue requiere además descripción coincidente.
+     *
+     * @param  array<string, mixed>  $diferido
+     * @param  array<string, mixed>  $precio
+     */
+    private function esTransporteOAlbergue(array $diferido, array $precio): bool
+    {
+        if (in_array($diferido['codigo'], self::TRANSPORTES_AT, true)) {
+            return true;
+        }
+
+        return $diferido['codigo'] === 'A'
+            && preg_match('/ALBERGUE/u', mb_strtoupper((string) $diferido['descripcion'])) === 1
+            && preg_match('/ALBERGUE/u', mb_strtoupper((string) $precio['descripcion'])) === 1;
     }
 
     /**
@@ -1862,6 +1893,7 @@ final class ValorizacionAdministrativa
             $codigo['subtipo'] === self::SUBTIPO_RN14_AP => 'Prueba de que el precio del AP integral cubre esta presentación, o de que el medicamento se cobra aparte.',
             $codigo['subtipo'] === self::SUBTIPO_DISPENSACION_MISMO_PERIODO => 'Precio del CUM en meses anteriores o tarifa contractual; la dispensación del mismo evento no es referencia histórica.',
             $codigo['subtipo'] === 'UNIDAD NO COMPATIBLE' => 'Unidad de cobro histórica del código (por registro o por unidad) y tarifa contractual.',
+            $codigo['subtipo'] === 'INDEPENDENCIA AT NO DEMOSTRADA' => 'Evidencia de cobro independiente del AT frente a procedimientos y paquetes, y unidad contractual.',
             str_starts_with($codigo['subtipo'], 'D ·') => 'CUM o presentación inequívoca y cantidad dispensada.',
             str_starts_with($codigo['subtipo'], 'C ·') => 'Tarifa contractual vigente del CUM; el precio de dispensación solo es referencia.',
             str_starts_with($codigo['subtipo'], 'TRATAMIENTO INTEGRAL') => 'Acuerdo de tarifa integral por esquema y número de tratamientos completos.',

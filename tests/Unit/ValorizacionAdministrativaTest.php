@@ -218,12 +218,33 @@ class ValorizacionAdministrativaTest extends TestCase
             $valorizacion->registrar($this->detalle('otrosServicios', 'DM00500', 5.0, ['decisionPaquete' => 'REGLA_NO_DEFINIDA']), ['respaldado' => 0.0, 'condicionadoIncluido' => 50000.0]);
         }
 
-        $estimada = collect($valorizacion->filasDetalle())->first(static fn (array $fila): bool => $fila[2] === 'DM00500' && $fila[4] === ValorizacionAdministrativa::ESTIMADA);
+        $pendiente = collect($valorizacion->filasDetalle())->first(static fn (array $fila): bool => $fila[2] === 'DM00500' && $fila[4] === ValorizacionAdministrativa::CONDICIONADA);
 
-        // 100 filas administrativas por mes frente a 100 registros RIPS del código (180 unidades): una fila por registro.
-        $this->assertSame(['REGISTRO', 20, 200000.0], [$estimada[9], $estimada[7], $estimada[17]]);
-        $this->assertStringContainsString('frente a 100 registros y 180,0 unidades RIPS del código en 2026-09 (20 registros y 100,0 unidades sin tarifa)', $estimada[20]);
-        $this->assertSame(1000000.0, collect($valorizacion->filasComparacion([]))->firstWhere(1, 'AT')[5]);
+        // La frecuencia histórica no demuestra que el insumo se cobre aparte del procedimiento.
+        $this->assertSame(['NO VERIFICADA', 20, 0.0, 200000.0], [$pendiente[9], $pendiente[7], $pendiente[17], $pendiente[18]]);
+        $this->assertSame(800000.0, collect($valorizacion->filasComparacion([]))->firstWhere(1, 'AT')[5]);
+    }
+
+    public function test_albergue_uses_compatible_units_while_other_at_stays_pending(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-06', '2026-07', '2026-08'] as $month) {
+            for ($unit = 0; $unit < 3; $unit++) {
+                $historial->registrar('PROSTATA', $month, 'AT', 'A', 40000.0, 'ALBERGUE');
+            }
+
+            $historial->registrar('PROSTATA', $month, 'AT', 'DM00500', 10000.0, 'INSUMO');
+        }
+
+        $valuation = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $valuation->registrar($this->detalle('otrosServicios', 'A', 3.0, ['descripcionOficial' => 'ALBERGUE']), ['respaldado' => 0.0]);
+        $valuation->registrar($this->detalle('otrosServicios', 'DM00500', 1.0, ['descripcionOficial' => 'INSUMO']), ['respaldado' => 0.0]);
+
+        $rows = collect($valuation->filasDetalle())->keyBy(2);
+        $this->assertSame(['UNIDAD', 120000.0], [$rows['A'][9], $rows['A'][17]]);
+        $this->assertSame([ValorizacionAdministrativa::CONDICIONADA, 'NO', 0.0], [$rows['DM00500'][4], $rows['DM00500'][5], $rows['DM00500'][17]]);
+        $this->assertSame(120000.0, collect($valuation->filasComparacion([]))->firstWhere(1, 'AT')[5]);
     }
 
     public function test_same_month_dispensation_price_of_the_same_event_is_conditioned_not_historical(): void
@@ -535,7 +556,7 @@ class ValorizacionAdministrativaTest extends TestCase
         }
 
         $pendientes = collect($valorizacion->filasPendientes())->pluck(10, 2);
-        $this->assertStringContainsString('Unidad de cobro', $pendientes['T99']);
+        $this->assertStringContainsString('Evidencia de cobro independiente', $pendientes['T99']);
         $this->assertStringContainsString('Tarifa contractual vigente del CUM', $pendientes['1P1040411000101']);
     }
 

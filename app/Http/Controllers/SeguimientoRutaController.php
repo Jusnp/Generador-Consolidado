@@ -79,7 +79,7 @@ class SeguimientoRutaController extends Controller
         'codDiagnosticoCausaMuerteCIE11', 'nomCodDiagnosticoCausaMuerteCIE11',
     ];
 
-    private const MONTHLY_SUMMARY_HEADERS = ['MES', 'PACIENTES', 'SERVICIOS'];
+    private const MONTHLY_SUMMARY_HEADERS = ['MES', 'PACIENTES', 'SERVICIOS', 'VALOR TOTAL MES'];
 
     private const PATIENT_HEADERS = [
         'MES', 'tipoDocumentoIdentificacion', 'numDocumentoIdentificacion', 'codSexo',
@@ -282,12 +282,8 @@ class SeguimientoRutaController extends Controller
 
             $summarySheet = $writer->getCurrentSheet();
             $summarySheet->setName('SEGUIMIENTO MENSUAL');
-            $this->configureSheet($summarySheet, $this->columnWidths(self::MONTHLY_SUMMARY_HEADERS));
+            $this->configureSheet($summarySheet, [46, 27, 18, 26]);
             $writer->addRow(Row::fromValues(self::MONTHLY_SUMMARY_HEADERS, $this->headerStyle()));
-
-            foreach ($this->monthlySummaries($profiles, $sharedProfiles) as $summary) {
-                $writer->addRow(Row::fromValues(array_slice($summary, 0, 3)));
-            }
 
             $patientSheet = $writer->addNewSheetAndMakeItCurrent();
             $patientSheet->setName('SEGUIMIENTO PACIENTE MES');
@@ -494,6 +490,8 @@ class SeguimientoRutaController extends Controller
             $valorizacion->atribuirPaquetes($resultadoEconomico['hospitalizacion']);
             $valorizacion->atribuirUrgencias($conciliacionRipsNota->filasEpisodiosUrgencias(), $conciliacionRipsNota->costoUrgenciasPorTipo());
             $estimacionAdministrativa = $this->administrativeComparison([$ruta => $valorizacion], [$ruta => $resultadoEconomico]);
+            $writer->setCurrentSheet($summarySheet);
+            $this->writeMonthlyAdministrativeSummary($writer, [$ruta => $valorizacion], [$ruta => $resultadoEconomico]);
             $hospitalizacionDemo = $resultadoEconomico['hospitalizacion'];
             foreach ($hospitalizacionDemo as $filaHospital) {
                 if ($filaHospital[0] !== 'TOTAL') {
@@ -658,16 +656,11 @@ class SeguimientoRutaController extends Controller
             $summaryHeaders = ['RUTA', ...self::MONTHLY_SUMMARY_HEADERS];
             $summarySheet = $writer->getCurrentSheet();
             $summarySheet->setName('SEGUIMIENTO MENSUAL');
-            $this->configureSheet($summarySheet, $this->columnWidths($summaryHeaders));
+            $this->configureSheet($summarySheet, [46, 27, 18, 18, 26]);
             $writer->addRow(Row::fromValues($summaryHeaders, $this->headerStyle()));
 
-            foreach ($resultados as $resultado) {
-                foreach ($resultado['mensual'] as $summary) {
-                    $writer->addRow(Row::fromValues([$resultado['ruta'], ...array_slice($summary, 0, 3)]));
-                }
-            }
-
             $estimacionAdministrativa = $this->administrativeComparison($valorizaciones, $resultados);
+            $this->writeMonthlyAdministrativeSummary($writer, $valorizaciones, $resultados, true);
 
             $catalogSheet = $writer->addNewSheetAndMakeItCurrent();
             $catalogSheet->setName('CATALOGOS APLICADOS');
@@ -1983,6 +1976,53 @@ class SeguimientoRutaController extends Controller
             'sinTarifa' => $resumen->filasSinTarifa(),
             'hospitalizacion' => $this->hospitalControlRows($profiles),
         ];
+    }
+
+    /**
+     * Dos tablas breves en la primera hoja; AU se presenta atribuido y no se
+     * agrega al total administrativo del motor.
+     *
+     * @param  array<string, ValorizacionAdministrativa>  $valorizaciones
+     * @param  array<string, array<string, mixed>>  $resultados
+     */
+    private function writeMonthlyAdministrativeSummary(Writer $writer, array $valorizaciones, array $resultados, bool $includeRoute = false): void
+    {
+        $money = (new Style)->setFormat('"$"#,##0.00');
+        $monthlyRows = [];
+        $serviceBlocks = [];
+
+        foreach ($resultados as $ruta => $resultado) {
+            foreach ($resultado['mensual'] as $summary) {
+                $mes = (string) $summary[0];
+                $economic = $valorizaciones[$ruta]->resumenServicios($mes);
+                $monthlyRows[] = $includeRoute
+                    ? [$ruta, $mes, $summary[1], $summary[2], $economic['totales']['estimado']]
+                    : [$mes, $summary[1], $summary[2], $economic['totales']['estimado']];
+                $serviceBlocks[] = [$ruta, $mes, $economic];
+            }
+        }
+
+        foreach ($monthlyRows as $row) {
+            $writer->addRow(Row::fromValuesWithStyles($row, null, [$includeRoute ? 4 : 3 => $money]));
+        }
+
+        foreach ($serviceBlocks as [$ruta, $mes, $economic]) {
+            $writer->addRow(Row::fromValues(['']));
+            $writer->addRow(Row::fromValues([($includeRoute ? self::ROUTE_NAMES[$ruta].' · ' : '').$mes]));
+            $writer->addRow(Row::fromValues(['TIPO RIPS / SERVICIO', 'VALOR ADMINISTRATIVO'], $this->headerStyle()));
+
+            foreach ($economic['filas'] as $service) {
+                if ($service[0] === 'TOTAL' || ! in_array($service[0], ['AC', 'AP', 'AT', 'AU', 'AM', 'AH'], true)) {
+                    continue;
+                }
+
+                $value = $service[0] === 'AU' ? (float) $service[9] : (float) $service[4];
+                $label = $service[0].' — '.$service[1].($service[0] === 'AU' ? ' (atribuido, no aditivo)' : '');
+                $writer->addRow(Row::fromValuesWithStyles([$label, $value], null, [1 => $money]));
+            }
+
+            $writer->addRow(Row::fromValuesWithStyles(['TOTAL DEL MES', $economic['totales']['estimado']], null, [1 => $money]));
+        }
     }
 
     /**

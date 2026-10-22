@@ -32,7 +32,7 @@ class LaMariaConciliacionSeptiembreTest extends TestCase
         ]]);
         $sources = $base.'Septiembre json/';
         $invoices = ['FEHM643506', 'FEHM643507', 'FEHM643504', 'FEHM643505'];
-        $destination = getenv('SIRUTA_SEPTIEMBRE_DESTINATION') ?: base_path('outputs/septiembre-limpio-20261021');
+        $destination = getenv('SIRUTA_SEPTIEMBRE_DESTINATION') ?: base_path('outputs/septiembre-resumen-at-20261021');
 
         if (! is_dir($destination)) {
             mkdir($destination, 0775, true);
@@ -53,7 +53,7 @@ class LaMariaConciliacionSeptiembreTest extends TestCase
                 ), $invoices);
                 $response = $this->actingAs($user)->post(route('la-maria.'.$route.'.export'), ['archivos' => $uploads]);
                 $response->assertDownload();
-                $output = $destination.'/LA_MARIA_'.strtoupper($route).'_SEPTIEMBRE_LIMPIO.xlsx';
+                $output = $destination.'/LA_MARIA_'.strtoupper($route).'_SEPTIEMBRE_RESUMEN_AT.xlsx';
                 file_put_contents($output, $response->streamedContent());
 
                 [$names, $first] = $this->firstSheet($output);
@@ -63,12 +63,23 @@ class LaMariaConciliacionSeptiembreTest extends TestCase
                     'REFERENCIA TECNICA', 'CATALOGOS APLICADOS', 'CONTROL DE CARGUE',
                 ], $names);
                 $this->assertSame([], array_values(array_intersect(self::HOJAS_RETIRADAS, $names)));
-                $this->assertCount(2, $first);
-                $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS'], $first[0]);
-                $this->assertCount(3, $first[1]);
+                $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS', 'VALOR TOTAL MES'], $first[0]);
+                $this->assertCount(4, $first[1]);
                 $this->assertSame('2026-09', $first[1][0]);
                 $this->assertSame($expected['pacientes'], (int) $first[1][1]);
                 $this->assertSame($expected['registros'], (int) $first[1][2]);
+                $this->assertSame($expected['central'], round((float) $first[1][3], 2));
+                $serviceHeader = array_search('TIPO RIPS / SERVICIO', array_column($first, 0), true);
+                $this->assertNotFalse($serviceHeader);
+                $this->assertSame(['TIPO RIPS / SERVICIO', 'VALOR ADMINISTRATIVO'], $first[$serviceHeader]);
+                $services = array_slice($first, $serviceHeader + 1, 7);
+                $this->assertSame(['AC', 'AP', 'AT', 'AU', 'AM', 'AH', 'TOTAL'], array_map(
+                    static fn (array $row): string => explode(' ', (string) $row[0])[0], $services
+                ));
+                $this->assertSame($expected['central'], round((float) $services[6][1], 2));
+                $this->assertSame($expected['central'], round(array_sum(array_map(
+                    static fn (array $row): float => (float) $row[1], [$services[0], $services[1], $services[2], $services[4], $services[5]]
+                )), 2));
 
                 $result = session('la-maria.resultado.'.$route);
                 $cost = collect($result['costos'])->first(static fn (array $row): bool => ($row[1] ?? '') === '2026-09');

@@ -276,10 +276,29 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
 
         $this->assertSame(['SEGUIMIENTO MENSUAL', 'CATALOGOS APLICADOS', 'CONTROL DE CARGUE'], $sheets);
         $this->assertSame('CONTROL DE CARGUE', end($sheets));
-        $this->assertSame(['RUTA', 'MES', 'PACIENTES', 'SERVICIOS'], $monthlyRows[0]);
+        $this->assertSame(['RUTA', 'MES', 'PACIENTES', 'SERVICIOS', 'VALOR TOTAL MES'], $monthlyRows[0]);
 
-        foreach (array_slice($monthlyRows, 1) as $row) {
-            $this->assertCount(4, $row);
+        $periods = array_values(array_filter($monthlyRows, static fn (array $row): bool => in_array($row[0] ?? '', ['PROSTATA', 'CERVIX'], true)));
+        $serviceHeaders = array_keys(array_filter($monthlyRows, static fn (array $row): bool => ($row[0] ?? '') === 'TIPO RIPS / SERVICIO'));
+        $this->assertNotEmpty($periods);
+        $this->assertCount(count($periods), $serviceHeaders);
+
+        foreach ($periods as $index => $period) {
+            $this->assertCount(5, $period);
+            $this->assertSame('2026-', substr((string) $period[1], 0, 5));
+            $this->assertGreaterThanOrEqual(0, (float) $period[4]);
+
+            $header = $serviceHeaders[$index];
+            $this->assertSame(['TIPO RIPS / SERVICIO', 'VALOR ADMINISTRATIVO'], $monthlyRows[$header]);
+            $services = array_slice($monthlyRows, $header + 1, 7);
+            $this->assertSame(['AC', 'AP', 'AT', 'AU', 'AM', 'AH', 'TOTAL'], array_map(
+                static fn (array $row): string => explode(' ', (string) $row[0])[0], $services
+            ));
+            $this->assertStringContainsString('no aditivo', (string) $services[3][0]);
+            $this->assertSame(round((float) $period[4], 2), round((float) $services[6][1], 2));
+            $this->assertSame(round((float) $period[4], 2), round(array_sum(array_map(
+                static fn (array $row): float => (float) $row[1], [$services[0], $services[1], $services[2], $services[4], $services[5]]
+            )), 2));
         }
     }
 }
