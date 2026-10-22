@@ -146,6 +146,11 @@ final class ValorizacionAdministrativa
     /** Precio administrativo por registro que supera la tarifa de aplicación en este factor: alcance integral. */
     private const FACTOR_INTEGRAL = 1.5;
 
+    /** RN-03: una clase no distinguida por los medicamentos solo se estima si domina el historial comparable. */
+    private const OBSERVACIONES_DOMINANTE = 10;
+
+    private const PARTICIPACION_DOMINANTE = 0.8;
+
     /** Razón aceptada entre registros administrativos por mes y registros/unidades RIPS. */
     private const RAZON_MINIMA = 0.5;
 
@@ -333,7 +338,8 @@ final class ValorizacionAdministrativa
             return;
         }
 
-        if ($absorcion !== null) {
+        // RN-06: el administrativo cobra el transporte aparte aunque ocurra durante la estancia.
+        if ($absorcion !== null && ! ($absorcion === self::ABSORCIONES['INCLUIDO_EN_PAQUETE'] && in_array($codigo, self::TRANSPORTES_AT, true))) {
             $this->agregar($linea, self::INCLUIDA, false, 'INCLUIDO EN '.$absorcion, 'REGLA HOSPITALARIA SIRUTA',
                 'Servicio absorbido; no se cobra por separado.');
 
@@ -357,6 +363,8 @@ final class ValorizacionAdministrativa
             $this->radioPendientes[$clave]['registros']++;
             $this->radioPendientes[$clave]['unidades'] += $cantidad;
             $this->radioPendientes[$clave]['casos'][$caso] = true;
+            $this->radioPendientes[$clave]['lineas'][] = ['paciente' => $this->historial->clavePaciente((string) ($detalle['numDocumentoIdentificacion'] ?? '')),
+                'fecha' => substr((string) ($detalle['fechaAtencion'] ?? ''), 0, 10), 'cantidad' => $cantidad];
 
             return;
         }
@@ -1028,13 +1036,15 @@ final class ValorizacionAdministrativa
             ['RN-BASE', 'Ventana histórica', 'Tres meses más recientes anteriores al mes valorizado; precio = mediana de registros positivos. Sin datos recientes se usan los tres meses anteriores disponibles y se señala.'],
             ['RN-BASE', 'Estados y totales', 'Respaldada · Estimada · Condicionada · Incluida · Sin valorización. Estimación central = lo que suma. Componente condicionado = valores sin evidencia suficiente (no suma a la central). Alternativas de unidad e importes informativos no se suman a ningún total.'],
             ['RN-02', 'AP según esquema real', 'Cada CUPS integral se valora con la clase de precio histórica de su esquema: los precios del informe se agrupan por valor y por los medicamentos anotados (columna MEDICAMENTO). La asociación de medicamentos RIPS requiere paciente, mes y factura compartida; la coincidencia mensual sola queda condicionada. Si el histórico tiene un solo precio por CUPS, no se inventan tarifas distintas para sus medicamentos.'],
-            ['RN-03', 'Asignación del esquema', 'La clase se asigna con los medicamentos del mismo caso, factura y fecha del AP: el medicamento distintivo de una clase (p. ej. pembrolizumab) la determina; un medicamento que solo figura en la composición de una clase la determina; con medicamentos del CUPS sin distintivo de otra clase se usa la clase base. Si el distintivo de una clase de mayor precio está en otra fecha de la misma factura dentro de otra sesión integral del mismo CUPS y la sesión registra medicamentos del CUPS, la sesión pertenece a esa serie del esquema (patrón del historial administrativo). Si ese distintivo está en otra fecha sin esa evidencia, el esquema queda indeterminado: precio provisional de la clase de la fecha en la central y diferencia con la clase de mayor precio como componente condicionado. Sin evidencia en la fecha, o con varios esquemas posibles: precio base en la central y diferencia con la mezcla histórica como componente condicionado.'],
+            ['RN-03', 'Asignación del esquema', 'La clase se asigna con los medicamentos del mismo caso, factura y fecha del AP: el medicamento distintivo de una clase (p. ej. pembrolizumab) la determina; un medicamento que solo figura en la composición de una clase la determina; con medicamentos del CUPS sin distintivo de otra clase se usa la clase base, solo si es la única clase sin distintivos. Si los medicamentos no distinguen la clase, se estima con la clase dominante del historial comparable (mismo CUPS, programa, ventana y valor por registro) solo con al menos 10 registros y 80 % de participación. Si el distintivo de una clase de mayor precio está en otra fecha de la misma factura dentro de otra sesión integral del mismo CUPS y la sesión registra medicamentos del CUPS, la sesión pertenece a esa serie del esquema (patrón del historial administrativo). Si ese distintivo está en otra fecha sin esa evidencia, el esquema queda indeterminado: precio provisional de la clase de la fecha en la central y diferencia con la clase de mayor precio como componente condicionado. Sin evidencia ni clase dominante, o con varios esquemas posibles: precio base provisional en la central y diferencia con la mezcla histórica como componente condicionado.'],
 
             ['RN-04', 'Medicamentos oncológicos', 'La composición histórica relaciona medicamento y CUPS integral; los de otro esquema se valoran como AM independiente. La relación con el mismo CUPS exige RN-14 para demostrar cobertura económica.'],
             ['RN-05', 'Demás procedimientos', 'Con tarifa aplicable: costo A. Sin tarifa o con regla pendiente: mediana administrativa por registro cuando la unidad es compatible.'],
-            ['RN-06', 'AT', 'Solo transporte y albergue identificados por código y descripción pueden tener valoración AT independiente con precio histórico y unidad compatible. La base (registro o unidad) compara la mediana de filas administrativas de la ventana anterior con la actividad RIPS del código; fuera de 0,5 a 2 veces queda condicionada. Los demás AT sin tarifa acreditada permanecen pendientes y no suman aparte; los absorbidos en AH tampoco.'],
+            ['RN-06', 'AT', 'Solo transporte y albergue identificados por código y descripción pueden tener valoración AT independiente con precio histórico y unidad compatible. La base (registro o unidad) compara la mediana de filas administrativas de la ventana anterior con la actividad RIPS del código; fuera de 0,5 a 2 veces queda condicionada. Los demás AT sin tarifa acreditada permanecen pendientes y no suman aparte; los absorbidos en AH tampoco, salvo el transporte, que el historial administrativo cobra aparte aunque ocurra durante la estancia.'],
+
             ['RN-07', 'AU', 'No suma. Sus componentes ya están en AC/AP/AM; la atribución se muestra como informativa.'],
-            ['RN-08', 'Radioterapia', 'Se conservan por separado: por registro (metodología administrativa) como componente condicionado y por tratamiento (un tratamiento por caso-mes × tarifa de la nota) como alternativa. No se mezclan unidades.'],
+            ['RN-08', 'Radioterapia', 'Se conservan por separado: por registro (metodología administrativa) y por tratamiento (un tratamiento por caso-mes × tarifa de la nota) como alternativa no aditiva. Un registro suma a la central solo con correspondencia documentada: con el informe del mismo mes, una fila administrativa del mismo paciente, fecha y código (1:1); sin ese informe, la ventana debe mostrar una fila por paciente y fecha y el registro no puede repetirse ni superar el máximo histórico por paciente-mes. Los demás registros quedan condicionados. No se mezclan unidades.'],
+
             ['RN-AM', 'A · B · C · D', 'A: costo A. B: incluido en tratamiento integral. C: cantidad × mediana del precio unitario de dispensación del mismo CUM en meses anteriores (sin tarifa contractual). Si el único precio es la dispensación del mismo paciente, CUM y mes, es el registro del propio evento: queda condicionado y no suma. D: sin presentación o cantidad: no se valoriza.'],
             ['RN-11', 'Conciliación de medicamentos', 'Una línea AM es un registro, no una unidad. Su cantidad RIPS se conserva por separado; solo la presentación CUM resuelta con precio unitario compatible admite cantidad × precio. Los medicamentos incluidos en AP integral o AH no vuelven a sumar en AM. Un conteo administrativo externo exige identificación de su filtro antes de compararlo.'],
             ['RN-12', 'Conciliación AC/AT por código y unidad', 'Se exponen registros, unidades, base de cobro y precio histórico por código. AC conserva costo A, AH sigue RN-16; AT solo usa la unidad históricamente comparable. Un total administrativo agregado no crea una tarifa ni modifica el costo A.'],
@@ -1044,7 +1054,7 @@ final class ValorizacionAdministrativa
         ];
 
         foreach ($this->historial->fuentes() as $fuente) {
-            $filas[] = ['FUENTE', $fuente['archivo'], sprintf('Hoja %s · programa %s · %s filas · meses %s. Solo se leyeron mes, tipo, código, descripción, diagnóstico, medicamento del esquema y valor.',
+            $filas[] = ['FUENTE', $fuente['archivo'], sprintf('Hoja %s · programa %s · %s filas · meses %s. Solo se leyeron mes, tipo, código, descripción, diagnóstico, medicamento del esquema y valor; documento y fecha solo como clave seudónima en memoria.',
                 HistorialAdministrativo::HOJA, $fuente['ruta'], number_format($fuente['filas'], 0, ',', '.'), $fuente['meses'])];
         }
 
@@ -1450,8 +1460,16 @@ final class ValorizacionAdministrativa
                 0, array_map('strval', array_keys($porComposicion[0]['composicion'])), $evidencia];
         }
 
-        if ($candidatas === [] && $bases !== [] && array_intersect($medicamentos, $todos) !== []) {
+        // La ausencia de distintivos identifica la clase base solo si una única clase carece de ellos.
+        if ($candidatas === [] && count($bases) === 1 && array_intersect($medicamentos, $todos) !== []) {
             return [$base, 'MEDICAMENTOS DEL CUPS SIN DISTINTIVO DE OTRO ESQUEMA', 0, array_map('strval', array_keys($base['composicion'])), $evidencia];
+        }
+
+        $dominante = $candidatas === [] ? self::claseDominante($clases) : null;
+
+        if ($dominante !== null) {
+            return [$dominante, sprintf('CLASE DOMINANTE (%s %% DE %d REGISTROS HISTORICOS COMPARABLES)', number_format($dominante['participacion'] * 100, 1, ',', '.'),
+                array_sum(array_column($clases, 'registros'))), 0, array_map('strval', array_keys($dominante['composicion'])), $evidencia];
         }
 
         $mezcla = array_sum(array_map(static fn (array $clase): float => $clase['precio'] * $clase['participacion'], $clases));
@@ -1460,6 +1478,22 @@ final class ValorizacionAdministrativa
         return [$base, $candidatas === [] ? 'SIN EVIDENCIA DEL ESQUEMA (BASE + MEZCLA CONDICIONADA)' : 'VARIOS ESQUEMAS POSIBLES (BASE + MEZCLA CONDICIONADA)',
             max(0, ResumenEconomico::centavos($mezcla - $base['precio'])), $todos, $evidencia,
             array_values(array_unique(array_merge([], ...array_map(static fn (array $clase): array => array_map('strval', $clase['distintivos']), $candidatas))))];
+    }
+
+    /**
+     * Clase que domina el historial comparable del CUPS (mismo programa, ventana y valor por
+     * registro): al menos 10 registros y 80 % de participación. Sin esa predominancia no hay
+     * precio representativo y el registro queda con precio provisional y diferencia condicionada.
+     *
+     * @param  list<array{precio: float, registros: int, participacion: float, composicion: array<string, float>, distintivos: list<string>, ejemplo: string}>  $clases
+     * @return array<string, mixed>|null
+     */
+    private static function claseDominante(array $clases): ?array
+    {
+        $dominante = array_reduce($clases, static fn (?array $mayor, array $clase): array => $mayor === null || $clase['registros'] > $mayor['registros'] ? $clase : $mayor);
+
+        return $dominante !== null && array_sum(array_column($clases, 'registros')) >= self::OBSERVACIONES_DOMINANTE
+            && $dominante['participacion'] >= self::PARTICIPACION_DOMINANTE ? $dominante : null;
     }
 
     /**
@@ -1515,16 +1549,79 @@ final class ValorizacionAdministrativa
             $porRegistro = $precio['mediana'] ?? ($this->radioterapia[$radio['codigo']] ?? 0.0);
             $porTratamiento = $this->radioterapia[$radio['codigo']] ?? $porRegistro;
             $casos = count($radio['casos']);
-            $linea = [...$radio, 'cantidad' => $radio['unidades'], 'costoA' => 0];
+            $linea = [...$radio, 'costoA' => 0];
+            [$demostradas, $evidencia] = $precio === null ? [[], 'Sin historial administrativo del código.'] : $this->radioterapiaDemostrada($radio);
+            $unidades = (float) array_sum(array_column($demostradas, 'cantidad'));
 
-            $this->agregar($linea, self::CONDICIONADA, false, 'RADIOTERAPIA · POR REGISTRO', $precio === null ? 'NOTA TECNICA' : 'INFORME ADMINISTRATIVO (MEDIANA POR REGISTRO)',
-                'El administrativo valora cada registro como un tratamiento; el RIPS puede registrar sesiones. Equivalencia no demostrada.',
-                $precio, 0, ResumenEconomico::centavos($radio['registros'] * $porRegistro), 'REGISTRO', registros: $radio['registros']);
+            if ($demostradas !== []) {
+                $this->agregar([...$linea, 'cantidad' => $unidades], self::ESTIMADA, true, 'RADIOTERAPIA · POR REGISTRO', 'INFORME ADMINISTRATIVO (MEDIANA POR REGISTRO)',
+                    $evidencia, $precio, 0, ResumenEconomico::centavos(count($demostradas) * $porRegistro), 'REGISTRO', registros: count($demostradas));
+            }
+
+            if (count($demostradas) < $radio['registros']) {
+                $pendientes = $radio['registros'] - count($demostradas);
+                $this->agregar([...$linea, 'cantidad' => $radio['unidades'] - $unidades], self::CONDICIONADA, false, 'RADIOTERAPIA · POR REGISTRO',
+                    $precio === null ? 'NOTA TECNICA' : 'INFORME ADMINISTRATIVO (MEDIANA POR REGISTRO)',
+                    $evidencia.' Registros sin correspondencia demostrada: el RIPS puede registrar sesiones o repetir el servicio.',
+                    $precio, 0, ResumenEconomico::centavos($pendientes * $porRegistro), 'REGISTRO', registros: $pendientes);
+            }
             $this->agregar([...$linea, 'cantidad' => (float) $casos], self::CONDICIONADA, false, 'RADIOTERAPIA · POR TRATAMIENTO',
                 'NOTA TECNICA (TARIFA POR TRATAMIENTO)', sprintf('Alternativa: un tratamiento por caso-mes (%d casos) × tarifa de la nota $%s. No se suma con la valoración por registro.',
                     $casos, number_format($porTratamiento, 2, ',', '.')),
                 null, 0, ResumenEconomico::centavos($casos * $porTratamiento), 'TRATAMIENTO', registros: 0, claseNoAditivo: self::NO_ADITIVO_ALTERNATIVA);
         }
+    }
+
+    /**
+     * RN-08: registros de radioterapia con unidad económica demostrada. Con el informe del
+     * mismo mes, cada registro necesita una fila administrativa del mismo paciente, fecha y
+     * código (1:1). Sin ese informe, la ventana debe mostrar una fila por paciente y fecha;
+     * los registros repetidos o por encima del máximo histórico por paciente-mes no se demuestran.
+     *
+     * @param  array<string, mixed>  $radio
+     * @return array{0: list<array{paciente: string, fecha: string, cantidad: float}>, 1: string}
+     */
+    private function radioterapiaDemostrada(array $radio): array
+    {
+        $lineas = array_values(array_filter($radio['lineas'], static fn (array $linea): bool => $linea['paciente'] !== '' && $linea['fecha'] !== ''));
+        $servicios = $this->historial->serviciosDelMes($this->ruta, $radio['mes'], $radio['tipo'], $radio['codigo']);
+        $demostradas = [];
+
+        if ($servicios !== null) {
+            foreach ($lineas as $linea) {
+                if (($servicios[$linea['paciente'].'|'.$linea['fecha']] ?? 0) > 0) {
+                    $servicios[$linea['paciente'].'|'.$linea['fecha']]--;
+                    $demostradas[] = $linea;
+                }
+            }
+
+            return [$demostradas, sprintf('Correspondencia documentada del mismo mes: %d de %d registros con fila administrativa del mismo paciente, fecha y código.',
+                count($demostradas), $radio['registros'])];
+        }
+
+        $unidad = $this->historial->unidadPorPaciente($this->ruta, $radio['mes'], $radio['tipo'], $radio['codigo']);
+
+        if ($unidad === null || $unidad['porFecha'] !== 1) {
+            return [[], $unidad === null
+                ? 'Sin informe del mes ni servicios identificados en la ventana: unidad por registro no demostrada.'
+                : 'La ventana registra más de una fila por paciente y fecha: unidad por registro no demostrada.'];
+        }
+
+        $vistos = [];
+        $porPaciente = [];
+
+        foreach ($lineas as $linea) {
+            if (isset($vistos[$linea['paciente'].'|'.$linea['fecha']]) || ($porPaciente[$linea['paciente']] ?? 0) >= $unidad['porPacienteMes']) {
+                continue;
+            }
+
+            $vistos[$linea['paciente'].'|'.$linea['fecha']] = true;
+            $porPaciente[$linea['paciente']] = ($porPaciente[$linea['paciente']] ?? 0) + 1;
+            $demostradas[] = $linea;
+        }
+
+        return [$demostradas, sprintf('Sin informe del mes: la ventana %s registra una fila por paciente y fecha y hasta %d por paciente-mes; %d de %d registros cumplen esa unidad sin repetirse.',
+            implode(', ', $unidad['meses']), $unidad['porPacienteMes'], count($demostradas), $radio['registros'])];
     }
 
     /**

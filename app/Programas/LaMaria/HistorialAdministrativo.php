@@ -9,8 +9,10 @@ use OpenSpout\Reader\XLSX\Reader;
 /**
  * Valores administrativos históricos por tipo RIPS y código, leídos de la hoja
  * «inf admin» de los informes administrativos de La María. Solo conserva mes,
- * tipo, código, descripción, medicamento del esquema y valor: ningún dato
- * personal sale del archivo.
+ * tipo, código, descripción, medicamento del esquema y valor; documento y fecha
+ * solo como clave seudónima en memoria (HMAC con semilla aleatoria por
+ * instancia) para verificar la correspondencia de prestación con los RIPS.
+ * Ningún dato personal sale del archivo.
  *
  * Cada fila administrativa es un registro con su valor; el informe no trae
  * cantidades, por eso el precio observado es un valor por registro.
@@ -35,6 +37,12 @@ final class HistorialAdministrativo
 
     /** @var array<string, true> Huellas sha256 de los archivos ya leídos. */
     private array $huellas = [];
+
+    /** @var array<string, array<string, array<string, array<string, int>>>> ruta => tipo|codigo => mes => paciente|fecha => filas con valor */
+    private array $servicios = [];
+
+    /** Semilla de las claves seudónimas; vive solo en memoria. */
+    private ?string $semilla = null;
 
     /**
      * Medicamentos anotados por registro administrativo (columna MEDICAMENTO):
@@ -81,9 +89,11 @@ final class HistorialAdministrativo
         return $this->fuentes[array_key_last($this->fuentes)]['ruta'];
     }
 
-    public function registrar(string $ruta, string $mes, string $tipo, string $codigo, float $valor, string $descripcion = '', string $medicamento = ''): void
+    public function registrar(string $ruta, string $mes, string $tipo, string $codigo, float $valor, string $descripcion = '', string $medicamento = '',
+        string $fecha = '', string $documento = ''): void
     {
         $clave = $tipo.'|'.$codigo;
+        $this->registrarServicio($ruta, $mes, $tipo, $codigo, $valor, $fecha, $this->clavePaciente($documento));
 
         if (trim($medicamento) !== '') {
             $this->composiciones[$ruta][$clave][$mes][] = [$valor, self::tokens($medicamento), mb_substr(mb_strtoupper(trim($medicamento)), 0, 80)];
@@ -96,6 +106,59 @@ final class HistorialAdministrativo
         if ($descripcion !== '') {
             $this->descripciones[$clave] ??= $descripcion;
         }
+    }
+
+    /** Clave seudónima del documento, comparable entre el informe y los RIPS de esta instancia. */
+    public function clavePaciente(string $documento): string
+    {
+        $documento = ltrim(trim($documento), '0');
+        $this->semilla ??= random_bytes(16);
+
+        return $documento === '' ? '' : substr(hash_hmac('sha256', $documento, $this->semilla), 0, 20);
+    }
+
+    /**
+     * Filas con valor del código en el mes por paciente y fecha, para la
+     * correspondencia documentada con los RIPS. Null si el informe no cubre el mes.
+     *
+     * @return array<string, int>|null
+     */
+    public function serviciosDelMes(string $ruta, string $mes, string $tipo, string $codigo): ?array
+    {
+        return isset($this->totales[$ruta][$mes]) ? ($this->servicios[$ruta][$tipo.'|'.$codigo][$mes] ?? []) : null;
+    }
+
+    /**
+     * Unidad histórica por paciente en la ventana: máximo de filas con valor del
+     * código por paciente y fecha, y por paciente y mes.
+     *
+     * @return array{meses: list<string>, porFecha: int, porPacienteMes: int}|null
+     */
+    public function unidadPorPaciente(string $ruta, string $mes, string $tipo, string $codigo): ?array
+    {
+        $porMes = $this->servicios[$ruta][$tipo.'|'.$codigo] ?? [];
+        $meses = array_values(array_intersect($this->ventana($ruta, $mes), array_keys($porMes)));
+
+        if ($meses === []) {
+            return null;
+        }
+
+        $porFecha = 0;
+        $porPacienteMes = 0;
+
+        foreach ($meses as $m) {
+            $pacientes = [];
+
+            foreach ($porMes[$m] as $servicio => $filas) {
+                $porFecha = max($porFecha, $filas);
+                $paciente = (string) strstr($servicio, '|', true);
+                $pacientes[$paciente] = ($pacientes[$paciente] ?? 0) + $filas;
+            }
+
+            $porPacienteMes = max($porPacienteMes, max($pacientes));
+        }
+
+        return ['meses' => $meses, 'porFecha' => $porFecha, 'porPacienteMes' => $porPacienteMes];
     }
 
     public function tieneDatos(string $ruta): bool
@@ -358,6 +421,14 @@ final class HistorialAdministrativo
         return $n % 2 === 1 ? (float) $valores[intdiv($n, 2)] : ($valores[$n / 2 - 1] + $valores[$n / 2]) / 2;
     }
 
+    private function registrarServicio(string $ruta, string $mes, string $tipo, string $codigo, float $valor, string $fecha, string $paciente): void
+    {
+        if ($valor > 0 && $paciente !== '' && $fecha !== '') {
+            $servicio = $paciente.'|'.$fecha;
+            $this->servicios[$ruta][$tipo.'|'.$codigo][$mes][$servicio] = ($this->servicios[$ruta][$tipo.'|'.$codigo][$mes][$servicio] ?? 0) + 1;
+        }
+    }
+
     private function leerArchivo(string $ruta, string $nombre): void
     {
         $reader = new Reader;
@@ -400,7 +471,9 @@ final class HistorialAdministrativo
                     $diagnosticos['CERVIX'] += str_starts_with($diagnostico, 'C53') ? 1 : 0;
                     $filas[] = [$mes, $tipo, $codigo, self::numero($valores[$columnas['valor']] ?? 0),
                         $columnas['descripcion'] === null ? '' : trim((string) ($valores[$columnas['descripcion']] ?? '')),
-                        $columnas['medicamento'] === null ? '' : trim((string) ($valores[$columnas['medicamento']] ?? ''))];
+                        $columnas['medicamento'] === null ? '' : trim((string) ($valores[$columnas['medicamento']] ?? '')),
+                        self::dia($valores[$columnas['fecha']] ?? null),
+                        $columnas['documento'] === null ? '' : $this->clavePaciente((string) ($valores[$columnas['documento']] ?? ''))];
                 }
             }
         } finally {
@@ -413,7 +486,8 @@ final class HistorialAdministrativo
             : ($diagnosticos['PROSTATA'] > $diagnosticos['CERVIX'] ? 'PROSTATA' : 'CERVIX');
         $meses = [];
 
-        foreach ($filas as [$mes, $tipo, $codigo, $valor, $descripcion, $medicamento]) {
+        foreach ($filas as [$mes, $tipo, $codigo, $valor, $descripcion, $medicamento, $fecha, $paciente]) {
+            $this->registrarServicio($rutaPrograma, $mes, $tipo, $codigo, $valor, $fecha, $paciente);
             $this->registrar($rutaPrograma, $mes, $tipo, $codigo, $valor, $descripcion, $medicamento);
             $meses[$mes] = true;
         }
@@ -428,7 +502,7 @@ final class HistorialAdministrativo
      * tienen en posiciones distintas.
      *
      * @param  array<int, mixed>  $encabezado
-     * @return array{codigo: int, tipo: int, valor: int, fecha: int, descripcion: int|null, diagnostico: int|null, medicamento: int|null}|null
+     * @return array{codigo: int, tipo: int, valor: int, fecha: int, descripcion: int|null, diagnostico: int|null, medicamento: int|null, documento: int|null}|null
      */
     private static function columnas(array $encabezado): ?array
     {
@@ -450,6 +524,7 @@ final class HistorialAdministrativo
             'descripcion' => $buscar('DESCRIPCION DEL SERVICIO'),
             'diagnostico' => $buscar('DIACODIGO'),
             'medicamento' => $buscar('MEDICAMENTO'),
+            'documento' => $buscar('DOCUMENTO'),
         ];
 
         return in_array(null, [$columnas['codigo'], $columnas['tipo'], $columnas['valor'], $columnas['fecha']], true) ? null : $columnas;
@@ -465,6 +540,17 @@ final class HistorialAdministrativo
         $texto = $fecha instanceof DateTimeInterface ? $fecha->format('Y-m') : substr(trim((string) $fecha), 0, 7);
 
         return preg_match('/^\d{4}-\d{2}$/', $texto) === 1 ? $texto : '';
+    }
+
+    private static function dia(mixed $fecha): string
+    {
+        if ((is_int($fecha) || is_float($fecha)) && $fecha > 20000 && $fecha < 80000) {
+            return (new DateTimeImmutable('1899-12-30'))->modify('+'.(int) $fecha.' days')->format('Y-m-d');
+        }
+
+        $texto = $fecha instanceof DateTimeInterface ? $fecha->format('Y-m-d') : substr(trim((string) $fecha), 0, 10);
+
+        return preg_match('/^\d{4}-\d{2}-\d{2}$/', $texto) === 1 ? $texto : '';
     }
 
     private static function numero(mixed $valor): float

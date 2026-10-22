@@ -748,6 +748,122 @@ class ValorizacionAdministrativaTest extends TestCase
         $this->assertSame([0.0, 35411904.0], [$ap[5], $ap[6]], 'Solo la valoración por registro entra al componente condicionado; la alternativa no se mezcla.');
     }
 
+    public function test_radiotherapy_record_needs_documented_correspondence_in_the_same_month_not_a_volume_ratio(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        // Ventana con nueve filas por mes (otros pacientes): la razón 9/5 no decide nada.
+        foreach (['2026-04', '2026-05', '2026-06'] as $mes) {
+            for ($i = 1; $i <= 9; $i++) {
+                $historial->registrar('CERVIX', $mes, 'AP', '922444', 8852976.0, '', '', $mes.'-1'.$i, 'X'.$i.$mes);
+            }
+        }
+
+        // Julio en el informe: cuatro filas del mismo paciente, fecha y código que los RIPS.
+        foreach (['A' => '2026-07-02', 'B' => '2026-07-09', 'C' => '2026-07-16', 'D' => '2026-07-23'] as $documento => $fecha) {
+            $historial->registrar('CERVIX', '2026-07', 'AP', '922444', 8852976.0, '', '', $fecha, $documento);
+        }
+
+        $nota = [['codigo' => '922444', 'categoria' => 'ONCOLOGIA_RADIOTERAPIA', 'tarifaReferencia' => 8852976.0, 'metadatos' => []]];
+        $valorizacion = new ValorizacionAdministrativa('CERVIX', $historial, $nota, static fn (string $cum): array => []);
+
+        foreach ([['A', '2026-07-02'], ['B', '2026-07-09'], ['C', '2026-07-16'], ['D', '2026-07-23'], ['E', '2026-07-23']] as [$documento, $fecha]) {
+            $valorizacion->registrar($this->detalle('procedimientos', '922444', 1.0, ['mesAtencion' => '2026-07', 'casoId' => $documento,
+                'numDocumentoIdentificacion' => '00'.$documento, 'fechaAtencion' => $fecha.' 08:00', 'tipoValorReferencia' => 'TARIFA_TRATAMIENTO_PENDIENTE']), ['respaldado' => 0.0]);
+        }
+
+        $ap = collect($valorizacion->resumenServicios('2026-07')['filas'])->keyBy(0)['AP'];
+        $estimada = collect($valorizacion->filasDetalle())->first(static fn (array $fila): bool => $fila[6] === 'RADIOTERAPIA · POR REGISTRO' && $fila[4] === ValorizacionAdministrativa::ESTIMADA);
+        $tratamiento = collect($valorizacion->filasCondicionadas())->firstWhere(6, 'RADIOTERAPIA · POR TRATAMIENTO');
+
+        // Cuatro registros con fila 1:1 suman; el quinto (sin fila administrativa) queda condicionado.
+        $this->assertSame([0.0, 35411904.0, 8852976.0], [$ap[3], $ap[4], $ap[6]]);
+        $this->assertSame([4, 'SI'], [$estimada[7], $estimada[5]]);
+        $this->assertStringContainsString('4 de 5 registros con fila administrativa del mismo paciente, fecha y código', $estimada[20]);
+        $this->assertSame([44264880.0, ValorizacionAdministrativa::NO_ADITIVO_ALTERNATIVA], [$tratamiento[18], $tratamiento[21]]);
+    }
+
+    public function test_radiotherapy_without_the_month_report_uses_the_historical_unit_per_patient_and_rejects_repetitions(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
+            foreach (['P1', 'P2', 'P3'] as $n => $documento) {
+                $historial->registrar('CERVIX', $mes, 'AP', '922444', 8852976.0, '', '', $mes.'-0'.($n + 1), $documento.$mes);
+            }
+        }
+
+        $nota = [['codigo' => '922444', 'categoria' => 'ONCOLOGIA_RADIOTERAPIA', 'tarifaReferencia' => 8852976.0, 'metadatos' => []]];
+        $valorizacion = new ValorizacionAdministrativa('CERVIX', $historial, $nota, static fn (string $cum): array => []);
+
+        // A repite paciente-mes, C repite la misma fecha y D no trae documento.
+        foreach ([['A', '2026-09-02'], ['A', '2026-09-20'], ['B', '2026-09-05'], ['C', '2026-09-08'], ['C', '2026-09-08'], ['', '2026-09-10']] as [$documento, $fecha]) {
+            $valorizacion->registrar($this->detalle('procedimientos', '922444', 1.0, ['casoId' => $documento ?: 'D',
+                'numDocumentoIdentificacion' => $documento, 'fechaAtencion' => $fecha.' 08:00', 'tipoValorReferencia' => 'TARIFA_TRATAMIENTO_PENDIENTE']), ['respaldado' => 0.0]);
+        }
+
+        $ap = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0)['AP'];
+        $estimada = collect($valorizacion->filasDetalle())->first(static fn (array $fila): bool => $fila[6] === 'RADIOTERAPIA · POR REGISTRO' && $fila[4] === ValorizacionAdministrativa::ESTIMADA);
+
+        $this->assertSame([26558928.0, 26558928.0], [$ap[4], $ap[6]]);
+        $this->assertStringContainsString('una fila por paciente y fecha y hasta 1 por paciente-mes; 3 de 6 registros', $estimada[20]);
+    }
+
+    public function test_undistinguished_integral_uses_the_dominant_class_only_with_enough_comparable_records(): void
+    {
+        $valorizacion = $this->valorizacionClases(['ABIRATERONA' => 6, 'ENZALUTAMIDA' => 6, 'LEUPROLIDE' => 4, 'DOCETAXEL' => 4], 2);
+        $caso = ['mesAtencion' => '2026-09', 'factura' => 'F1'];
+
+        $valorizacion->registrar($this->detalle('procedimientos', '992505', 1.0, [...$caso, 'casoId' => 'P1', 'fechaAtencion' => '2026-09-03 08:00']), ['respaldado' => 444690.0]);
+        $valorizacion->registrar($this->detalle('procedimientos', '992505', 1.0, [...$caso, 'casoId' => 'P2', 'fechaAtencion' => '2026-09-04 08:00']), ['respaldado' => 444690.0]);
+        $valorizacion->registrar($this->detalle('medicamentos', 'LEUP', 1.0, [...$caso, 'casoId' => 'P2', 'fechaAtencion' => '2026-09-04 09:00',
+            'principioActivo' => 'LEUPRORELINA', 'cumResuelto' => 'CUM-LEUP']), ['respaldado' => 0.0]);
+
+        $tratamientos = collect($valorizacion->filasTratamientos());
+
+        // Sin medicamento y con leuprorelina (presente en ambas clases): la clase con 20 de 22 registros representa el CUPS.
+        $this->assertSame([7965668.98], $tratamientos->pluck(6)->unique()->values()->all());
+        $this->assertSame(15931337.96, $tratamientos->sum(8));
+        $this->assertSame(0.0, $tratamientos->sum(9));
+        $this->assertSame(['CLASE DOMINANTE (90,9 % DE 22 REGISTROS HISTORICOS COMPARABLES)'], $tratamientos->pluck(3)->unique()->values()->all());
+    }
+
+    public function test_without_a_clear_dominant_class_the_integral_stays_provisional_and_conditioned(): void
+    {
+        $valorizacion = $this->valorizacionClases(['ABIRATERONA' => 3, 'ENZALUTAMIDA' => 3], 3);
+        $valorizacion->registrar($this->detalle('procedimientos', '992505', 1.0, ['casoId' => 'P1', 'factura' => 'F1', 'fechaAtencion' => '2026-09-03 08:00']), ['respaldado' => 444690.0]);
+
+        [$tratamiento] = $valorizacion->filasTratamientos();
+
+        // Nueve registros (6 frente a 3): sin predominancia suficiente ni precio máximo por defecto.
+        $this->assertSame(['SIN EVIDENCIA DEL ESQUEMA (BASE + MEZCLA CONDICIONADA)', 2400267.86], [$tratamiento[3], $tratamiento[8]]);
+        $this->assertSame(3710452.93, $tratamiento[9]);
+    }
+
+    public function test_transport_absorbed_by_the_hospital_package_is_valued_as_the_administrative_history_bills_it(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
+            $historial->registrar('PROSTATA', $mes, 'AT', '601T01', 304438.22, 'TRASLADO ASISTENCIAL BASICO');
+            $historial->registrar('PROSTATA', $mes, 'AT', '601T01', 304438.22, 'TRASLADO ASISTENCIAL BASICO');
+            $historial->registrar('PROSTATA', $mes, 'AT', 'DM00114', 5000.0);
+        }
+
+        $valorizacion = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $absorbida = ['decisionPaquete' => 'INCLUIDO_EN_PAQUETE'];
+        $valorizacion->registrar($this->detalle('otrosServicios', '601T01', 1.0, $absorbida), ['respaldado' => 0.0]);
+        $valorizacion->registrar($this->detalle('otrosServicios', '601T01', 1.0, $absorbida), ['respaldado' => 0.0]);
+        $valorizacion->registrar($this->detalle('otrosServicios', 'DM00114', 3.0, $absorbida), ['respaldado' => 0.0]);
+
+        $at = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0)['AT'];
+        $detalle = collect($valorizacion->filasDetalle());
+
+        $this->assertSame([3, 0.0, 608876.44], [$at[2], $at[3], $at[4]]);
+        $this->assertSame(ValorizacionAdministrativa::ESTIMADA, $detalle->firstWhere(2, '601T01')[4]);
+        $this->assertSame([ValorizacionAdministrativa::INCLUIDA, 'INCLUIDO EN PAQUETE HOSPITALARIO AH'], [$detalle->firstWhere(2, 'DM00114')[4], $detalle->firstWhere(2, 'DM00114')[6]]);
+    }
+
     public function test_without_administrative_history_only_cost_a_and_medication_history_are_used(): void
     {
         $valorizacion = new ValorizacionAdministrativa('CERVIX', new HistorialAdministrativo, [], static fn (string $cum): array => []);
@@ -782,6 +898,32 @@ class ValorizacionAdministrativaTest extends TestCase
         }
 
         return new ValorizacionAdministrativa('CERVIX', $historial, $this->notaCervix(), $precios);
+    }
+
+    /**
+     * Historial del 992505 de Próstata con una clase a $7.965.668,98 (medicamentos dados) y otra
+     * de leuprolide a $2.400.267,86, sin medicamentos distintivos.
+     *
+     * @param  array<string, int>  $dominante  Medicamento => registros mensuales repartidos en la ventana.
+     */
+    private function valorizacionClases(array $dominante, int $minoritaria): ValorizacionAdministrativa
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach ($dominante as $medicamento => $registros) {
+            for ($i = 0; $i < $registros; $i++) {
+                $historial->registrar('PROSTATA', ['2026-06', '2026-07', '2026-08'][$i % 3], 'AP', '992505', 7965668.98, '', $medicamento);
+            }
+        }
+
+        for ($i = 0; $i < $minoritaria; $i++) {
+            $historial->registrar('PROSTATA', '2026-07', 'AP', '992505', 2400267.86, '', 'LEUPROLIDE 45MG');
+        }
+
+        $nota = [['codigo' => '992505', 'categoria' => 'ONCOLOGIA_QUIMIOTERAPIA', 'tarifaReferencia' => 444690.0,
+            'metadatos' => ['tarifa_medicamento' => 7520978.98, 'esquema' => self::ESQUEMA]]];
+
+        return new ValorizacionAdministrativa('PROSTATA', $historial, $nota, static fn (string $cum): array => []);
     }
 
     /** @return list<array<string, mixed>> */
