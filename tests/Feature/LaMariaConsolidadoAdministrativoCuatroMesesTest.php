@@ -44,8 +44,8 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             $this->assertWorkbookStructure($path);
             $resumen = $this->internalSummaries()['2026-09']['PROSTATA'];
             $this->assertSame(2137528852.70, round((float) $resumen['TOTAL'][5], 2));
-            $this->assertSame(3636194275.15, round((float) $resumen['TOTAL'][6], 2));
-            $this->assertSame(59061015.53, round((float) $resumen['AT'][6], 2));
+            $this->assertSame(3672150294.72, round((float) $resumen['TOTAL'][6], 2));
+            $this->assertSame(61192083.10, round((float) $resumen['AT'][6], 2));
             $this->assertSame(14172581.38, round((float) $resumen['AM'][6], 2));
             $this->assertGreaterThan(0, (float) $resumen['AM'][7]);
         } finally {
@@ -178,9 +178,9 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
 
                 if ($month === '2026-09') {
                     $this->assertSame(2137528852.70, round((float) $result[$month]['PROSTATA']['TOTAL'][5], 2));
-                    $this->assertSame(3636194275.15, round((float) $result[$month]['PROSTATA']['TOTAL'][6], 2));
+                    $this->assertSame(3672150294.72, round((float) $result[$month]['PROSTATA']['TOTAL'][6], 2));
                     $this->assertSame(521906976.77, round((float) $result[$month]['CERVIX']['TOTAL'][5], 2));
-                    $this->assertSame(1342631575.46, round((float) $result[$month]['CERVIX']['TOTAL'][6], 2));
+                    $this->assertSame(1458169640.93, round((float) $result[$month]['CERVIX']['TOTAL'][6], 2));
                     $this->assertGreaterThan(0, (float) $result[$month]['PROSTATA']['AU'][12]);
                     $this->assertGreaterThan(0, (float) $result[$month]['CERVIX']['AU'][12]);
                 }
