@@ -1717,9 +1717,10 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->assertSame(5000.0, (float) $comparison['TOTAL']['ESTIMACION ADMINISTRATIVA CENTRAL']);
         $this->assertSame(0.0, (float) $comparison['AU']['ESTIMACION ADMINISTRATIVA CENTRAL']);
         $this->assertSame(5000.0, (float) $comparison['AU']['IMPORTES INFORMATIVOS NO ADITIVOS']);
-        $this->assertSame('AU — Urgencias (atribuido, no aditivo)', (string) $sheet->getCell('A9')->getValue());
-        $this->assertSame(5000.0, (float) $sheet->getCell('B9')->getValue());
-        $this->assertSame(5000.0, (float) $sheet->getCell('B12')->getValue());
+        $this->assertSame('AU — Urgencias (sin cobro propio; no aditivo)', (string) $sheet->getCell('A9')->getValue());
+        $this->assertSame(1, (int) $sheet->getCell('B9')->getValue());
+        $this->assertSame(0.0, (float) $sheet->getCell('D9')->getValue());
+        $this->assertSame(5000.0, (float) $sheet->getCell('D12')->getValue());
         $this->assertSame(4000000000.0, ValorizacionAdministrativa::REFERENCIAS_GERENCIALES['PROSTATA']);
     }
 
@@ -1764,7 +1765,7 @@ class SeguimientoRutaControllerTest extends TestCase
             $filas = $workbook->getSheetByName('SEGUIMIENTO MENSUAL')->toArray(null, true, false);
             $total = array_search('TOTAL DEL MES', array_column($filas, 0), true);
 
-            return array_map(static fn (array $fila): array => [$fila[0], $fila[1]], array_slice($filas, $total + 1, 3));
+            return array_map(static fn (array $fila): array => [$fila[0], $fila[1]], array_slice($filas, $total + 2, 3));
         };
 
         try {

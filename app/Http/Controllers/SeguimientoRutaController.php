@@ -1999,6 +1999,8 @@ class SeguimientoRutaController extends Controller
         array $autonomas, bool $includeRoute = false): void
     {
         $money = (new Style)->setFormat('"$"#,##0.00');
+        $integer = (new Style)->setFormat('#,##0');
+        $quantity = (new Style)->setFormat('#,##0.####');
         $monthlyRows = [];
         $serviceBlocks = [];
 
@@ -2009,7 +2011,8 @@ class SeguimientoRutaController extends Controller
                 $monthlyRows[] = $includeRoute
                     ? [$ruta, $mes, $summary[1], $summary[2], $economic['totales']['estimado']]
                     : [$mes, $summary[1], $summary[2], $economic['totales']['estimado']];
-                $serviceBlocks[] = [$ruta, $mes, $economic];
+                $serviceBlocks[] = [$ruta, $mes, $economic, $valorizaciones[$ruta]->cantidadesEconomicas($mes),
+                    $valorizaciones[$ruta]->consultaUrgencias890701($mes), $valorizaciones[$ruta]->pendientesApPorCausa($mes)];
             }
         }
 
@@ -2017,33 +2020,76 @@ class SeguimientoRutaController extends Controller
             $writer->addRow(Row::fromValuesWithStyles($row, null, [$includeRoute ? 4 : 3 => $money]));
         }
 
-        foreach ($serviceBlocks as [$ruta, $mes, $economic]) {
+        foreach ($serviceBlocks as [$ruta, $mes, $economic, $cantidades, $consultaUrgencias, $pendientesAp]) {
             $writer->addRow(Row::fromValues(['']));
             $writer->addRow(Row::fromValues([($includeRoute ? self::ROUTE_NAMES[$ruta].' · ' : '').$mes]));
-            $writer->addRow(Row::fromValues(['TIPO RIPS / SERVICIO', 'VALOR ADMINISTRATIVO'], $this->headerStyle()));
+            $writer->addRow(Row::fromValues(['TIPO RIPS / SERVICIO', 'REGISTROS RIPS', 'UNIDADES VALORIZADAS', 'VALOR ADMINISTRATIVO'], $this->headerStyle()));
 
             foreach ($economic['filas'] as $service) {
                 if ($service[0] === 'TOTAL' || ! in_array($service[0], ['AC', 'AP', 'AT', 'AU', 'AM', 'AH'], true)) {
                     continue;
                 }
 
-                $value = $service[0] === 'AU' ? (float) $service[9] : (float) $service[4];
-                $label = $service[0].' — '.$service[1].($service[0] === 'AU' ? ' (atribuido, no aditivo)' : '');
-                $writer->addRow(Row::fromValuesWithStyles([$label, $value], null, [1 => $money]));
+                $tipo = (string) $service[0];
+                $label = $tipo.' — '.$service[1].($tipo === 'AU' ? ' (sin cobro propio; no aditivo)' : '');
+                $writer->addRow(Row::fromValuesWithStyles([$label, (int) $service[2], $cantidades[$tipo]['unidades'],
+                    $tipo === 'AU' ? 0.0 : (float) $service[4]], null, [1 => $integer, 2 => $quantity, 3 => $money]));
             }
 
-            $writer->addRow(Row::fromValuesWithStyles(['TOTAL DEL MES', $economic['totales']['estimado']], null, [1 => $money]));
+            $writer->addRow(Row::fromValuesWithStyles(['TOTAL DEL MES', $economic['totales']['registros'], '',
+                $economic['totales']['estimado']], null, [1 => $integer, 3 => $money]));
+            $writer->addRow(Row::fromValuesWithStyles(['COSTO A ACREDITADO (NO SUMA AL ADMINISTRATIVO)', '', '',
+                $economic['totales']['costoA']], null, [3 => $money]));
 
             if (! $historial->cubreMes($ruta, $mes)) {
                 $writer->addRow(Row::fromValues(['FUENTE DEL TOTAL', 'CÁLCULO AUTÓNOMO: RIPS, catálogos, reglas RN-01 a RN-16 y precios históricos anteriores a '.$mes.'; sin informe administrativo del mes.']));
-
-                continue;
+            } else {
+                $autonomo = $autonomas[$ruta]->resumenServicios($mes)['totales']['estimado'];
+                $writer->addRow(Row::fromValues(['FUENTE DEL TOTAL', 'CÁLCULO CON INFORME DEL MES — CONCILIACIÓN PARCIAL: informe administrativo de '.$mes.' (RN-17); solo filas con correspondencia RIPS de paciente, fecha y código. Los importes sin respaldo RIPS no suman y pueden persistir diferencias con los totales externos.']));
+                $writer->addRow(Row::fromValuesWithStyles(['VALOR AUTÓNOMO (SIN INFORME DEL MES)', $autonomo], null, [1 => $money]));
+                $writer->addRow(Row::fromValuesWithStyles(['AJUSTE RESPALDADO POR LA CONCILIACIÓN DEL MES', round($economic['totales']['estimado'] - $autonomo, 2)], null, [1 => $money]));
             }
 
-            $autonomo = $autonomas[$ruta]->resumenServicios($mes)['totales']['estimado'];
-            $writer->addRow(Row::fromValues(['FUENTE DEL TOTAL', 'CÁLCULO CON INFORME DEL MES — CONCILIACIÓN PARCIAL: informe administrativo de '.$mes.' (RN-17); solo filas con correspondencia RIPS de paciente, fecha y código. Los importes sin respaldo RIPS no suman y pueden persistir diferencias con los totales externos.']));
-            $writer->addRow(Row::fromValuesWithStyles(['VALOR AUTÓNOMO (SIN INFORME DEL MES)', $autonomo], null, [1 => $money]));
-            $writer->addRow(Row::fromValuesWithStyles(['AJUSTE RESPALDADO POR LA CONCILIACIÓN DEL MES', round($economic['totales']['estimado'] - $autonomo, 2)], null, [1 => $money]));
+            $writer->addRow(Row::fromValues(['']));
+            $writer->addRow(Row::fromValues(['DETALLE AU (NO ADITIVO)', 'REGISTROS / EPISODIOS', 'UNIDADES RECONOCIDAS', 'VALOR INFORMATIVO'], $this->headerStyle()));
+            $writer->addRow(Row::fromValuesWithStyles(['EPISODIOS AU RIPS', $economic['urgencias']['episodios'], 0, 0.0], null, [1 => $integer, 2 => $integer, 3 => $money]));
+            $writer->addRow(Row::fromValuesWithStyles(['CONSULTA 890701 RIPS (YA VALORADA EN AC)', $consultaUrgencias['rips'],
+                $consultaUrgencias['reconocidas'], $consultaUrgencias['valorAc']], null, [1 => $integer, 2 => $integer, 3 => $money]));
+            $writer->addRow(Row::fromValuesWithStyles(['CONSULTA 890701 EN INFORME DEL MES (REFERENCIA)',
+                $consultaUrgencias['administrativas'] ?? '', $consultaUrgencias['administrativas'] ?? '',
+                $consultaUrgencias['valorAdministrativo'] ?? ''], null, [1 => $integer, 2 => $integer, 3 => $money]));
+            $writer->addRow(Row::fromValuesWithStyles(['TARIFA HISTÓRICA 890701 POR CONSULTA', '', '',
+                $consultaUrgencias['tarifaHistorica'] ?? ''], null, [3 => $money]));
+            $writer->addRow(Row::fromValuesWithStyles(['CONSULTAS 890701 ENLAZADAS A AU (SUBCONJUNTO DE AC)',
+                $consultaUrgencias['enlazadas'], $consultaUrgencias['enlazadas'], $consultaUrgencias['valorEnlazado']], null,
+                [1 => $integer, 2 => $integer, 3 => $money]));
+            $writer->addRow(Row::fromValuesWithStyles(['OTROS SERVICIOS ATRIBUIDOS A AU (YA EN AC/AP/AM)', '', '',
+                round($economic['urgencias']['atribuidoAdministrativo'] - $consultaUrgencias['valorEnlazado'], 2)], null, [3 => $money]));
+            foreach ($consultaUrgencias['sinValor'] as $motivo => $registros) {
+                $writer->addRow(Row::fromValues(['CONSULTA 890701 SIN VALOR INDEPENDIENTE', $registros, '', $motivo]));
+            }
+            $writer->addRow(Row::fromValues(['']));
+            $writer->addRow(Row::fromValues(['ESTADO DE REGISTROS', 'RECONOCIDOS', 'DUPLICADOS', 'INCLUIDOS / CONDICIONADOS-PENDIENTES'], $this->headerStyle()));
+
+            foreach (['AC', 'AP', 'AT', 'AU', 'AM', 'AH'] as $tipo) {
+                $estado = $cantidades[$tipo];
+                $writer->addRow(Row::fromValuesWithStyles([$tipo, $estado['reconocidos'], $estado['duplicados'],
+                    $estado['incluidos'].' / '.$estado['pendientes']], null, [1 => $integer, 2 => $integer]));
+            }
+
+            $writer->addRow(Row::fromValues(['AH: REGISTROS RIPS CON EGRESO', $cantidades['AH']['reconocidos'],
+                'EGRESOS VALORIZADOS (RN-16)', $cantidades['AH']['unidades']]));
+            $writer->addRow(Row::fromValues(['AH: INTERNACIONES SOLO COMO SERVICIO AP',
+                max(0, $cantidades['AH']['unidades'] - $cantidades['AH']['reconocidos']),
+                'Forman parte de los egresos valorizados; no se suman otra vez como AP.', '']));
+            $writer->addRow(Row::fromValues(['AH: REGISTROS INCLUIDOS', $cantidades['AH']['incluidos'],
+                'Cortes 08 o estancias sin cobro independiente; el egreso se valora una sola vez.', '']));
+            $writer->addRow(Row::fromValues(['AP: CONDICIONADO POR POSIBLE INCLUSIÓN EN PAQUETE AH', $pendientesAp['paquete'],
+                'Informe del mes cobra aparte; nota Hx incluye. No suma sin aclaración contractual.', '']));
+            $writer->addRow(Row::fromValues(['AP: SIN TARIFA / OTROS PENDIENTES', $pendientesAp['sinTarifa'],
+                'Otros pendientes: '.$pendientesAp['otros'].'; no equivalen a prestaciones sin RIPS.', '']));
+            $writer->addRow(Row::fromValues(['DEFINICIÓN DE UNIDADES', 'AC/AP: prestaciones reconocidas; AT: base compatible por código; '
+                .'AM: líneas independientes, sin sumar cantidades de presentaciones distintas; AH: egresos; AU: cero unidades independientes.']));
         }
     }
 

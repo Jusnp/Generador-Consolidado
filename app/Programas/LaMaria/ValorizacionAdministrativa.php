@@ -271,6 +271,9 @@ final class ValorizacionAdministrativa
     /** @var array<int, int> Importe aditivo administrativo exacto por línea RIPS. */
     private array $valoracionLinea = [];
 
+    /** @var array<string, array<string, int>> Estado económico de las consultas 890701 por mes. */
+    private array $estadosConsultaUrgencias = [];
+
     /** @var array<string, array<string, int>> mes => concepto => centavos */
     private array $noAditivos = [];
 
@@ -631,6 +634,157 @@ final class ValorizacionAdministrativa
             'conHistorial' => $ventana !== [],
             'meses' => $ventana,
         ];
+    }
+
+    /**
+     * Cantidades para el resumen visible. Una unidad económica de AP o AM es
+     * una prestación reconocida, no la suma de cantidades heterogéneas RIPS.
+     *
+     * @return array<string, array{reconocidos: int, duplicados: int, incluidos: int, pendientes: int, unidades: float, definicion: string}>
+     */
+    public function cantidadesEconomicas(string $mes): array
+    {
+        $this->cerrar();
+        $cantidades = [];
+
+        foreach (self::TIPOS_ORDEN as $tipo) {
+            $cantidades[$tipo] = ['reconocidos' => 0, 'duplicados' => 0, 'incluidos' => 0, 'pendientes' => 0,
+                'unidades' => 0.0, 'definicion' => 'prestaciones reconocidas'];
+        }
+
+        $basesAt = [];
+        $unidadesAt = 0.0;
+
+        foreach ($this->codigos as $codigo) {
+            if ($codigo['mes'] !== $mes || ! isset($cantidades[$codigo['tipo']])) {
+                continue;
+            }
+
+            $tipo = $codigo['tipo'];
+            $registros = (int) $codigo['registros'];
+            $reconocido = $codigo['suma'] && $codigo['estimado'] > 0;
+
+            if ($reconocido) {
+                $cantidades[$tipo]['reconocidos'] += $registros;
+
+                if ($tipo === 'AT') {
+                    $basesAt[$codigo['base']] = true;
+                    $unidadesAt += $codigo['base'] === 'UNIDAD' ? (float) $codigo['unidades'] : $registros;
+                }
+
+                if ($tipo === 'AH') {
+                    $cantidades[$tipo]['unidades'] += (float) $codigo['unidades'];
+                }
+
+                continue;
+            }
+
+            if ($registros === 0) {
+                continue;
+            }
+
+            if (str_contains($codigo['subtipo'], 'REPETICION DEL MISMO SERVICIO')
+                || str_contains(implode(' ', array_keys($codigo['motivos'])), 'DUPLICADO_EXACTO')) {
+                $cantidades[$tipo]['duplicados'] += $registros;
+            } elseif ($codigo['estado'] === self::INCLUIDA) {
+                $cantidades[$tipo]['incluidos'] += $registros;
+            } else {
+                $cantidades[$tipo]['pendientes'] += $registros;
+            }
+        }
+
+        foreach (['AC', 'AP', 'AM'] as $tipo) {
+            $cantidades[$tipo]['unidades'] = (float) $cantidades[$tipo]['reconocidos'];
+        }
+
+        $cantidades['AT']['unidades'] = count($basesAt) === 1 ? $unidadesAt : (float) $cantidades['AT']['reconocidos'];
+        $cantidades['AT']['definicion'] = count($basesAt) === 1 && isset($basesAt['UNIDAD'])
+            ? 'unidades de transporte o albergue con base compatible'
+            : 'prestaciones reconocidas; bases por código';
+        $cantidades['AM']['definicion'] = 'líneas independientes reconocidas; cantidades por presentación';
+        $cantidades['AH']['definicion'] = 'egresos o internaciones reconocidos por RN-16';
+        $cantidades['AU']['definicion'] = 'sin unidad independiente; componentes en AC/AP/AM';
+
+        $egresosRips = $this->internaciones[$mes]['cierres'] ?? 0;
+        $cantidades['AH']['reconocidos'] = $egresosRips;
+        $cantidades['AH']['incluidos'] = max(0, $cantidades['AH']['incluidos'] - $egresosRips);
+
+        return $cantidades;
+    }
+
+    /** @return array{paquete: int, sinTarifa: int, otros: int} */
+    public function pendientesApPorCausa(string $mes): array
+    {
+        $this->cerrar();
+        $causas = ['paquete' => 0, 'sinTarifa' => 0, 'otros' => 0];
+
+        foreach ($this->codigos as $codigo) {
+            if ($codigo['mes'] !== $mes || $codigo['tipo'] !== 'AP' || $codigo['registros'] <= 0
+                || ! in_array($codigo['estado'], [self::CONDICIONADA, self::SIN_VALOR], true)) {
+                continue;
+            }
+
+            $causa = match (true) {
+                $codigo['subtipo'] === self::SUBTIPO_ESTANCIA_COBRADA_APARTE => 'paquete',
+                $codigo['estado'] === self::SIN_VALOR => 'sinTarifa',
+                default => 'otros',
+            };
+            $causas[$causa] += (int) $codigo['registros'];
+        }
+
+        return $causas;
+    }
+
+    /**
+     * La consulta 890701 pertenece a AC; su relación con episodios AU es
+     * informativa y nunca crea otro cobro.
+     *
+     * @return array{rips: int, reconocidas: int, valorAc: float, enlazadas: int, valorEnlazado: float, administrativas: int|null, valorAdministrativo: float|null, tarifaHistorica: float|null, sinValor: array<string, int>}
+     */
+    public function consultaUrgencias890701(string $mes): array
+    {
+        $this->cerrar();
+        $episodios = array_values(array_filter($this->componentesUrgencias,
+            static fn (array $linea): bool => $linea['mes'] === $mes && $linea['tipo'] === 'AU'
+                && $linea['fecha'] !== '' && $linea['egreso'] >= $linea['fecha']));
+        $rips = 0;
+        $reconocidas = 0;
+        $valorAc = 0;
+        $enlazadas = 0;
+        $valorEnlazado = 0;
+
+        foreach ($this->componentesUrgencias as $linea) {
+            if ($linea['mes'] !== $mes || $linea['tipo'] !== 'AC' || $linea['codigo'] !== '890701') {
+                continue;
+            }
+
+            $rips++;
+            $valor = $this->valoracionLinea[$linea['id']] ?? 0;
+
+            if ($valor <= 0) {
+                continue;
+            }
+
+            $reconocidas++;
+            $valorAc += $valor;
+            $coincidencias = array_filter($episodios, static fn (array $episodio): bool => $episodio['caso'] === $linea['caso']
+                && $episodio['factura'] === $linea['factura'] && $linea['fecha'] >= $episodio['fecha']
+                && $linea['fecha'] <= $episodio['egreso']);
+
+            if (count($coincidencias) === 1) {
+                $enlazadas++;
+                $valorEnlazado += $valor;
+            }
+        }
+
+        $administrativo = $this->historial->valorDelMes($this->ruta, $mes, 'AU', '890701');
+        $precio = $this->historial->precio($this->ruta, $mes, 'AU', '890701');
+
+        return ['rips' => $rips, 'reconocidas' => $reconocidas, 'valorAc' => $valorAc / 100.0,
+            'enlazadas' => $enlazadas, 'valorEnlazado' => $valorEnlazado / 100.0,
+            'administrativas' => $administrativo['registros'] ?? null, 'valorAdministrativo' => $administrativo['valor'] ?? null,
+            'tarifaHistorica' => $precio['mediana'] ?? null,
+            'sinValor' => $this->estadosConsultaUrgencias[$mes] ?? []];
     }
 
     /** @return array<string, int> Registros con importe pendiente, sin duplicar alternativas de cálculo. */
@@ -2298,6 +2452,10 @@ final class ValorizacionAdministrativa
         }
         $codigo['precio'] ??= $precio;
         $codigo['motivos'][$motivo] = true;
+        if ($linea['codigo'] === '890701' && $linea['tipo'] === 'AC' && $registros > 0 && ! $suma) {
+            $this->estadosConsultaUrgencias[$linea['mes']][$subtipo] =
+                ($this->estadosConsultaUrgencias[$linea['mes']][$subtipo] ?? 0) + $registros;
+        }
         unset($codigo);
     }
 
