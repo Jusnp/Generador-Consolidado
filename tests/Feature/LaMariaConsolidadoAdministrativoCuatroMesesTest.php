@@ -383,15 +383,15 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             $this->assertGreaterThanOrEqual(0, (float) $period[4]);
 
             $header = $serviceHeaders[$index];
-            $this->assertSame(['TIPO RIPS / SERVICIO', 'VALOR ADMINISTRATIVO'], $monthlyRows[$header]);
+            $this->assertSame(['TIPO RIPS / SERVICIO', 'REGISTROS RIPS', 'UNIDADES VALORIZADAS', 'VALOR ADMINISTRATIVO'], $monthlyRows[$header]);
             $services = array_slice($monthlyRows, $header + 1, 7);
             $this->assertSame(['AC', 'AP', 'AT', 'AU', 'AM', 'AH', 'TOTAL'], array_map(
                 static fn (array $row): string => explode(' ', (string) $row[0])[0], $services
             ));
             $this->assertStringContainsString('no aditivo', (string) $services[3][0]);
-            $this->assertSame(round((float) $period[4], 2), round((float) $services[6][1], 2));
+            $this->assertSame(round((float) $period[4], 2), round((float) $services[6][3], 2));
             $this->assertSame(round((float) $period[4], 2), round(array_sum(array_map(
-                static fn (array $row): float => (float) $row[1], [$services[0], $services[1], $services[2], $services[4], $services[5]]
+                static fn (array $row): float => (float) $row[3], [$services[0], $services[1], $services[2], $services[4], $services[5]]
             )), 2));
         }
     }

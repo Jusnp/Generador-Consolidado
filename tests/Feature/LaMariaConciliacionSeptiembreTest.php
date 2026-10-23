@@ -99,17 +99,54 @@ class LaMariaConciliacionSeptiembreTest extends TestCase
                 $this->assertSame($expected['central'], round((float) $first[1][3], 2));
                 $serviceHeader = array_search('TIPO RIPS / SERVICIO', array_column($first, 0), true);
                 $this->assertNotFalse($serviceHeader);
-                $this->assertSame(['TIPO RIPS / SERVICIO', 'VALOR ADMINISTRATIVO'], $first[$serviceHeader]);
+                $this->assertSame(['TIPO RIPS / SERVICIO', 'REGISTROS RIPS', 'UNIDADES VALORIZADAS', 'VALOR ADMINISTRATIVO'], $first[$serviceHeader]);
                 $services = array_slice($first, $serviceHeader + 1, 7);
                 $this->assertSame(['AC', 'AP', 'AT', 'AU', 'AM', 'AH', 'TOTAL'], array_map(
                     static fn (array $row): string => explode(' ', (string) $row[0])[0], $services
                 ));
-                $this->assertSame($expected['central'], round((float) $services[6][1], 2));
+                $this->assertSame($expected['registros'], (int) $services[6][1]);
+                $this->assertSame($route === 'prostata' ? [1170, 4975, 2178, 25, 2947, 65] : [700, 2069, 1830, 29, 2293, 33],
+                    array_map(static fn (array $row): int => (int) $row[1], array_slice($services, 0, 6)));
+                $this->assertSame(0.0, (float) $services[3][3]);
+                $this->assertSame($expected['central'], round((float) $services[6][3], 2));
+                $costA = collect($first)->first(static fn (array $row): bool => ($row[0] ?? '') === 'COSTO A ACREDITADO (NO SUMA AL ADMINISTRATIVO)');
+                $this->assertNotNull($costA);
+                $this->assertSame($expected['principal'], round((float) $costA[3], 2));
                 $this->assertSame($expected['central'], round(array_sum(array_map(
-                    static fn (array $row): float => (float) $row[1], [$services[0], $services[1], $services[2], $services[4], $services[5]]
+                    static fn (array $row): float => (float) $row[3], [$services[0], $services[1], $services[2], $services[4], $services[5]]
                 )), 2));
+                $auHeader = array_search('DETALLE AU (NO ADITIVO)', array_column($first, 0), true);
+                $this->assertNotFalse($auHeader);
+                $this->assertSame($route === 'prostata' ? 25 : 29, (int) $first[$auHeader + 1][1]);
+                $this->assertSame($route === 'prostata' ? [23, 13, 522542.93] : [28, 22, 884303.42],
+                    [(int) $first[$auHeader + 2][1], (int) $first[$auHeader + 2][2], round((float) $first[$auHeader + 2][3], 2)]);
+                $this->assertSame($route === 'prostata' ? [12, 482347.32] : [18, 723520.98],
+                    [(int) $first[$auHeader + 5][1], round((float) $first[$auHeader + 5][3], 2)]);
+
+                if ($autonomos !== null) {
+                    $this->assertSame($route === 'prostata' ? [25, 1004890.19] : [26, 1045085.80],
+                        [(int) $first[$auHeader + 3][1], round((float) $first[$auHeader + 3][3], 2)]);
+                }
+
+                $stateHeader = array_search('ESTADO DE REGISTROS', array_column($first, 0), true);
+                $this->assertNotFalse($stateHeader);
+
+                foreach (array_slice($first, $stateHeader + 1, 6) as $index => $state) {
+                    $counts = array_map('intval', explode(' / ', (string) $state[3]));
+                    $this->assertSame((int) $services[$index][1], (int) $state[1] + (int) $state[2] + array_sum($counts));
+                }
+                $estados = collect($first)->keyBy(0);
+                $this->assertSame($route === 'prostata' ? [56, 62, 9] : [25, 27, 8],
+                    [(int) $estados['AH'][1], (int) $estados['AH: REGISTROS RIPS CON EGRESO'][3], (int) $estados['AH: REGISTROS INCLUIDOS'][1]]);
+                $this->assertSame($route === 'prostata' ? 6 : 2,
+                    (int) $estados['AH: INTERNACIONES SOLO COMO SERVICIO AP'][1]);
+                $this->assertSame($autonomos === null ? 0 : ($route === 'prostata' ? 596 : 654),
+                    (int) $estados['AP: CONDICIONADO POR POSIBLE INCLUSIÓN EN PAQUETE AH'][1]);
+                $consultasSinValor = array_values(array_filter($first, static fn (array $row): bool => ($row[0] ?? '') === 'CONSULTA 890701 SIN VALOR INDEPENDIENTE'));
+                $this->assertSame($route === 'prostata' ? 10 : 6, array_sum(array_map(static fn (array $row): int => (int) $row[1], $consultasSinValor)));
+                $this->assertSame(['INCLUIDO EN PAQUETE HOSPITALARIO AH'], array_unique(array_column($consultasSinValor, 3)));
                 // La fuente del total queda declarada: autónomo, o conciliado con su valor autónomo y el ajuste.
-                $fuente = array_slice($first, $serviceHeader + 8, 3);
+                $fuente = array_slice($first, $serviceHeader + 9, 3);
                 $this->assertSame('FUENTE DEL TOTAL', $fuente[0][0]);
 
                 if ($autonomos === null) {
