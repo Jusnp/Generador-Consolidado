@@ -10,6 +10,20 @@ use Tests\TestCase;
 
 class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
 {
+    private const BASE = 'C:/Users/Juan/Desktop/Trabajo/RIPS JSON RUTA AUTOINMUNES/pestaña 2/';
+
+    /** Informes anteriores (hoja «inf admin», hasta agosto): septiembre se valora solo con el historial. */
+    private const INFORMES_ANTERIORES = [
+        'PROSTATA' => self::BASE.'Nueva carpeta/INFORME ADMIN PROSTATA PARA JUAN.xlsx',
+        'CERVIX' => self::BASE.'Nueva carpeta/INFORME ADMIN CERVIX PARA JUAN.xlsx',
+    ];
+
+    /** Informes nuevos (GRUPO DEL SERVICIO, hasta septiembre): conciliación con el informe del mismo mes (RN-17). */
+    private const INFORMES_NUEVOS = [
+        'PROSTATA' => 'C:/Users/Juan/Downloads/Informe Administrativo CaP - Oct 2025 - sept 2026 nueva clasificación EJECUCION.xlsx',
+        'CERVIX' => 'C:/Users/Juan/Downloads/Informe Administrativo CCU - Oct 2025 - septi 2026.xlsx nueva clasificación Ejecución.xlsx',
+    ];
+
     public function test_september_prostata_preserves_totals_with_invoice_linkage_and_verified_transport_unit(): void
     {
         if (getenv('SIRUTA_PRUEBA_SEPTIEMBRE') !== '1' || getenv('DB_DATABASE') !== 'json_excel_demo_lamaria_20261008') {
@@ -44,7 +58,7 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             $this->assertWorkbookStructure($path);
             $resumen = $this->internalSummaries()['2026-09']['PROSTATA'];
             $this->assertSame(2137528852.70, round((float) $resumen['TOTAL'][5], 2));
-            $this->assertSame(3708242181.90, round((float) $resumen['TOTAL'][6], 2));
+            $this->assertSame(3543529898.23, round((float) $resumen['TOTAL'][6], 2));
             $this->assertSame(61192083.10, round((float) $resumen['AT'][6], 2));
             $this->assertSame(14172581.38, round((float) $resumen['AM'][6], 2));
             $this->assertGreaterThan(0, (float) $resumen['AM'][7]);
@@ -130,8 +144,107 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             $this->markTestSkipped('Solo se ejecuta con los JSON y la base aislada de demostración.');
         }
 
+        $destination = getenv('SIRUTA_RN15_DESTINATION') ?: sys_get_temp_dir().'/siruta-cuatro-meses-'.uniqid();
+        $result = $this->cuatroMeses(self::INFORMES_ANTERIORES, $destination);
+
+        $this->assertSame(2137528852.70, round((float) $result['2026-09']['PROSTATA']['TOTAL'][5], 2));
+        $this->assertSame(3543529898.23, round((float) $result['2026-09']['PROSTATA']['TOTAL'][6], 2));
+        $this->assertSame(521906976.77, round((float) $result['2026-09']['CERVIX']['TOTAL'][5], 2));
+        $this->assertSame(1454024001.78, round((float) $result['2026-09']['CERVIX']['TOTAL'][6], 2));
+        $this->assertGreaterThan(0, (float) $result['2026-09']['PROSTATA']['AU'][12]);
+        $this->assertGreaterThan(0, (float) $result['2026-09']['CERVIX']['AU'][12]);
+        $this->assertNotSame($result['2026-06']['PROSTATA']['TOTAL'][6], $result['2026-07']['PROSTATA']['TOTAL'][6]);
+        $this->assertNotSame($result['2026-07']['CERVIX']['TOTAL'][6], $result['2026-08']['CERVIX']['TOTAL'][6]);
+        // Los informes anteriores terminan en agosto: septiembre es cálculo autónomo y así lo declara el resumen.
+        $fuentes = $this->fuentesDelTotal($destination.'/FUENTE_ADMINISTRATIVA_2026-09.xlsx');
+        $this->assertStringStartsWith('CÁLCULO AUTÓNOMO', $fuentes['PRÓSTATA · 2026-09']['FUENTE DEL TOTAL']);
+        $this->assertStringStartsWith('CÁLCULO AUTÓNOMO', $fuentes['CÉRVIX · 2026-09']['FUENTE DEL TOTAL']);
+    }
+
+    public function test_month_report_conciliation_keeps_cost_a_and_monthly_independence(): void
+    {
+        if (getenv('SIRUTA_PRUEBA_CUATRO_MESES') !== '1' || getenv('DB_DATABASE') !== 'json_excel_demo_lamaria_20261008') {
+            $this->markTestSkipped('Solo se ejecuta con los JSON y la base aislada de demostración.');
+        }
+
+        if (! is_file(self::INFORMES_NUEVOS['PROSTATA']) || ! is_file(self::INFORMES_NUEVOS['CERVIX'])) {
+            $this->markTestSkipped('Requiere los informes administrativos nuevos en la carpeta privada de descargas.');
+        }
+
+        $destination = getenv('SIRUTA_RN17_DESTINATION') ?: sys_get_temp_dir().'/siruta-cuatro-meses-rn17-'.uniqid();
+        $result = $this->cuatroMeses(self::INFORMES_NUEVOS, $destination);
+
+        // El informe del mes no modifica el costo A de ningún mes.
+        foreach ([
+            '2026-06' => ['PROSTATA' => 2549084466.68, 'CERVIX' => 436375193.43],
+            '2026-07' => ['PROSTATA' => 2714285783.60, 'CERVIX' => 496257069.91],
+            '2026-08' => ['PROSTATA' => 2692534916.18, 'CERVIX' => 500798309.07],
+            '2026-09' => ['PROSTATA' => 2137528852.70, 'CERVIX' => 521906976.77],
+        ] as $month => $routes) {
+            foreach ($routes as $route => $costoA) {
+                $this->assertSame($costoA, round((float) $result[$month][$route]['TOTAL'][5], 2), "$month $route costo A");
+            }
+        }
+
+        $this->assertSame(3529346176.34, round((float) $result['2026-09']['PROSTATA']['TOTAL'][6], 2));
+        $this->assertSame(1460636867.64, round((float) $result['2026-09']['CERVIX']['TOTAL'][6], 2));
+        $this->assertSame(59713708.49, round((float) $result['2026-09']['PROSTATA']['AP'][7], 2));
+        $this->assertSame(44344427.75, round((float) $result['2026-09']['CERVIX']['AP'][7], 2));
+        // El resumen declara la conciliación y conserva el valor autónomo del mes (el mismo de los informes anteriores).
+        $fuentes = $this->fuentesDelTotal($destination.'/FUENTE_ADMINISTRATIVA_2026-09.xlsx');
+        $this->assertStringStartsWith('CÁLCULO CON INFORME DEL MES — CONCILIACIÓN PARCIAL: informe administrativo de 2026-09', $fuentes['PRÓSTATA · 2026-09']['FUENTE DEL TOTAL']);
+        $this->assertSame([3543529898.23, -14183721.89], [round((float) $fuentes['PRÓSTATA · 2026-09']['VALOR AUTÓNOMO (SIN INFORME DEL MES)'], 2),
+            round((float) $fuentes['PRÓSTATA · 2026-09']['AJUSTE RESPALDADO POR LA CONCILIACIÓN DEL MES'], 2)]);
+        $this->assertSame([1454024001.78, 6612865.86], [round((float) $fuentes['CÉRVIX · 2026-09']['VALOR AUTÓNOMO (SIN INFORME DEL MES)'], 2),
+            round((float) $fuentes['CÉRVIX · 2026-09']['AJUSTE RESPALDADO POR LA CONCILIACIÓN DEL MES'], 2)]);
+    }
+
+    /**
+     * Filas de fuente que siguen al total de cada mes en SEGUIMIENTO MENSUAL, por bloque (ruta · mes).
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    private function fuentesDelTotal(string $path): array
+    {
+        $reader = new Reader;
+        $reader->open($path);
+        $fuentes = [];
+        $bloque = '';
+
+        try {
+            foreach ($reader->getSheetIterator() as $sheet) {
+                if ($sheet->getName() !== 'SEGUIMIENTO MENSUAL') {
+                    continue;
+                }
+
+                foreach ($sheet->getRowIterator() as $row) {
+                    $values = $row->toArray();
+                    $label = (string) ($values[0] ?? '');
+
+                    if (preg_match('/ · \d{4}-\d{2}$/', $label) === 1) {
+                        $bloque = $label;
+                    } elseif (in_array($label, ['FUENTE DEL TOTAL', 'VALOR AUTÓNOMO (SIN INFORME DEL MES)', 'AJUSTE RESPALDADO POR LA CONCILIACIÓN DEL MES'], true)) {
+                        $fuentes[$bloque][$label] = $values[1] ?? null;
+                    }
+                }
+            }
+        } finally {
+            $reader->close();
+        }
+
+        return $fuentes;
+    }
+
+    /**
+     * Cada mes por separado y el lote de 16 JSON con los informes indicados: el lote reproduce cada mes
+     * (POR_LOTE independiente), el Excel conserva su estructura y AU no suma.
+     *
+     * @param  array{PROSTATA: string, CERVIX: string}  $informes
+     * @return array<string, array<string, array<string, array<int, mixed>>>>
+     */
+    private function cuatroMeses(array $informes, string $destination): array
+    {
         $this->assertSame('json_excel_demo_lamaria_20261008', DB::connection()->getDatabaseName());
-        $base = 'C:/Users/Juan/Desktop/Trabajo/RIPS JSON RUTA AUTOINMUNES/pestaña 2/';
         $groups = [
             '2026-06' => ['FEHM614147', 'FEHM614149', 'FEHM614150', 'FEHM614152'],
             '2026-07' => ['FEHM623064', 'FEHM623066', 'FEHM623069', 'FEHM623071'],
@@ -140,12 +253,7 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
         ];
         config(['programas.la-maria.politica_dispensacion' => 'CONDICIONADA']);
         config(['programas.la-maria.libro_paquetes' => 'POR_LOTE']);
-        config(['programas.la-maria.informes_administrativos' => [
-            'requerido' => true,
-            'PROSTATA' => $base.'Nueva carpeta/INFORME ADMIN PROSTATA PARA JUAN.xlsx',
-            'CERVIX' => $base.'Nueva carpeta/INFORME ADMIN CERVIX PARA JUAN.xlsx',
-        ]]);
-        $destination = getenv('SIRUTA_RN15_DESTINATION') ?: sys_get_temp_dir().'/siruta-cuatro-meses-'.uniqid();
+        config(['programas.la-maria.informes_administrativos' => ['requerido' => true, ...$informes]]);
 
         if (! is_dir($destination)) {
             mkdir($destination, 0775, true);
@@ -160,7 +268,7 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             try {
                 $user = User::factory()->create(['role' => 'admin', 'active' => true]);
                 $uploads = array_map(static fn (string $invoice): UploadedFile => new UploadedFile(
-                    $base.(str_starts_with($invoice, 'FEHM643') ? 'Septiembre json/' : 'Json/').$invoice.'.json',
+                    self::BASE.(str_starts_with($invoice, 'FEHM643') ? 'Septiembre json/' : 'Json/').$invoice.'.json',
                     $invoice.'.json', 'application/json', null, true
                 ), $invoices);
                 $response = $this->actingAs($user)->post(route('la-maria.consolidado.export'), ['archivos' => $uploads]);
@@ -174,15 +282,6 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
                     $this->assertArrayHasKey($route, $result[$month]);
                     $rows = $result[$month][$route];
                     $this->assertSame(round((float) $rows['TOTAL'][6] + (float) $rows['TOTAL'][7], 2), round((float) $rows['TOTAL'][8], 2));
-                }
-
-                if ($month === '2026-09') {
-                    $this->assertSame(2137528852.70, round((float) $result[$month]['PROSTATA']['TOTAL'][5], 2));
-                    $this->assertSame(3708242181.90, round((float) $result[$month]['PROSTATA']['TOTAL'][6], 2));
-                    $this->assertSame(521906976.77, round((float) $result[$month]['CERVIX']['TOTAL'][5], 2));
-                    $this->assertSame(1470200269.99, round((float) $result[$month]['CERVIX']['TOTAL'][6], 2));
-                    $this->assertGreaterThan(0, (float) $result[$month]['PROSTATA']['AU'][12]);
-                    $this->assertGreaterThan(0, (float) $result[$month]['CERVIX']['AU'][12]);
                 }
             } finally {
                 DB::rollBack();
@@ -198,7 +297,7 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
             foreach ($groups as $invoices) {
                 foreach ($invoices as $invoice) {
                     $uploads[] = new UploadedFile(
-                        $base.(str_starts_with($invoice, 'FEHM643') ? 'Septiembre json/' : 'Json/').$invoice.'.json',
+                        self::BASE.(str_starts_with($invoice, 'FEHM643') ? 'Septiembre json/' : 'Json/').$invoice.'.json',
                         $invoice.'.json', 'application/json', null, true
                     );
                 }
@@ -231,9 +330,9 @@ class LaMariaConsolidadoAdministrativoCuatroMesesTest extends TestCase
         }
 
         file_put_contents($destination.'/resultados_mensuales.json', json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-        $this->assertNotSame($result['2026-06']['PROSTATA']['TOTAL'][6], $result['2026-07']['PROSTATA']['TOTAL'][6]);
-        $this->assertNotSame($result['2026-07']['CERVIX']['TOTAL'][6], $result['2026-08']['CERVIX']['TOTAL'][6]);
         $this->assertSame($before, DB::table('programa_ejecuciones')->count());
+
+        return $result;
     }
 
     /** @return array<string, array<string, array<string, array<int, mixed>>>> */

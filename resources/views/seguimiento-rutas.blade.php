@@ -231,7 +231,8 @@
                     multiple
                 >
                 <div class="form-help">
-                    Se lee la hoja “inf admin” (mes, tipo, código y valor) para agregar la estimación administrativa
+                    Se lee la hoja “inf admin” o, en los informes nuevos, la hoja de servicios con “GRUPO DEL SERVICIO”
+                    (mes, tipo, código y valor) para agregar la estimación administrativa
                     referencial. Si no se carga, se usa el informe configurado para esta ruta; si falta, el reporte
                     se detiene con un aviso. No cambia el costo A y no es facturación.
                 </div>
