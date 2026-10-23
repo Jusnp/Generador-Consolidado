@@ -1750,6 +1750,40 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->assertSame(1500.0, (float) $replaced['AT']['COMPONENTE CONDICIONADO'], 'El informe cargado reemplaza al configurado de su ruta, sin convertir el insumo en cobro independiente.');
     }
 
+    public function test_monthly_summary_declares_whether_the_total_is_autonomous_or_conciliated_with_the_month_report(): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        $sinMes = $this->administrativeReport([['DM00114', 'AT', 1200]]);
+        $conMes = $this->administrativeReport([['DM00114', 'AT', 1200]], fechas: ['2026-06-15', '2026-07-15', '2026-08-15', '2026-09-12']);
+        config(['programas.la-maria.informes_administrativos.requerido' => true]);
+        $files = ['septiembre.json' => $this->rips('FAC-SEP', [
+            $this->usuario('9988776655', 'M', ['otrosServicios' => [$this->otroServicio('DM00114', 'C61X', '2026-09-12 09:00')]]),
+        ])];
+        $fuente = static function (Spreadsheet $workbook): array {
+            $filas = $workbook->getSheetByName('SEGUIMIENTO MENSUAL')->toArray(null, true, false);
+            $total = array_search('TOTAL DEL MES', array_column($filas, 0), true);
+
+            return array_map(static fn (array $fila): array => [$fila[0], $fila[1]], array_slice($filas, $total + 1, 3));
+        };
+
+        try {
+            $autonomo = $fuente($this->exportWorkbook($user, 'prostata', $files, informes: ['INFORME HASTA AGOSTO.xlsx' => $sinMes]));
+            $conciliado = $fuente($this->exportWorkbook($user, 'prostata', $files, informes: ['INFORME CON SEPTIEMBRE.xlsx' => $conMes]));
+        } finally {
+            File::delete([$sinMes, $conMes]);
+        }
+
+        // Sin informe del mes: el total es el cálculo autónomo y así lo declara.
+        $this->assertSame('FUENTE DEL TOTAL', $autonomo[0][0]);
+        $this->assertStringStartsWith('CÁLCULO AUTÓNOMO', (string) $autonomo[0][1]);
+        $this->assertNotContains('VALOR AUTÓNOMO (SIN INFORME DEL MES)', array_column($autonomo, 0));
+        // Con informe del mes: la fuente cambia de forma explícita y se muestran el valor autónomo y el ajuste.
+        $this->assertStringStartsWith('CÁLCULO CON INFORME DEL MES — CONCILIACIÓN PARCIAL: informe administrativo de 2026-09', (string) $conciliado[0][1]);
+        $this->assertSame(['VALOR AUTÓNOMO (SIN INFORME DEL MES)', 'AJUSTE RESPALDADO POR LA CONCILIACIÓN DEL MES'], [$conciliado[1][0], $conciliado[2][0]]);
+        $this->assertSame(0.0, (float) $conciliado[2][1]);
+    }
+
     public function test_missing_administrative_source_stops_the_report_with_a_clear_error(): void
     {
         $user = User::factory()->create();
@@ -1944,8 +1978,9 @@ class SeguimientoRutaControllerTest extends TestCase
      * Informe administrativo mínimo con la hoja «inf admin», incluida una columna de documento.
      *
      * @param  list<array{0: string, 1: string, 2: int|float, 3?: string}>  $servicios  Código, tipo, valor y medicamento del esquema.
+     * @param  list<string>  $fechas  Fechas de prestación de las filas (por defecto, junio a agosto).
      */
-    private function administrativeReport(array $servicios, string $diagnostico = 'C61X'): string
+    private function administrativeReport(array $servicios, string $diagnostico = 'C61X', array $fechas = ['2026-06-15', '2026-07-15', '2026-08-15']): string
     {
         $path = storage_path('framework/testing/inf-admin-'.Str::uuid().'.xlsx');
         File::ensureDirectoryExists(dirname($path));
@@ -1955,7 +1990,7 @@ class SeguimientoRutaControllerTest extends TestCase
         $writer->addRow(OpenSpoutRow::fromValues(['MES', 'DOCUMENTO', 'CUPS', 'DESCRIPCION DEL SERVICIO', 'DIACODIGO',
             'FECHA_PRESTACION_SERVICIO', 'GRUPO DEL SERVICIO', 'CLASIFICACIÓN RIPS ', 'MEDICAMENTO ', 'VALOR']));
 
-        foreach (['2026-06-15', '2026-07-15', '2026-08-15'] as $fecha) {
+        foreach ($fechas as $fecha) {
             foreach ($servicios as $servicio) {
                 [$codigo, $tipo, $valor] = $servicio;
                 $writer->addRow(OpenSpoutRow::fromValues(['', '70975586', $codigo, 'Servicio '.$codigo, $diagnostico, $fecha, 'Grupo', $tipo, $servicio[3] ?? '', $valor]));

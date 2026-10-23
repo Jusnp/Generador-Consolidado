@@ -304,6 +304,7 @@ class SeguimientoRutaController extends Controller
             $resumenEconomico = new ResumenEconomico($ruta, $referenciaRutaMatcher->entradasNotaTecnica($ruta));
             $conciliacionRipsNota = new ConciliacionRipsNota((string) config('app.key'));
             $valorizacion = $this->administrativeValuation($ruta, $historialAdministrativo, $referenciaRutaMatcher);
+            $valorizacionAutonoma = $this->administrativeValuation($ruta, $historialAdministrativo->sinInformeDelMes(), $referenciaRutaMatcher);
             $estadosEconomicos = [];
             $categoriasEconomicas = [];
 
@@ -324,6 +325,7 @@ class SeguimientoRutaController extends Controller
                 $estadoEconomico = $resumenEconomico->registrar($detail);
                 $conciliacionRipsNota->registrar($detail, $estadoEconomico);
                 $valorizacion->registrar($detail, $estadoEconomico);
+                $valorizacionAutonoma->registrar($detail, $estadoEconomico);
                 $estadosEconomicos[] = [$detail['mesAtencion'], $detail['factura'], $detail['tipoServicio'], $detail['codigo'],
                     $detail['cantidad'], $detail['tarifaReferencia'], $detail['cumResuelto'] ?? '', $detail['metodoResolucion'] ?? '',
                     $estadoEconomico['estado'], $estadoEconomico['respaldado'], $estadoEconomico['condicionadoIncluido'],
@@ -489,9 +491,10 @@ class SeguimientoRutaController extends Controller
             $conciliacionRipsNota->atribuirPaquetes($resultadoEconomico['hospitalizacion']);
             $valorizacion->atribuirPaquetes($resultadoEconomico['hospitalizacion']);
             $valorizacion->atribuirUrgencias($conciliacionRipsNota->filasEpisodiosUrgencias(), $conciliacionRipsNota->costoUrgenciasPorTipo());
+            $valorizacionAutonoma->atribuirPaquetes($resultadoEconomico['hospitalizacion']);
             $estimacionAdministrativa = $this->administrativeComparison([$ruta => $valorizacion], [$ruta => $resultadoEconomico]);
             $writer->setCurrentSheet($summarySheet);
-            $this->writeMonthlyAdministrativeSummary($writer, [$ruta => $valorizacion], [$ruta => $resultadoEconomico]);
+            $this->writeMonthlyAdministrativeSummary($writer, [$ruta => $valorizacion], [$ruta => $resultadoEconomico], $historialAdministrativo, [$ruta => $valorizacionAutonoma]);
             $hospitalizacionDemo = $resultadoEconomico['hospitalizacion'];
             foreach ($hospitalizacionDemo as $filaHospital) {
                 if ($filaHospital[0] !== 'TOTAL') {
@@ -635,22 +638,26 @@ class SeguimientoRutaController extends Controller
             $controlRows = iterator_to_array($seguimientoRutaClassifier->controlRowsForFiles($screenedFiles), false);
             $resultados = [];
             $valorizaciones = [];
+            $autonomas = [];
 
             foreach ([LaMariaPrograma::RUTA_PROSTATA, LaMariaPrograma::RUTA_CERVIX] as $ruta) {
                 $profiles = $seguimientoRutaClassifier->profilesForExecutionRoute($allProfiles, $ruta);
                 $resumenEconomico = new ResumenEconomico($ruta, $referenciaRutaMatcher->entradasNotaTecnica($ruta));
                 $conciliacionRipsNota = new ConciliacionRipsNota((string) config('app.key'));
                 $valorizaciones[$ruta] = $this->administrativeValuation($ruta, $historialAdministrativo, $referenciaRutaMatcher);
+                $autonomas[$ruta] = $this->administrativeValuation($ruta, $historialAdministrativo->sinInformeDelMes(), $referenciaRutaMatcher);
 
                 foreach ($seguimientoRutaClassifier->detailRowsForFiles($processableFiles, $profiles, $referenciaRutaMatcher, $ruta, $duplicateIndex) as $detail) {
                     $estadoEconomico = $resumenEconomico->registrar($detail);
                     $conciliacionRipsNota->registrar($detail, $estadoEconomico);
                     $valorizaciones[$ruta]->registrar($detail, $estadoEconomico);
+                    $autonomas[$ruta]->registrar($detail, $estadoEconomico);
                 }
 
                 $resultados[$ruta] = $this->economicResult($resumenEconomico, $profiles, $sharedProfiles, $ruta);
                 $valorizaciones[$ruta]->atribuirPaquetes($resultados[$ruta]['hospitalizacion']);
                 $valorizaciones[$ruta]->atribuirUrgencias($conciliacionRipsNota->filasEpisodiosUrgencias(), $conciliacionRipsNota->costoUrgenciasPorTipo());
+                $autonomas[$ruta]->atribuirPaquetes($resultados[$ruta]['hospitalizacion']);
             }
 
             $summaryHeaders = ['RUTA', ...self::MONTHLY_SUMMARY_HEADERS];
@@ -660,7 +667,7 @@ class SeguimientoRutaController extends Controller
             $writer->addRow(Row::fromValues($summaryHeaders, $this->headerStyle()));
 
             $estimacionAdministrativa = $this->administrativeComparison($valorizaciones, $resultados);
-            $this->writeMonthlyAdministrativeSummary($writer, $valorizaciones, $resultados, true);
+            $this->writeMonthlyAdministrativeSummary($writer, $valorizaciones, $resultados, $historialAdministrativo, $autonomas, true);
 
             $catalogSheet = $writer->addNewSheetAndMakeItCurrent();
             $catalogSheet->setName('CATALOGOS APLICADOS');
@@ -1980,12 +1987,16 @@ class SeguimientoRutaController extends Controller
 
     /**
      * Dos tablas breves en la primera hoja; AU se presenta atribuido y no se
-     * agrega al total administrativo del motor.
+     * agrega al total administrativo del motor. Debajo del total de cada mes
+     * se declara su fuente: cálculo autónomo o conciliado con el informe del
+     * mismo mes; en este caso también el valor autónomo y el ajuste.
      *
      * @param  array<string, ValorizacionAdministrativa>  $valorizaciones
      * @param  array<string, array<string, mixed>>  $resultados
+     * @param  array<string, ValorizacionAdministrativa>  $autonomas  Las mismas líneas sin conciliación del mes.
      */
-    private function writeMonthlyAdministrativeSummary(Writer $writer, array $valorizaciones, array $resultados, bool $includeRoute = false): void
+    private function writeMonthlyAdministrativeSummary(Writer $writer, array $valorizaciones, array $resultados, HistorialAdministrativo $historial,
+        array $autonomas, bool $includeRoute = false): void
     {
         $money = (new Style)->setFormat('"$"#,##0.00');
         $monthlyRows = [];
@@ -2022,6 +2033,17 @@ class SeguimientoRutaController extends Controller
             }
 
             $writer->addRow(Row::fromValuesWithStyles(['TOTAL DEL MES', $economic['totales']['estimado']], null, [1 => $money]));
+
+            if (! $historial->cubreMes($ruta, $mes)) {
+                $writer->addRow(Row::fromValues(['FUENTE DEL TOTAL', 'CÁLCULO AUTÓNOMO: RIPS, catálogos, reglas RN-01 a RN-16 y precios históricos anteriores a '.$mes.'; sin informe administrativo del mes.']));
+
+                continue;
+            }
+
+            $autonomo = $autonomas[$ruta]->resumenServicios($mes)['totales']['estimado'];
+            $writer->addRow(Row::fromValues(['FUENTE DEL TOTAL', 'CÁLCULO CON INFORME DEL MES — CONCILIACIÓN PARCIAL: informe administrativo de '.$mes.' (RN-17); solo filas con correspondencia RIPS de paciente, fecha y código. Los importes sin respaldo RIPS no suman y pueden persistir diferencias con los totales externos.']));
+            $writer->addRow(Row::fromValuesWithStyles(['VALOR AUTÓNOMO (SIN INFORME DEL MES)', $autonomo], null, [1 => $money]));
+            $writer->addRow(Row::fromValuesWithStyles(['AJUSTE RESPALDADO POR LA CONCILIACIÓN DEL MES', round($economic['totales']['estimado'] - $autonomo, 2)], null, [1 => $money]));
         }
     }
 
@@ -2248,7 +2270,7 @@ class SeguimientoRutaController extends Controller
             report($exception);
 
             throw ValidationException::withMessages([
-                'informes_administrativos' => 'No fue posible leer el informe administrativo: debe ser un .xlsx con la hoja «inf admin».',
+                'informes_administrativos' => 'No fue posible leer el informe administrativo: debe ser un .xlsx con la hoja «inf admin» o una hoja de servicios con CUPS, FECHA_PRESTACION, GRUPO DEL SERVICIO y VALOR.',
             ]);
         }
 

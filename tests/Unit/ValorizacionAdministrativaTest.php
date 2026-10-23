@@ -907,6 +907,387 @@ class ValorizacionAdministrativaTest extends TestCase
         $this->assertStringContainsString('1 cortes 08 sin unidad', $unidad[9]);
     }
 
+    public function test_repeated_lines_of_the_same_service_do_not_add_units_beyond_the_historical_unit_per_patient_and_date(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
+            foreach (['H1', 'H2', 'H3'] as $n => $documento) {
+                $historial->registrar('PROSTATA', $mes, 'AP', '601101', 1316829.0, '', '', $mes.'-1'.$n, $documento.$mes);
+            }
+            // Sin documento en el historial: no hay unidad por paciente identificable.
+            $historial->registrar('PROSTATA', $mes, 'AP', '898221', 176744.0);
+        }
+
+        $valorizacion = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $biopsia = fn (string $documento, string $fecha): array => $this->detalle('procedimientos', '601101', 1.0,
+            ['casoId' => $documento, 'numDocumentoIdentificacion' => $documento, 'fechaAtencion' => $fecha.' 08:00', 'tarifaReferencia' => 1316829.0]);
+
+        // A repite la biopsia en la misma fecha (dos líneas RIPS); B tiene una; A vuelve otro día.
+        $valorizacion->registrar($biopsia('A', '2026-09-03'), ['respaldado' => 1316829.0]);
+        $valorizacion->registrar($biopsia('A', '2026-09-03'), ['respaldado' => 1316829.0]);
+        $valorizacion->registrar($biopsia('B', '2026-09-03'), ['respaldado' => 1316829.0]);
+        $valorizacion->registrar($biopsia('A', '2026-09-20'), ['respaldado' => 1316829.0]);
+        $valorizacion->registrar($this->detalle('procedimientos', '898221', 1.0, ['casoId' => 'A', 'numDocumentoIdentificacion' => 'A', 'fechaAtencion' => '2026-09-03 08:00']), ['respaldado' => 176744.0]);
+        $valorizacion->registrar($this->detalle('procedimientos', '898221', 1.0, ['casoId' => 'A', 'numDocumentoIdentificacion' => 'A', 'fechaAtencion' => '2026-09-03 08:00']), ['respaldado' => 176744.0]);
+
+        $ap = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0)['AP'];
+        $repetida = collect($valorizacion->filasDetalle())->first(static fn (array $fila): bool => $fila[2] === '601101' && $fila[6] === 'REPETICION DEL MISMO SERVICIO');
+
+        // Costo A conserva las cuatro biopsias y los dos estudios; la estimación cuenta tres biopsias (una por paciente y fecha) y ambos estudios.
+        $this->assertSame([5620804.0, 4303975.0], [$ap[3], $ap[4]]);
+        $this->assertSame([1, ValorizacionAdministrativa::INCLUIDA], [$repetida[7], $repetida[4]]);
+    }
+
+    public function test_repeated_line_that_differs_in_any_rips_field_still_adds_and_is_flagged_for_review(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
+            foreach (['H1', 'H2'] as $n => $documento) {
+                $historial->registrar('PROSTATA', $mes, 'AP', '601101', 1316829.0, '', '', $mes.'-1'.$n, $documento.$mes);
+            }
+        }
+
+        $valorizacion = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $biopsia = fn (string $hora, string $consecutivo): array => $this->detalle('procedimientos', '601101', 1.0, ['casoId' => 'A', 'numDocumentoIdentificacion' => 'A',
+            'factura' => 'F1', 'fechaAtencion' => '2026-09-03 '.$hora, 'servicioJson' => ['fechaInicioAtencion' => '2026-09-03 '.$hora, 'consecutivo' => $consecutivo]]);
+
+        // La segunda línea difiere en la hora (otra prestación posible); la tercera repite la primera salvo el consecutivo.
+        $valorizacion->registrar($biopsia('08:00', '1'), ['respaldado' => 1316829.0]);
+        $valorizacion->registrar($biopsia('10:30', '2'), ['respaldado' => 1316829.0]);
+        $valorizacion->registrar($biopsia('08:00', '3'), ['respaldado' => 1316829.0]);
+
+        $ap = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0)['AP'];
+        $revision = collect($valorizacion->filasPendientes())->firstWhere(4, ValorizacionAdministrativa::CONDICIONADA.' / '.ValorizacionAdministrativa::SUBTIPO_REPETICION_POR_REVISAR);
+
+        $this->assertSame([3950487.0, 2633658.0, 0.0], [$ap[3], $ap[4], $ap[6]]);
+        $this->assertStringContainsString('1 línea(s) superan la unidad por paciente y fecha (1)', $revision[9]);
+    }
+
+    public function test_month_report_rows_of_the_same_service_raise_the_unit_per_patient_and_date(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
+            $historial->registrar('CERVIX', $mes, 'AP', '898221', 176744.0, '', '', $mes.'-10', 'H'.$mes);
+        }
+
+        // El informe de septiembre cobra tres especímenes del mismo paciente y fecha.
+        for ($i = 0; $i < 3; $i++) {
+            $historial->registrar('CERVIX', '2026-09', 'AP', '898221', 176744.0, '', '', '2026-09-03', 'A');
+        }
+
+        $valorizacion = new ValorizacionAdministrativa('CERVIX', $historial, [], static fn (string $cum): array => []);
+
+        for ($i = 0; $i < 4; $i++) {
+            $valorizacion->registrar($this->detalle('procedimientos', '898221', 1.0, ['casoId' => 'A', 'numDocumentoIdentificacion' => 'A',
+                'fechaAtencion' => '2026-09-03 08:00', 'servicioJson' => ['consecutivo' => (string) $i]]), ['respaldado' => 176744.0]);
+        }
+
+        $ap = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0)['AP'];
+
+        // Cuatro líneas idénticas: tres son unidades documentadas por el informe del mes y la cuarta repite el servicio.
+        $this->assertSame([706976.0, 530232.0], [$ap[3], $ap[4]]);
+        $this->assertStringContainsString('Unidad por paciente y fecha: 3',
+            collect($valorizacion->filasDetalle())->firstWhere(6, 'REPETICION DEL MISMO SERVICIO')[20]);
+    }
+
+    public function test_scheme_documented_in_the_month_report_resolves_only_sessions_backed_by_the_rips(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-07', '2026-08', '2026-09'] as $mes) {
+            for ($i = 0; $i < 3; $i++) {
+                $historial->registrar('CERVIX', $mes, 'AP', '992511', 32000000.0, '', 'PEMBROLIZUMAB + CARBOPLATINO');
+            }
+
+            for ($i = 0; $i < 7; $i++) {
+                $historial->registrar('CERVIX', $mes, 'AP', '992511', 2000000.0, '', 'CARBOPLATINO + PACLITAXEL');
+            }
+        }
+
+        // Informe de octubre: D1 con pembrolizumab en la fecha de su sesión y en otra sesión sin línea RIPS; D2 con
+        // pembrolizumab sin respaldo en su factura; D3 con el esquema base.
+        foreach ([['D1', '2026-10-09', 32000000.0, 'PEMBROLIZUMAB + CARBOPLATINO'], ['D1', '2026-10-30', 32000000.0, 'PEMBROLIZUMAB + CARBOPLATINO'],
+            ['D2', '2026-10-12', 32000000.0, 'PEMBROLIZUMAB + CARBOPLATINO'], ['D3', '2026-10-15', 2000000.0, 'CARBOPLATINO + PACLITAXEL']] as [$documento, $fecha, $valor, $medicamento]) {
+            $historial->registrar('CERVIX', '2026-10', 'AP', '992511', $valor, '', $medicamento, $fecha, $documento);
+        }
+
+        $valorizacion = new ValorizacionAdministrativa('CERVIX', $historial, $this->notaCervix(), static fn (string $cum): array => []);
+        $sesion = fn (string $documento, string $fecha): array => $this->detalle('procedimientos', '992511', 1.0, ['mesAtencion' => '2026-10',
+            'casoId' => $documento, 'factura' => 'F'.$documento, 'numDocumentoIdentificacion' => $documento, 'fechaAtencion' => $fecha.' 08:00']);
+
+        foreach ([['D1', '2026-10-09'], ['D2', '2026-10-12'], ['D3', '2026-10-15']] as [$documento, $fecha]) {
+            $valorizacion->registrar($sesion($documento, $fecha), ['respaldado' => 444690.0]);
+        }
+
+        // El pembrolizumab de D1 está en otra fecha de la misma factura (esquema indeterminado sin el informe).
+        $valorizacion->registrar($this->detalle('medicamentos', 'PEMBRO', 1.0, ['mesAtencion' => '2026-10', 'casoId' => 'D1', 'factura' => 'FD1',
+            'fechaAtencion' => '2026-10-04 09:00', 'principioActivo' => 'PEMBROLIZUMAB', 'cumResuelto' => 'CUM-PEMBRO']), ['respaldado' => 0.0]);
+
+        $tratamientos = collect($valorizacion->filasTratamientos());
+        $documentados = $tratamientos->filter(static fn (array $fila): bool => str_starts_with($fila[3], 'ESQUEMA DOCUMENTADO EN EL INFORME DEL MES'));
+
+        // D1 toma el esquema con pembrolizumab y D3 el base; D2 conserva la base provisional y su mezcla condicionada.
+        // La segunda sesión administrativa de D1 no crea una sesión RIPS.
+        $this->assertSame(3, $tratamientos->sum(4));
+        $this->assertSame([36000000.0, 9000000.0], [$tratamientos->sum(8), $tratamientos->sum(9)]);
+        $this->assertSame([2000000.0, 32000000.0], $documentados->pluck(6)->sort()->values()->all());
+        $this->assertStringContainsString('RESPALDO RIPS: DISTINTIVO PEMB EN LA FACTURA', $documentados->firstWhere(6, 32000000.0)[3]);
+        $this->assertSame(ValorizacionAdministrativa::COBERTURA_INCLUIDO_AP,
+            collect($valorizacion->filasCoberturaMedicamentos())->firstWhere(6, 'CUM-PEMBRO')[16]);
+    }
+
+    public function test_package_procedure_billed_apart_in_the_month_report_is_conditioned_and_never_central(): void
+    {
+        $historial = new HistorialAdministrativo;
+        $historial->registrar('PROSTATA', '2026-09', 'AP', '902210', 19000.0, '', '', '2026-09-05', 'A');
+        $valorizacion = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $absorbida = fn (string $documento, string $codigo): array => $this->detalle('procedimientos', $codigo, 1.0, ['casoId' => $documento,
+            'numDocumentoIdentificacion' => $documento, 'fechaAtencion' => '2026-09-05 10:00', 'decisionPaquete' => 'INCLUIDO_EN_PAQUETE']);
+
+        // A tiene fila del mismo servicio en el informe del mes; B y el otro examen de A no la tienen.
+        $valorizacion->registrar($absorbida('A', '902210'), ['respaldado' => 0.0]);
+        $valorizacion->registrar($absorbida('B', '902210'), ['respaldado' => 0.0]);
+        $valorizacion->registrar($absorbida('A', '903859'), ['respaldado' => 0.0]);
+
+        $ap = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0)['AP'];
+        $detalle = collect($valorizacion->filasDetalle());
+
+        $cobrada = $detalle->firstWhere(6, ValorizacionAdministrativa::SUBTIPO_ESTANCIA_COBRADA_APARTE);
+
+        $this->assertSame([0.0, 0.0, 19000.0], [$ap[3], $ap[4], $ap[6]]);
+        $this->assertSame(['902210', 1, 'NO', 19000.0], [$cobrada[2], $cobrada[7], $cobrada[5], $cobrada[18]]);
+        $this->assertSame(2, $detalle->where(6, 'INCLUIDO EN PAQUETE HOSPITALARIO AH')->sum(7));
+
+        // La única fila del informe corresponde a la línea cobrada del mismo servicio, en cualquier orden: el AP de la estancia no la reutiliza.
+        foreach ([true, false] as $primeroAbsorbido) {
+            $otra = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+            $cobradaAparte = $this->detalle('procedimientos', '902210', 1.0, ['casoId' => 'A', 'numDocumentoIdentificacion' => 'A',
+                'fechaAtencion' => '2026-09-05 06:00', 'tarifaReferencia' => 19000.0]);
+            $lineas = [[$absorbida('A', '902210'), ['respaldado' => 0.0]], [$cobradaAparte, ['respaldado' => 19000.0]]];
+
+            foreach ($primeroAbsorbido ? $lineas : array_reverse($lineas) as [$linea, $economico]) {
+                $otra->registrar($linea, $economico);
+            }
+
+            $this->assertSame([19000.0, 19000.0, 0.0], array_map(static fn (int $i): mixed => collect($otra->resumenServicios('2026-09')['filas'])->keyBy(0)['AP'][$i], [3, 4, 6]));
+        }
+    }
+
+    public function test_higher_month_report_price_keeps_the_accredited_tariff_and_conditions_only_the_difference(): void
+    {
+        $historial = new HistorialAdministrativo;
+        $historial->registrar('PROSTATA', '2026-09', 'AP', '906610', 91387.0, '', '', '2026-09-03', 'A');
+        $historial->registrar('PROSTATA', '2026-09', 'AP', '906610', 57590.0, '', '', '2026-09-03', 'B');
+        $valorizacion = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+
+        foreach (['A', 'B', 'C'] as $documento) {
+            $valorizacion->registrar($this->detalle('procedimientos', '906610', 1.0, ['casoId' => $documento, 'numDocumentoIdentificacion' => $documento,
+                'fechaAtencion' => '2026-09-03 07:00', 'tarifaReferencia' => 57590.0]), ['respaldado' => 57590.0]);
+        }
+
+        $ap = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0)['AP'];
+        $diferencia = collect($valorizacion->filasDetalle())->firstWhere(6, ValorizacionAdministrativa::SUBTIPO_PRECIO_INFORME_MES);
+
+        $this->assertSame([172770.0, 172770.0, 33797.0], [$ap[3], $ap[4], $ap[6]]);
+        $this->assertSame([0, 33797.0], [$diferencia[7], $diferencia[18]]);
+    }
+
+    public function test_documented_equivalence_prices_the_rips_code_with_its_equivalent_and_keeps_the_cups(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-02', '2026-03'] as $mes) {
+            $historial->registrar('PROSTATA', $mes, 'AP', '405407', 5052320.0, 'LINFADENECTOMIA RADICAL PELVICA VIA LAPAROSCOPICA', '', $mes.'-10', 'X'.$mes);
+        }
+
+        foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
+            foreach (['Y1', 'Y2'] as $n => $documento) {
+                $historial->registrar('PROSTATA', $mes, 'AP', '405406', 3805615.0, 'LINFADENECTOMIA RADICAL PELVICA VIA ABIERTA', '', $mes.'-1'.$n, $documento.$mes);
+            }
+        }
+
+        $historial->registrar('PROSTATA', '2026-09', 'AP', '405406', 3805615.0, '', '', '2026-09-04', 'A');
+        $historial->registrar('PROSTATA', '2026-09', 'AP', '405406', 3805615.0, '', '', '2026-09-11', 'B');
+        $linfadenectomia = fn (string $documento, string $fecha): array => $this->detalle('procedimientos', '405407', 1.0, ['casoId' => $documento,
+            'numDocumentoIdentificacion' => $documento, 'fechaAtencion' => $fecha.' 07:00']);
+        $valorizacion = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $valorizacion->registrar($linfadenectomia('A', '2026-09-04'), ['respaldado' => 0.0]);
+        $valorizacion->registrar($linfadenectomia('B', '2026-09-11'), ['respaldado' => 0.0]);
+
+        $fila = collect($valorizacion->filasDetalle())->firstWhere(6, 'EQUIVALENCIA DOCUMENTADA CON 405406');
+
+        $this->assertSame(['405407', 2, 7611230.0], [$fila[2], $fila[7], $fila[17]]);
+        $this->assertStringContainsString('Informe del mes: 2 de 2 líneas con fila 405406 del mismo paciente y fecha; ninguna fila 405407.', $fila[20]);
+
+        // Si el informe del mes cobra el código propio, la equivalencia no se aplica.
+        $historial->registrar('PROSTATA', '2026-09', 'AP', '405407', 5052320.0, '', '', '2026-09-20', 'C');
+        $propia = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $propia->registrar($linfadenectomia('A', '2026-09-04'), ['respaldado' => 0.0]);
+
+        $this->assertNull(collect($propia->filasDetalle())->firstWhere(6, 'EQUIVALENCIA DOCUMENTADA CON 405406'));
+    }
+
+    public function test_rn05_result_does_not_depend_on_the_order_of_the_lines(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        // Unidad histórica: dos filas por paciente y fecha.
+        foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
+            $historial->registrar('PROSTATA', $mes, 'AP', '550202', 1218650.0, '', '', $mes.'-10', 'H'.$mes);
+            $historial->registrar('PROSTATA', $mes, 'AP', '550202', 1218650.0, '', '', $mes.'-10', 'H'.$mes);
+        }
+
+        $linea = fn (string $hora, string $factura, string $consecutivo): array => $this->detalle('procedimientos', '550202', 1.0, ['casoId' => 'A',
+            'numDocumentoIdentificacion' => 'A', 'factura' => $factura, 'fechaAtencion' => '2026-09-03 '.$hora,
+            'servicioJson' => ['fechaInicioAtencion' => '2026-09-03 '.$hora, 'consecutivo' => $consecutivo]]);
+        $centrales = [];
+
+        // Dos líneas idénticas y una distinta, en tres órdenes (incluido el de otra factura cargada antes).
+        foreach ([[['08:00', 'F1'], ['08:00', 'F1'], ['10:30', 'F2']], [['08:00', 'F1'], ['10:30', 'F2'], ['08:00', 'F1']], [['10:30', 'F2'], ['08:00', 'F1'], ['08:00', 'F1']]] as $orden) {
+            $valorizacion = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+
+            foreach ($orden as $n => [$hora, $factura]) {
+                $valorizacion->registrar($linea($hora, $factura, (string) $n), ['respaldado' => 1218650.0]);
+            }
+
+            $ap = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0)['AP'];
+            $centrales[] = [$ap[3], $ap[4]];
+        }
+
+        // Dos unidades por paciente y fecha: la distinta y una de las idénticas; la otra idéntica no suma.
+        $this->assertSame(array_fill(0, 3, [3655950.0, 2437300.0]), $centrales);
+    }
+
+    public function test_month_report_price_difference_does_not_depend_on_the_order_of_the_report_rows(): void
+    {
+        $condicionados = [];
+
+        foreach ([[57590.0, 91387.0], [91387.0, 57590.0]] as $valores) {
+            $historial = new HistorialAdministrativo;
+
+            foreach ($valores as $valor) {
+                $historial->registrar('PROSTATA', '2026-09', 'AP', '906610', $valor, '', '', '2026-09-03', 'A');
+            }
+
+            $valorizacion = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+
+            foreach (['07:00', '15:00'] as $hora) {
+                $valorizacion->registrar($this->detalle('procedimientos', '906610', 1.0, ['casoId' => 'A', 'numDocumentoIdentificacion' => 'A',
+                    'fechaAtencion' => '2026-09-03 '.$hora, 'servicioJson' => ['fechaInicioAtencion' => '2026-09-03 '.$hora], 'tarifaReferencia' => 57590.0]), ['respaldado' => 57590.0]);
+            }
+
+            $condicionados[] = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0)['AP'][6];
+        }
+
+        $this->assertSame([33797.0, 33797.0], $condicionados);
+    }
+
+    public function test_documented_scheme_row_is_not_reused_by_another_session_and_its_value_must_match_the_class(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-07', '2026-08', '2026-09'] as $mes) {
+            for ($i = 0; $i < 3; $i++) {
+                $historial->registrar('CERVIX', $mes, 'AP', '992511', 32000000.0, '', 'PEMBROLIZUMAB + CARBOPLATINO');
+            }
+
+            for ($i = 0; $i < 7; $i++) {
+                $historial->registrar('CERVIX', $mes, 'AP', '992511', 2000000.0, '', 'CARBOPLATINO + PACLITAXEL');
+            }
+        }
+
+        // D1: una sola fila del informe, la de la sesión del 09 (que ya tiene pembrolizumab en su fecha).
+        // D2: la fila dice pembrolizumab pero vale el precio base: no documenta el esquema.
+        $historial->registrar('CERVIX', '2026-10', 'AP', '992511', 32000000.0, '', 'PEMBROLIZUMAB + CARBOPLATINO', '2026-10-09', 'D1');
+        $historial->registrar('CERVIX', '2026-10', 'AP', '992511', 2000000.0, '', 'PEMBROLIZUMAB + CARBOPLATINO', '2026-10-12', 'D2');
+        $valorizacion = new ValorizacionAdministrativa('CERVIX', $historial, $this->notaCervix(), static fn (string $cum): array => []);
+        $registrar = function (string $tipo, string $documento, string $fecha, string $codigo, array $extra = []) use ($valorizacion): void {
+            $valorizacion->registrar($this->detalle($tipo, $codigo, 1.0, ['mesAtencion' => '2026-10', 'casoId' => $documento, 'factura' => 'F'.$documento,
+                'numDocumentoIdentificacion' => $documento, 'fechaAtencion' => $fecha.' 08:00', ...$extra]), ['respaldado' => $tipo === 'procedimientos' ? 444690.0 : 0.0]);
+        };
+        $pembro = ['principioActivo' => 'PEMBROLIZUMAB', 'cumResuelto' => 'CUM-PEMBRO'];
+
+        $registrar('procedimientos', 'D1', '2026-10-09', '992511');
+        $registrar('procedimientos', 'D1', '2026-10-23', '992511');
+        $registrar('medicamentos', 'D1', '2026-10-09', 'PEMBRO', $pembro);
+        $registrar('procedimientos', 'D2', '2026-10-12', '992511');
+        $registrar('medicamentos', 'D2', '2026-10-04', 'PEMBRO', $pembro);
+
+        $tratamientos = collect($valorizacion->filasTratamientos());
+
+        // D1 del 09 por su propio distintivo; D1 del 23 y D2 siguen indeterminadas (base provisional + 30 M condicionados).
+        $this->assertSame([], $tratamientos->filter(static fn (array $fila): bool => str_starts_with($fila[3], 'ESQUEMA DOCUMENTADO'))->all());
+        $this->assertSame([36000000.0, 60000000.0], [$tratamientos->sum(8), $tratamientos->sum(9)]);
+    }
+
+    public function test_review_annotation_does_not_remove_the_code_from_the_au_attribution(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
+            $historial->registrar('PROSTATA', $mes, 'AP', '879111', 300000.0, '', '', $mes.'-10', 'H'.$mes);
+        }
+
+        $valorizacion = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $valorizacion->registrar($this->detalle('urgencias', '', 1.0, ['casoId' => 'A', 'factura' => 'F1', 'fechaAtencion' => '2026-09-03 07:00',
+            'servicioJson' => ['fechaEgreso' => '2026-09-03 20:00']]), ['respaldado' => 0.0]);
+
+        // Dos líneas distintas del mismo paciente y fecha (la segunda queda por revisar) durante la urgencia; B fuera de ella.
+        foreach ([['A', '09:00'], ['A', '11:00'], ['B', '09:00']] as [$documento, $hora]) {
+            $valorizacion->registrar($this->detalle('procedimientos', '879111', 1.0, ['casoId' => $documento, 'numDocumentoIdentificacion' => $documento,
+                'factura' => 'F1', 'fechaAtencion' => '2026-09-03 '.$hora, 'servicioJson' => ['fechaInicioAtencion' => '2026-09-03 '.$hora]]), ['respaldado' => 0.0]);
+        }
+
+        $resumen = $valorizacion->resumenServicios('2026-09');
+
+        $this->assertSame(900000.0, collect($resumen['filas'])->keyBy(0)['AP'][4]);
+        $this->assertSame(600000.0, $resumen['urgencias']['atribuidoAdministrativo']);
+    }
+
+    public function test_documented_equivalence_needs_its_start_date_and_enough_correspondence_and_works_without_the_month_report(): void
+    {
+        $historial = new HistorialAdministrativo;
+
+        foreach (['2026-01', '2026-02', '2026-03', '2026-06', '2026-07', '2026-08'] as $mes) {
+            $historial->registrar('PROSTATA', $mes, 'AP', '405406', 3805615.0, 'LINFADENECTOMIA RADICAL PELVICA VIA ABIERTA', '', $mes.'-10', 'Y'.$mes);
+        }
+
+        $linfadenectomia = fn (string $mes, string $documento, string $fecha): array => $this->detalle('procedimientos', '405407', 1.0, ['mesAtencion' => $mes,
+            'casoId' => $documento, 'numDocumentoIdentificacion' => $documento, 'fechaAtencion' => $fecha.' 07:00']);
+        $subtipo = static fn (ValorizacionAdministrativa $valorizacion): ?string => collect($valorizacion->filasDetalle())->firstWhere(2, '405407')[6] ?? null;
+
+        // Sin informe del mes: equivalencia autónoma desde abril; antes de la vigencia, precio propio.
+        $septiembre = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $septiembre->registrar($linfadenectomia('2026-09', 'A', '2026-09-04'), ['respaldado' => 0.0]);
+        $marzo = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $marzo->registrar($linfadenectomia('2026-03', 'A', '2026-03-04'), ['respaldado' => 0.0]);
+        $fila = collect($septiembre->filasDetalle())->firstWhere(2, '405407');
+
+        $this->assertSame(['EQUIVALENCIA DOCUMENTADA CON 405406', 3805615.0], [$fila[6], $fila[17]]);
+        $this->assertStringNotContainsString('Informe del mes', $fila[20]);
+        $this->assertNotSame('EQUIVALENCIA DOCUMENTADA CON 405406', $subtipo($marzo));
+
+        // Cérvix tarifa 405407 en su propia nota: la equivalencia documentada es solo de Próstata, aunque 405406 tenga precio en Cérvix.
+        foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
+            $historial->registrar('CERVIX', $mes, 'AP', '405406', 3805615.0, '', '', $mes.'-10', 'Z'.$mes);
+        }
+
+        $cervix = new ValorizacionAdministrativa('CERVIX', $historial, [], static fn (string $cum): array => []);
+        $cervix->registrar($linfadenectomia('2026-09', 'A', '2026-09-04'), ['respaldado' => 0.0]);
+        $this->assertNotSame('EQUIVALENCIA DOCUMENTADA CON 405406', $subtipo($cervix));
+
+        // Con informe del mes y fila 405406 en 1 de 2 líneas (menos del 90 %): no se aplica.
+        $historial->registrar('PROSTATA', '2026-09', 'AP', '405406', 3805615.0, '', '', '2026-09-04', 'A');
+        $parcial = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
+        $parcial->registrar($linfadenectomia('2026-09', 'A', '2026-09-04'), ['respaldado' => 0.0]);
+        $parcial->registrar($linfadenectomia('2026-09', 'B', '2026-09-11'), ['respaldado' => 0.0]);
+
+        $this->assertNotSame('EQUIVALENCIA DOCUMENTADA CON 405406', $subtipo($parcial));
+    }
+
     public function test_without_administrative_history_only_cost_a_and_medication_history_are_used(): void
     {
         $valorizacion = new ValorizacionAdministrativa('CERVIX', new HistorialAdministrativo, [], static fn (string $cum): array => []);

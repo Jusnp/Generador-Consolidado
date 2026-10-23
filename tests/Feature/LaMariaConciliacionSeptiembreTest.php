@@ -6,6 +6,7 @@ use App\Models\User;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
 use OpenSpout\Reader\XLSX\Reader;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Tests\TestCase;
 
 class LaMariaConciliacionSeptiembreTest extends TestCase
@@ -15,22 +16,49 @@ class LaMariaConciliacionSeptiembreTest extends TestCase
         'RESUMEN POR TIPO RIPS', 'SERVICIOS POR CODIGO', 'CATEGORIAS NOTA', 'AT Y AU', 'EPISODIOS AU', 'CONTROL DOS VISTAS',
         'COSTO A ACTUAL', 'ESTIMACIÓN ADMINISTRATIVA'];
 
-    public function test_four_september_jsons_generate_clean_route_workbooks_with_temporally_linked_schemes(): void
+    private const BASE = 'C:/Users/Juan/Desktop/Trabajo/RIPS JSON RUTA AUTOINMUNES/pestaña 2/';
+
+    /**
+     * Sin informe de septiembre (informes anteriores, hasta agosto) el cálculo es autónomo; con los informes
+     * nuevos, que cubren septiembre, se agrega la conciliación del mismo mes (RN-17). El costo A no cambia.
+     *
+     * @return array<string, array{0: array{PROSTATA: string, CERVIX: string}, 1: array{prostata: float, cervix: float}, 2: string, 3: array{prostata: float, cervix: float}|null}>
+     */
+    public static function informesAdministrativos(): array
+    {
+        return [
+            'informes anteriores (sin informe del mes)' => [[
+                'PROSTATA' => self::BASE.'Nueva carpeta/INFORME ADMIN PROSTATA PARA JUAN.xlsx',
+                'CERVIX' => self::BASE.'Nueva carpeta/INFORME ADMIN CERVIX PARA JUAN.xlsx',
+            ], ['prostata' => 3543529898.23, 'cervix' => 1454024001.78], 'RESUMEN_AT', null],
+            'informes nuevos (con informe del mes)' => [[
+                'PROSTATA' => 'C:/Users/Juan/Downloads/Informe Administrativo CaP - Oct 2025 - sept 2026 nueva clasificación EJECUCION.xlsx',
+                'CERVIX' => 'C:/Users/Juan/Downloads/Informe Administrativo CCU - Oct 2025 - septi 2026.xlsx nueva clasificación Ejecución.xlsx',
+            ], ['prostata' => 3529346176.34, 'cervix' => 1460636867.64], 'INFORME_DEL_MES', ['prostata' => 3543529898.23, 'cervix' => 1454024001.78]],
+        ];
+    }
+
+    /**
+     * @param  array{PROSTATA: string, CERVIX: string}  $informes
+     * @param  array{prostata: float, cervix: float}  $centrales
+     * @param  array{prostata: float, cervix: float}|null  $autonomos  Valor sin el informe del mes cuando el informe lo cubre.
+     */
+    #[DataProvider('informesAdministrativos')]
+    public function test_four_september_jsons_generate_clean_route_workbooks_with_temporally_linked_schemes(array $informes, array $centrales, string $sufijo, ?array $autonomos): void
     {
         if (getenv('SIRUTA_PRUEBA_SEPTIEMBRE') !== '1' || getenv('DB_DATABASE') !== 'json_excel_demo_lamaria_20261008') {
             $this->markTestSkipped('Solo se ejecuta en la base aislada de demostración, con autorización expresa.');
         }
 
+        if (! is_file($informes['PROSTATA']) || ! is_file($informes['CERVIX'])) {
+            $this->markTestSkipped('Requiere los informes administrativos en su carpeta privada.');
+        }
+
         $this->assertSame('json_excel_demo_lamaria_20261008', DB::connection()->getDatabaseName());
-        $base = 'C:/Users/Juan/Desktop/Trabajo/RIPS JSON RUTA AUTOINMUNES/pestaña 2/';
         config(['programas.la-maria.politica_dispensacion' => 'CONDICIONADA']);
         config(['programas.la-maria.libro_paquetes' => 'POR_LOTE']);
-        config(['programas.la-maria.informes_administrativos' => [
-            'requerido' => true,
-            'PROSTATA' => $base.'Nueva carpeta/INFORME ADMIN PROSTATA PARA JUAN.xlsx',
-            'CERVIX' => $base.'Nueva carpeta/INFORME ADMIN CERVIX PARA JUAN.xlsx',
-        ]]);
-        $sources = $base.'Septiembre json/';
+        config(['programas.la-maria.informes_administrativos' => ['requerido' => true, ...$informes]]);
+        $sources = self::BASE.'Septiembre json/';
         $invoices = ['FEHM643506', 'FEHM643507', 'FEHM643504', 'FEHM643505'];
         $destination = getenv('SIRUTA_SEPTIEMBRE_DESTINATION') ?: base_path('outputs/septiembre-resumen-at-20261021');
 
@@ -45,15 +73,15 @@ class LaMariaConciliacionSeptiembreTest extends TestCase
             $user = User::factory()->create(['role' => 'admin', 'active' => true]);
 
             foreach ([
-                'prostata' => ['pacientes' => 1034, 'registros' => 11360, 'principal' => 2137528852.70, 'central' => 3708242181.90],
-                'cervix' => ['pacientes' => 442, 'registros' => 6954, 'principal' => 521906976.77, 'central' => 1470200269.99],
+                'prostata' => ['pacientes' => 1034, 'registros' => 11360, 'principal' => 2137528852.70, 'central' => $centrales['prostata']],
+                'cervix' => ['pacientes' => 442, 'registros' => 6954, 'principal' => 521906976.77, 'central' => $centrales['cervix']],
             ] as $route => $expected) {
                 $uploads = array_map(static fn (string $invoice): UploadedFile => new UploadedFile(
                     $sources.$invoice.'.json', $invoice.'.json', 'application/json', null, true
                 ), $invoices);
                 $response = $this->actingAs($user)->post(route('la-maria.'.$route.'.export'), ['archivos' => $uploads]);
                 $response->assertDownload();
-                $output = $destination.'/LA_MARIA_'.strtoupper($route).'_SEPTIEMBRE_RESUMEN_AT.xlsx';
+                $output = $destination.'/LA_MARIA_'.strtoupper($route).'_SEPTIEMBRE_'.$sufijo.'.xlsx';
                 file_put_contents($output, $response->streamedContent());
 
                 [$names, $first] = $this->firstSheet($output);
@@ -80,6 +108,17 @@ class LaMariaConciliacionSeptiembreTest extends TestCase
                 $this->assertSame($expected['central'], round(array_sum(array_map(
                     static fn (array $row): float => (float) $row[1], [$services[0], $services[1], $services[2], $services[4], $services[5]]
                 )), 2));
+                // La fuente del total queda declarada: autónomo, o conciliado con su valor autónomo y el ajuste.
+                $fuente = array_slice($first, $serviceHeader + 8, 3);
+                $this->assertSame('FUENTE DEL TOTAL', $fuente[0][0]);
+
+                if ($autonomos === null) {
+                    $this->assertStringStartsWith('CÁLCULO AUTÓNOMO', (string) $fuente[0][1]);
+                } else {
+                    $this->assertStringStartsWith('CÁLCULO CON INFORME DEL MES — CONCILIACIÓN PARCIAL: informe administrativo de 2026-09', (string) $fuente[0][1]);
+                    $this->assertSame(['VALOR AUTÓNOMO (SIN INFORME DEL MES)', $autonomos[$route]], [$fuente[1][0], round((float) $fuente[1][1], 2)]);
+                    $this->assertSame(round($expected['central'] - $autonomos[$route], 2), round((float) $fuente[2][1], 2));
+                }
 
                 $result = session('la-maria.resultado.'.$route);
                 $cost = collect($result['costos'])->first(static fn (array $row): bool => ($row[1] ?? '') === '2026-09');

@@ -4,11 +4,17 @@ namespace App\Programas\LaMaria;
 
 use DateTimeImmutable;
 use DateTimeInterface;
+use OpenSpout\Common\Entity\Cell;
+use OpenSpout\Common\Entity\Cell\FormulaCell;
+use OpenSpout\Common\Exception\OpenSpoutException;
+use OpenSpout\Reader\SheetInterface;
 use OpenSpout\Reader\XLSX\Reader;
+use ZipArchive;
 
 /**
  * Valores administrativos históricos por tipo RIPS y código, leídos de la hoja
- * «inf admin» de los informes administrativos de La María. Solo conserva mes,
+ * «inf admin» (con CLASIFICACIÓN RIPS) o, en los informes nuevos, de la hoja de
+ * servicios con GRUPO DEL SERVICIO (equivalencia verificada). Solo conserva mes,
  * tipo, código, descripción, medicamento del esquema y valor; documento y fecha
  * solo como clave seudónima en memoria (HMAC con semilla aleatoria por
  * instancia) para verificar la correspondencia de prestación con los RIPS.
@@ -23,6 +29,16 @@ final class HistorialAdministrativo
 
     private const MESES_VENTANA = 3;
 
+    /**
+     * GRUPO DEL SERVICIO de los informes nuevos => tipo RIPS. Equivalencia verificada fila a fila contra
+     * CLASIFICACIÓN RIPS del informe anterior (oct-2025 a ago-2026, ambas rutas: 100 % de las filas emparejadas).
+     */
+    private const GRUPOS_TIPO = [
+        'CONSULTA EXTERNA' => 'AC', 'URGENCIAS' => 'AU', 'HOSPITALIZACION' => 'AH', 'TRANSPORTE Y ALBERGUE' => 'AT',
+        'IMAGENES DIAGNOSTICAS' => 'AP', 'LABORATORIO CLINICO' => 'AP', 'PROCEDIMIENTOS DIAGNOSTICOS Y TERAPEUTICOS' => 'AP',
+        'PROCEDIMIENTOS QUIRURGICOS' => 'AP', 'QUIMIOTERAPIA' => 'AP', 'RADIOTERAPIA' => 'AP',
+    ];
+
     /** @var array<string, array<string, array<string, list<float>>>> ruta => tipo|codigo => mes => valores */
     private array $valores = [];
 
@@ -32,17 +48,26 @@ final class HistorialAdministrativo
     /** @var array<string, string> tipo|codigo => descripción administrativa */
     private array $descripciones = [];
 
-    /** @var list<array{archivo: string, ruta: string, filas: int, meses: string}> */
+    /** @var list<array{archivo: string, ruta: string, filas: int, meses: string, hoja: string, advertencias: list<string>}> */
     private array $fuentes = [];
 
     /** @var array<string, true> Huellas sha256 de los archivos ya leídos. */
     private array $huellas = [];
 
-    /** @var array<string, array<string, array<string, array<string, int>>>> ruta => tipo|codigo => mes => paciente|fecha => filas con valor */
+    /** @var array<string, array<string, array<string, array<string, list<float>>>>> ruta => tipo|codigo => mes => paciente|fecha => valores con valor */
     private array $servicios = [];
+
+    /** @var array<string, array<string, array<string, array<string, list<float>>>>> ruta => mes => paciente|fecha => tipo|codigo => valores */
+    private array $serviciosPaciente = [];
+
+    /** @var array<string, array<string, array<string, array<string, array<string, list<array{valor: float, medicamentos: list<string>}>>>>> ruta => tipo|codigo => mes => paciente => fecha => filas AP */
+    private array $esquemasPaciente = [];
 
     /** Semilla de las claves seudónimas; vive solo en memoria. */
     private ?string $semilla = null;
+
+    /** False en la vista autónoma: las filas del mes valorizado no se usan como conciliación (RN-17). */
+    private bool $conciliaMes = true;
 
     /**
      * Medicamentos anotados por registro administrativo (columna MEDICAMENTO):
@@ -93,7 +118,7 @@ final class HistorialAdministrativo
         string $fecha = '', string $documento = ''): void
     {
         $clave = $tipo.'|'.$codigo;
-        $this->registrarServicio($ruta, $mes, $tipo, $codigo, $valor, $fecha, $this->clavePaciente($documento));
+        $this->registrarServicio($ruta, $mes, $tipo, $codigo, $valor, $fecha, $this->clavePaciente($documento), $medicamento);
 
         if (trim($medicamento) !== '') {
             $this->composiciones[$ruta][$clave][$mes][] = [$valor, self::tokens($medicamento), mb_substr(mb_strtoupper(trim($medicamento)), 0, 80)];
@@ -125,7 +150,56 @@ final class HistorialAdministrativo
      */
     public function serviciosDelMes(string $ruta, string $mes, string $tipo, string $codigo): ?array
     {
-        return isset($this->totales[$ruta][$mes]) ? ($this->servicios[$ruta][$tipo.'|'.$codigo][$mes] ?? []) : null;
+        return $this->cubreMes($ruta, $mes) ? array_map('count', $this->servicios[$ruta][$tipo.'|'.$codigo][$mes] ?? []) : null;
+    }
+
+    /** El informe administrativo trae filas del mes valorizado (fuente de conciliación del mismo mes). */
+    public function cubreMes(string $ruta, string $mes): bool
+    {
+        return $this->conciliaMes && isset($this->totales[$ruta][$mes]);
+    }
+
+    /**
+     * Vista autónoma del mismo historial: conserva precios, clases y unidades de los meses anteriores al
+     * valorizado, pero no concilia con las filas del propio mes (cálculo con RN-01 a RN-16, sin RN-17).
+     */
+    public function sinInformeDelMes(): self
+    {
+        $this->semilla ??= random_bytes(16);
+        $vista = clone $this;
+        $vista->conciliaMes = false;
+
+        return $vista;
+    }
+
+    /**
+     * Filas con valor del mismo paciente y fecha en el informe del mes, por tipo|código.
+     * Null si el informe no cubre el mes.
+     *
+     * @return array<string, list<float>>|null
+     */
+    public function filasDelServicio(string $ruta, string $mes, string $paciente, string $fecha): ?array
+    {
+        if (! $this->cubreMes($ruta, $mes)) {
+            return null;
+        }
+
+        return $paciente === '' ? [] : ($this->serviciosPaciente[$ruta][$mes][$paciente.'|'.$fecha] ?? []);
+    }
+
+    /**
+     * Filas AP con valor del código para el paciente en el mes del informe, por fecha, con los
+     * medicamentos anotados (columna MEDICAMENTO). Null si el informe no cubre el mes.
+     *
+     * @return array<string, list<array{valor: float, medicamentos: list<string>}>>|null
+     */
+    public function esquemasPacienteMes(string $ruta, string $mes, string $codigo, string $paciente): ?array
+    {
+        if (! $this->cubreMes($ruta, $mes)) {
+            return null;
+        }
+
+        return $paciente === '' ? [] : ($this->esquemasPaciente[$ruta]['AP|'.$codigo][$mes][$paciente] ?? []);
     }
 
     /**
@@ -150,9 +224,9 @@ final class HistorialAdministrativo
             $pacientes = [];
 
             foreach ($porMes[$m] as $servicio => $filas) {
-                $porFecha = max($porFecha, $filas);
+                $porFecha = max($porFecha, count($filas));
                 $paciente = (string) strstr($servicio, '|', true);
-                $pacientes[$paciente] = ($pacientes[$paciente] ?? 0) + $filas;
+                $pacientes[$paciente] = ($pacientes[$paciente] ?? 0) + count($filas);
             }
 
             $porPacienteMes = max($porPacienteMes, max($pacientes));
@@ -399,7 +473,7 @@ final class HistorialAdministrativo
     }
 
     /**
-     * @return list<array{archivo: string, ruta: string, filas: int, meses: string}>
+     * @return list<array{archivo: string, ruta: string, filas: int, meses: string, hoja: string, advertencias: list<string>}>
      */
     public function fuentes(): array
     {
@@ -421,64 +495,51 @@ final class HistorialAdministrativo
         return $n % 2 === 1 ? (float) $valores[intdiv($n, 2)] : ($valores[$n / 2 - 1] + $valores[$n / 2]) / 2;
     }
 
-    private function registrarServicio(string $ruta, string $mes, string $tipo, string $codigo, float $valor, string $fecha, string $paciente): void
+    private function registrarServicio(string $ruta, string $mes, string $tipo, string $codigo, float $valor, string $fecha, string $paciente,
+        string $medicamento = ''): void
     {
         if ($valor > 0 && $paciente !== '' && $fecha !== '') {
-            $servicio = $paciente.'|'.$fecha;
-            $this->servicios[$ruta][$tipo.'|'.$codigo][$mes][$servicio] = ($this->servicios[$ruta][$tipo.'|'.$codigo][$mes][$servicio] ?? 0) + 1;
+            $this->servicios[$ruta][$tipo.'|'.$codigo][$mes][$paciente.'|'.$fecha][] = $valor;
+            $this->serviciosPaciente[$ruta][$mes][$paciente.'|'.$fecha][$tipo.'|'.$codigo][] = $valor;
+
+            if ($tipo === 'AP') {
+                $this->esquemasPaciente[$ruta][$tipo.'|'.$codigo][$mes][$paciente][$fecha][] = ['valor' => $valor, 'medicamentos' => self::tokens($medicamento)];
+            }
         }
     }
 
     private function leerArchivo(string $ruta, string $nombre): void
     {
+        $filasDeclaradas = self::filasDeclaradas($ruta);
         $reader = new Reader;
         $reader->open($ruta);
-        $filas = [];
-        $diagnosticos = ['PROSTATA' => 0, 'CERVIX' => 0];
+        $elegida = null;
+        $leida = null;
 
         try {
+            // La hoja «inf admin» conserva la prioridad; en los informes nuevos se usa la hoja de servicios con más filas.
             foreach ($reader->getSheetIterator() as $hoja) {
-                if (mb_strtolower(trim($hoja->getName())) !== self::HOJA) {
-                    continue;
+                $nombreHoja = trim($hoja->getName());
+                $orden = [mb_strtolower($nombreHoja) === self::HOJA, $filasDeclaradas[$nombreHoja] ?? 0];
+
+                if (($elegida === null || $orden > $elegida['orden']) && self::encabezado($hoja) !== null) {
+                    $elegida = ['indice' => $hoja->getIndex(), 'nombre' => $nombreHoja, 'orden' => $orden];
                 }
+            }
 
-                $columnas = null;
-                $leidas = 0;
+            foreach ($elegida === null ? [] : $reader->getSheetIterator() as $hoja) {
+                if ($hoja->getIndex() === $elegida['indice']) {
+                    $leida = $this->leerHoja($hoja);
 
-                foreach ($hoja->getRowIterator() as $fila) {
-                    $valores = $fila->toArray();
-
-                    if ($columnas === null) {
-                        $columnas = $leidas++ < 5 ? self::columnas($valores) : [];
-
-                        continue;
-                    }
-
-                    if ($columnas === []) {
-                        break;
-                    }
-
-                    $mes = self::mes($valores[$columnas['fecha']] ?? null);
-                    $tipo = mb_strtoupper(trim((string) ($valores[$columnas['tipo']] ?? '')));
-                    $codigo = trim((string) ($valores[$columnas['codigo']] ?? ''));
-
-                    if ($mes === '' || $tipo === '' || $codigo === '') {
-                        continue;
-                    }
-
-                    $diagnostico = mb_strtoupper(trim((string) ($columnas['diagnostico'] === null ? '' : ($valores[$columnas['diagnostico']] ?? ''))));
-                    $diagnosticos['PROSTATA'] += str_starts_with($diagnostico, 'C61') ? 1 : 0;
-                    $diagnosticos['CERVIX'] += str_starts_with($diagnostico, 'C53') ? 1 : 0;
-                    $filas[] = [$mes, $tipo, $codigo, self::numero($valores[$columnas['valor']] ?? 0),
-                        $columnas['descripcion'] === null ? '' : trim((string) ($valores[$columnas['descripcion']] ?? '')),
-                        $columnas['medicamento'] === null ? '' : trim((string) ($valores[$columnas['medicamento']] ?? '')),
-                        self::dia($valores[$columnas['fecha']] ?? null),
-                        $columnas['documento'] === null ? '' : $this->clavePaciente((string) ($valores[$columnas['documento']] ?? ''))];
+                    break;
                 }
             }
         } finally {
             $reader->close();
         }
+
+        $leida ??= ['filas' => [], 'diagnosticos' => ['PROSTATA' => 0, 'CERVIX' => 0], 'sinGrupo' => [], 'noVerificables' => 0];
+        $diagnosticos = $leida['diagnosticos'];
 
         // Cada informe pertenece a un programa: se asigna por el diagnóstico predominante.
         $rutaPrograma = $diagnosticos['PROSTATA'] === $diagnosticos['CERVIX']
@@ -486,15 +547,170 @@ final class HistorialAdministrativo
             : ($diagnosticos['PROSTATA'] > $diagnosticos['CERVIX'] ? 'PROSTATA' : 'CERVIX');
         $meses = [];
 
-        foreach ($filas as [$mes, $tipo, $codigo, $valor, $descripcion, $medicamento, $fecha, $paciente]) {
-            $this->registrarServicio($rutaPrograma, $mes, $tipo, $codigo, $valor, $fecha, $paciente);
+        foreach ($leida['filas'] as [$mes, $tipo, $codigo, $valor, $descripcion, $medicamento, $fecha, $paciente]) {
+            $this->registrarServicio($rutaPrograma, $mes, $tipo, $codigo, $valor, $fecha, $paciente, $medicamento);
             $this->registrar($rutaPrograma, $mes, $tipo, $codigo, $valor, $descripcion, $medicamento);
             $meses[$mes] = true;
         }
 
+        $advertencias = [];
+
+        foreach ($leida['sinGrupo'] as $grupo => $filas) {
+            $advertencias[] = sprintf('Grupo «%s» sin equivalencia RIPS verificada: %d filas no usadas.', $grupo, $filas);
+        }
+
+        if ($leida['noVerificables'] > 0) {
+            $advertencias[] = sprintf('%d filas con valor calculado por fórmula no verificable: no usadas.', $leida['noVerificables']);
+        }
+
         ksort($meses);
         $this->fuentes[] = ['archivo' => $nombre, 'ruta' => $rutaPrograma === '' ? 'NO IDENTIFICADA' : $rutaPrograma,
-            'filas' => count($filas), 'meses' => $meses === [] ? '' : array_key_first($meses).' a '.array_key_last($meses)];
+            'filas' => count($leida['filas']), 'meses' => $meses === [] ? '' : array_key_first($meses).' a '.array_key_last($meses),
+            'hoja' => $elegida['nombre'] ?? '', 'advertencias' => $advertencias];
+    }
+
+    /**
+     * Columnas de la hoja si una de sus cinco primeras filas es el encabezado de un informe de servicios.
+     *
+     * @return array{codigo: int, tipo: int|null, grupo: int|null, valor: int, fecha: int, descripcion: int|null, diagnostico: int|null, medicamento: int|null, documento: int|null}|null
+     */
+    private static function encabezado(SheetInterface $hoja): ?array
+    {
+        $leidas = 0;
+
+        try {
+            foreach ($hoja->getRowIterator() as $fila) {
+                $columnas = self::columnas(self::valoresFila($fila->getCells()));
+
+                if ($columnas !== null || ++$leidas >= 5) {
+                    return $columnas;
+                }
+            }
+        } catch (OpenSpoutException) {
+            // Una hoja auxiliar ilegible (tabla dinámica, formato inválido) no es de servicios ni impide leer las demás.
+        }
+
+        return null;
+    }
+
+    /**
+     * Valores de la fila; las columnas calculadas usan el resultado guardado de la fórmula.
+     *
+     * @param  list<Cell>  $celdas
+     * @return list<mixed>
+     */
+    private static function valoresFila(array $celdas): array
+    {
+        return array_map(static fn (Cell $celda): mixed => $celda instanceof FormulaCell ? $celda->getComputedValue() : $celda->getValue(), $celdas);
+    }
+
+    /**
+     * Filas declaradas por hoja en la dimensión del libro (sin leer los datos).
+     *
+     * @return array<string, int>
+     */
+    private static function filasDeclaradas(string $ruta): array
+    {
+        $zip = new ZipArchive;
+
+        if ($zip->open($ruta) !== true) {
+            return [];
+        }
+
+        $libro = (string) $zip->getFromName('xl/workbook.xml');
+        $relaciones = (string) $zip->getFromName('xl/_rels/workbook.xml.rels');
+        preg_match_all('/<sheet\b[^>]*\bname="([^"]*)"[^>]*\br:id="([^"]*)"/', $libro, $hojas, PREG_SET_ORDER);
+        $filas = [];
+
+        foreach ($hojas as [, $nombre, $relacion]) {
+            if (preg_match('/<Relationship\b(?=[^>]*\bId="'.preg_quote($relacion, '/').'")[^>]*\bTarget="([^"]*)"/', $relaciones, $destino) !== 1) {
+                continue;
+            }
+
+            $archivo = str_starts_with($destino[1], '/') ? ltrim($destino[1], '/') : 'xl/'.$destino[1];
+            $flujo = $zip->getStream($archivo);
+            $inicio = '';
+
+            if ($flujo !== false) {
+                $inicio = (string) fread($flujo, 4096);
+                fclose($flujo);
+            }
+
+            if (preg_match('/<dimension ref="[A-Z]*\d+(?::[A-Z]*(\d+))?"/', $inicio, $dimension) === 1) {
+                $filas[trim(html_entity_decode($nombre, ENT_QUOTES | ENT_XML1))] = (int) ($dimension[1] ?? 1);
+            }
+        }
+
+        $zip->close();
+
+        return $filas;
+    }
+
+    /**
+     * Filas de la hoja de servicios administrativos elegida.
+     *
+     * @return array{filas: list<array{0: string, 1: string, 2: string, 3: float, 4: string, 5: string, 6: string, 7: string}>, diagnosticos: array{PROSTATA: int, CERVIX: int}, sinGrupo: array<string, int>, noVerificables: int}
+     */
+    private function leerHoja(SheetInterface $hoja): array
+    {
+        $columnas = null;
+        $leidas = 0;
+        $resultado = ['filas' => [], 'diagnosticos' => ['PROSTATA' => 0, 'CERVIX' => 0], 'sinGrupo' => [], 'noVerificables' => 0];
+
+        foreach ($hoja->getRowIterator() as $fila) {
+            $celdas = $fila->getCells();
+            $valores = self::valoresFila($celdas);
+
+            if ($columnas === null) {
+                $columnas = $leidas++ < 5 ? self::columnas($valores) : [];
+
+                continue;
+            }
+
+            if ($columnas === []) {
+                break;
+            }
+
+            $mes = self::mes($valores[$columnas['fecha']] ?? null);
+            $codigo = trim((string) ($valores[$columnas['codigo']] ?? ''));
+            $tipo = $columnas['tipo'] !== null
+                ? mb_strtoupper(trim((string) ($valores[$columnas['tipo']] ?? '')))
+                : (self::GRUPOS_TIPO[self::normalizar((string) ($valores[$columnas['grupo']] ?? ''))] ?? '');
+
+            if ($tipo === '' && $columnas['tipo'] === null && $mes !== '' && $codigo !== '') {
+                $grupo = self::normalizar((string) ($valores[$columnas['grupo']] ?? ''));
+                $resultado['sinGrupo'][$grupo] = ($resultado['sinGrupo'][$grupo] ?? 0) + 1;
+            }
+
+            if ($mes === '' || $tipo === '' || $codigo === '') {
+                continue;
+            }
+
+            // Un error o un texto como resultado de la fórmula de VALOR no es verificable.
+            $celdaValor = $celdas[$columnas['valor']] ?? null;
+
+            if ($celdaValor instanceof FormulaCell && ! is_numeric($celdaValor->getComputedValue())) {
+                $resultado['noVerificables']++;
+
+                continue;
+            }
+
+            $diagnostico = mb_strtoupper(trim((string) ($columnas['diagnostico'] === null ? '' : ($valores[$columnas['diagnostico']] ?? ''))));
+            $resultado['diagnosticos']['PROSTATA'] += str_starts_with($diagnostico, 'C61') ? 1 : 0;
+            $resultado['diagnosticos']['CERVIX'] += str_starts_with($diagnostico, 'C53') ? 1 : 0;
+            $resultado['filas'][] = [$mes, $tipo, $codigo, self::numero($valores[$columnas['valor']] ?? 0),
+                $columnas['descripcion'] === null ? '' : trim((string) ($valores[$columnas['descripcion']] ?? '')),
+                $columnas['medicamento'] === null ? '' : trim((string) ($valores[$columnas['medicamento']] ?? '')),
+                self::dia($valores[$columnas['fecha']] ?? null),
+                $columnas['documento'] === null ? '' : $this->clavePaciente((string) ($valores[$columnas['documento']] ?? ''))];
+        }
+
+        return $resultado;
+    }
+
+    private static function normalizar(string $texto): string
+    {
+        return (string) preg_replace('/\s+/', ' ', strtr(mb_strtoupper(trim($texto)), ['Á' => 'A', 'É' => 'E', 'Í' => 'I', 'Ó' => 'O', 'Ú' => 'U', 'Ñ' => 'N']));
     }
 
     /**
@@ -502,11 +718,11 @@ final class HistorialAdministrativo
      * tienen en posiciones distintas.
      *
      * @param  array<int, mixed>  $encabezado
-     * @return array{codigo: int, tipo: int, valor: int, fecha: int, descripcion: int|null, diagnostico: int|null, medicamento: int|null, documento: int|null}|null
+     * @return array{codigo: int, tipo: int|null, grupo: int|null, valor: int, fecha: int, descripcion: int|null, diagnostico: int|null, medicamento: int|null, documento: int|null}|null
      */
     private static function columnas(array $encabezado): ?array
     {
-        $normalizado = array_map(static fn (mixed $valor): string => mb_strtoupper(trim((string) $valor)), $encabezado);
+        $normalizado = array_map(static fn (mixed $valor): string => is_scalar($valor) ? mb_strtoupper(trim((string) $valor)) : '', $encabezado);
         $buscar = static function (string $prefijo) use ($normalizado): ?int {
             foreach ($normalizado as $indice => $titulo) {
                 if (str_starts_with($titulo, $prefijo)) {
@@ -519,6 +735,7 @@ final class HistorialAdministrativo
         $columnas = [
             'codigo' => $buscar('CUPS'),
             'tipo' => $buscar('CLASIFICACI'),
+            'grupo' => $buscar('GRUPO DEL SERVICIO'),
             'valor' => $buscar('VALOR'),
             'fecha' => $buscar('FECHA_PRESTACION'),
             'descripcion' => $buscar('DESCRIPCION DEL SERVICIO'),
@@ -527,30 +744,31 @@ final class HistorialAdministrativo
             'documento' => $buscar('DOCUMENTO'),
         ];
 
-        return in_array(null, [$columnas['codigo'], $columnas['tipo'], $columnas['valor'], $columnas['fecha']], true) ? null : $columnas;
+        return in_array(null, [$columnas['codigo'], $columnas['valor'], $columnas['fecha']], true) || ($columnas['tipo'] === null && $columnas['grupo'] === null)
+            ? null : $columnas;
     }
 
     private static function mes(mixed $fecha): string
     {
-        // Fecha serial de Excel cuando la celda no conserva el formato de fecha.
-        if ((is_int($fecha) || is_float($fecha)) && $fecha > 20000 && $fecha < 80000) {
-            return (new DateTimeImmutable('1899-12-30'))->modify('+'.(int) $fecha.' days')->format('Y-m');
-        }
+        $dia = self::dia($fecha);
 
-        $texto = $fecha instanceof DateTimeInterface ? $fecha->format('Y-m') : substr(trim((string) $fecha), 0, 7);
-
-        return preg_match('/^\d{4}-\d{2}$/', $texto) === 1 ? $texto : '';
+        return $dia === '' ? '' : substr($dia, 0, 7);
     }
 
     private static function dia(mixed $fecha): string
     {
+        // Fecha serial de Excel cuando la celda no conserva el formato de fecha.
         if ((is_int($fecha) || is_float($fecha)) && $fecha > 20000 && $fecha < 80000) {
             return (new DateTimeImmutable('1899-12-30'))->modify('+'.(int) $fecha.' days')->format('Y-m-d');
         }
 
-        $texto = $fecha instanceof DateTimeInterface ? $fecha->format('Y-m-d') : substr(trim((string) $fecha), 0, 10);
+        $texto = $fecha instanceof DateTimeInterface ? $fecha->format('Y-m-d') : trim((string) $fecha);
 
-        return preg_match('/^\d{4}-\d{2}-\d{2}$/', $texto) === 1 ? $texto : '';
+        if (preg_match('#^(\d{1,2})/(\d{1,2})/(\d{4})#', $texto, $partes) === 1) {
+            return checkdate((int) $partes[2], (int) $partes[1], (int) $partes[3]) ? sprintf('%04d-%02d-%02d', $partes[3], $partes[2], $partes[1]) : '';
+        }
+
+        return preg_match('/^(\d{4})-(\d{2})-(\d{2})/', $texto, $partes) === 1 && checkdate((int) $partes[2], (int) $partes[3], (int) $partes[1]) ? substr($texto, 0, 10) : '';
     }
 
     private static function numero(mixed $valor): float
