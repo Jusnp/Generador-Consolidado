@@ -57,6 +57,9 @@ final class HistorialAdministrativo
     /** @var array<string, array<string, array<string, array<string, list<float>>>>> ruta => tipo|codigo => mes => paciente|fecha => valores con valor */
     private array $servicios = [];
 
+    /** @var array<string, array<string, array<string, array{porFecha: int, porPacienteMes: int}>>> */
+    private array $unidadesConsolidadas = [];
+
     /** @var array<string, array<string, array<string, array<string, list<float>>>>> ruta => mes => paciente|fecha => tipo|codigo => valores */
     private array $serviciosPaciente = [];
 
@@ -211,7 +214,8 @@ final class HistorialAdministrativo
     public function unidadPorPaciente(string $ruta, string $mes, string $tipo, string $codigo): ?array
     {
         $porMes = $this->servicios[$ruta][$tipo.'|'.$codigo] ?? [];
-        $meses = array_values(array_intersect($this->ventana($ruta, $mes), array_keys($porMes)));
+        $consolidadas = $this->unidadesConsolidadas[$ruta][$tipo.'|'.$codigo] ?? [];
+        $meses = array_values(array_intersect($this->ventana($ruta, $mes), array_unique([...array_keys($porMes), ...array_keys($consolidadas)])));
 
         if ($meses === []) {
             return null;
@@ -221,18 +225,96 @@ final class HistorialAdministrativo
         $porPacienteMes = 0;
 
         foreach ($meses as $m) {
+            if (isset($consolidadas[$m])) {
+                $porFecha = max($porFecha, $consolidadas[$m]['porFecha']);
+                $porPacienteMes = max($porPacienteMes, $consolidadas[$m]['porPacienteMes']);
+            }
             $pacientes = [];
 
-            foreach ($porMes[$m] as $servicio => $filas) {
+            foreach ($porMes[$m] ?? [] as $servicio => $filas) {
                 $porFecha = max($porFecha, count($filas));
                 $paciente = (string) strstr($servicio, '|', true);
                 $pacientes[$paciente] = ($pacientes[$paciente] ?? 0) + count($filas);
             }
 
-            $porPacienteMes = max($porPacienteMes, max($pacientes));
+            $porPacienteMes = max([$porPacienteMes, ...array_values($pacientes)]);
         }
 
         return ['meses' => $meses, 'porFecha' => $porFecha, 'porPacienteMes' => $porPacienteMes];
+    }
+
+    /**
+     * Referencia sin identificadores de pacientes para el catálogo versionado.
+     * Conserva observaciones, composición de esquemas y máximos de unidad.
+     *
+     * @return array{version: int, fuentes: list<array<string, mixed>>, items: list<array<string, mixed>>}
+     */
+    public function exportarConsolidado(): array
+    {
+        $items = [];
+
+        foreach ($this->valores as $ruta => $codigos) {
+            foreach ($codigos as $clave => $porMes) {
+                [$tipo, $codigo] = explode('|', $clave, 2);
+                $unidades = $this->unidadesConsolidadas[$ruta][$clave] ?? [];
+
+                foreach ($this->servicios[$ruta][$clave] ?? [] as $mes => $servicios) {
+                    $porFecha = 0;
+                    $porPaciente = [];
+
+                    foreach ($servicios as $servicio => $filas) {
+                        $porFecha = max($porFecha, count($filas));
+                        $paciente = (string) strstr($servicio, '|', true);
+                        $porPaciente[$paciente] = ($porPaciente[$paciente] ?? 0) + count($filas);
+                    }
+
+                    $unidades[$mes] = ['porFecha' => $porFecha, 'porPacienteMes' => max(0, ...array_values($porPaciente))];
+                }
+
+                $items[] = [
+                    'ruta' => $ruta,
+                    'tipo' => $tipo,
+                    'codigo' => $codigo,
+                    'descripcion' => $this->descripciones[$clave] ?? '',
+                    'valores' => $porMes,
+                    'composiciones' => $this->composiciones[$ruta][$clave] ?? [],
+                    'unidades' => $unidades,
+                ];
+            }
+        }
+
+        return ['version' => 1, 'fuentes' => $this->fuentes, 'items' => $items];
+    }
+
+    /**
+     * @param  array{version: int, fuentes: list<array<string, mixed>>, items: list<array<string, mixed>>}  $consolidado
+     */
+    public static function desdeConsolidado(array $consolidado): self
+    {
+        if (($consolidado['version'] ?? 0) !== 1) {
+            throw new \InvalidArgumentException('Versión de referencia tarifaria no compatible.');
+        }
+
+        $historial = new self;
+        $historial->fuentes = $consolidado['fuentes'];
+        $historial->conciliaMes = false;
+
+        foreach ($consolidado['items'] as $item) {
+            $ruta = (string) $item['ruta'];
+            $clave = $item['tipo'].'|'.$item['codigo'];
+            $historial->valores[$ruta][$clave] = $item['valores'];
+            $historial->composiciones[$ruta][$clave] = $item['composiciones'];
+            $historial->unidadesConsolidadas[$ruta][$clave] = $item['unidades'];
+            $historial->descripciones[$clave] = (string) $item['descripcion'];
+
+            foreach ($item['valores'] as $mes => $valores) {
+                $historial->totales[$ruta][$mes][$item['tipo']] ??= ['registros' => 0, 'valor' => 0.0];
+                $historial->totales[$ruta][$mes][$item['tipo']]['registros'] += count($valores);
+                $historial->totales[$ruta][$mes][$item['tipo']]['valor'] += array_sum($valores);
+            }
+        }
+
+        return $historial;
     }
 
     public function tieneDatos(string $ruta): bool

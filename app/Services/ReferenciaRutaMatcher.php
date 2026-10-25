@@ -9,6 +9,7 @@ use App\Programas\LaMaria\EstadoContractual;
 use App\Programas\LaMaria\EstadoTarifario;
 use App\Programas\LaMaria\FormaCruce;
 use App\Programas\LaMaria\FuenteTarifa;
+use App\Programas\LaMaria\HistoricoTarifarioConsolidado;
 use App\Programas\LaMaria\LaMariaPrograma;
 use App\Programas\LaMaria\PoliticaDispensacion;
 use Illuminate\Support\Collection;
@@ -131,6 +132,7 @@ class ReferenciaRutaMatcher
                 ->forPrograma(LaMariaPrograma::SLUG)
                 ->active()
                 ->where('tipo', '!=', CatalogoReferenciaImporter::TYPE_MEDICAMENTOS_CUM)
+                ->where('tipo', '!=', HistoricoTarifarioConsolidado::TIPO)
                 ->when(
                     $rutaEjecucion === LaMariaPrograma::RUTA_PROSTATA,
                     fn ($query) => $query->where('tipo', '!=', CatalogoReferenciaImporter::TYPE_NOTA_CERVIX)

@@ -15,7 +15,7 @@ use Closure;
  * esquema real · RN-04 medicamentos oncológicos incluidos, de otro esquema o
  * de asociación desconocida · RN-05 demás AP con el histórico · RN-06 AT por
  * unidad comparable · RN-07 AU no aditivo · RN-08 radioterapia por registro y
- * por tratamiento, sin mezclar unidades · RN-16 AH por registro con egreso ·
+ * por tratamiento, sin mezclar unidades · RN-16 AH por bloques de 25 días ·
  * RN-17 conciliación opcional con el informe del mismo mes.
  */
 final class ValorizacionAdministrativa
@@ -69,6 +69,8 @@ final class ValorizacionAdministrativa
     public const COBERTURA_INCLUIDO_AH = 'INCLUIDO DEMOSTRADO EN AH';
 
     public const COBERTURA_INCLUIDO_URGENCIA = 'INCLUIDO EN URGENCIA COBRADA';
+
+    public const COBERTURA_CONDICIONADO_URGENCIA = 'URGENCIA MENOR DE 24 H SIN TARIFA ACREDITADA';
 
     public const COBERTURA_INDEPENDIENTE = 'INDEPENDIENTE';
 
@@ -361,7 +363,7 @@ final class ValorizacionAdministrativa
             $this->internaciones[$mes][$corte ? 'cortes' : 'cierres'] = ($this->internaciones[$mes][$corte ? 'cortes' : 'cierres'] ?? 0) + 1;
             $this->agregar($linea, self::INCLUIDA, false, $corte ? 'CORTE DE ESTANCIA (CONTINUA)' : 'REGISTRO DE INTERNACION CON EGRESO', 'LIBRO DE PAQUETES',
                 $corte ? 'Corte 08: la estancia continúa; la unidad administrativa AH corresponde a su egreso.'
-                    : 'Una unidad administrativa AH por registro con egreso (RN-16); el costo A conserva los paquetes de 25 días.');
+                    : 'El egreso identifica la estancia; RN-16 valora sus bloques de hasta 25 días sin contar el registro como cargo adicional.');
 
             return;
         }
@@ -385,6 +387,22 @@ final class ValorizacionAdministrativa
             }
 
             $this->registrarMedicamento($linea, $detalle, $economico, $absorcion, $caso, $casoFactura);
+
+            return;
+        }
+
+        if (($detalle['decisionPaquete'] ?? '') === DecisionPaqueteHospitalario::UrgenciaTarifaPendiente->value) {
+            $cirugiaSinAmbitoAcreditado = $tipo === 'AP' && (string) ($detalle['grupoServicios'] ?? '') === '04';
+            $potencial = $cirugiaSinAmbitoAcreditado
+                ? ResumenEconomico::centavos(max(0, (float) ($detalle['tarifaReferencia'] ?? 0)) * $cantidad)
+                : 0;
+            $this->agregar($linea, self::CONDICIONADA, false,
+                $cirugiaSinAmbitoAcreditado ? 'CIRUGÍA EN ESTANCIA <24H · ÁMBITO SIN ACREDITAR' : 'URGENCIA <24H SIN TARIFA ACREDITADA',
+                'RIPS · NOTA TÉCNICA OFICIAL · SERVICIOS Y TECNOLOGÍAS',
+                $cirugiaSinAmbitoAcreditado
+                    ? 'El grupo quirúrgico 04 identifica el procedimiento, pero no acredita si ocurrió fuera de urgencias ni que sea facturable por separado. Tarifa de nota como potencial no aditivo.'
+                    : 'Estancia inferior a 24 horas con modalidad de urgencia sin acreditar; sus componentes permanecen pendientes de clasificación económica.',
+                null, -1, $potencial, $cirugiaSinAmbitoAcreditado ? 'PROCEDIMIENTO' : '');
 
             return;
         }
@@ -531,20 +549,25 @@ final class ValorizacionAdministrativa
             $paquetes[$mes] = [($paquetes[$mes][0] ?? 0.0) + (float) ($fila[1] ?? 0), ($paquetes[$mes][1] ?? 0) + $costo];
         }
 
-        // RN-16: la estimación cuenta registros con egreso × valor del paquete, sin bloques de 25 días.
+        // RN-16: los bloques ya reconstruidos desde RIPS determinan la unidad de la nota Hx.
         foreach (array_unique([...array_keys($paquetes), ...array_keys($this->internaciones), ...array_keys($this->internacionesServicio)]) as $mes) {
             [$netos, $costo] = $paquetes[$mes] ?? [0.0, 0];
-            $servicio = count(array_filter(array_diff_key($this->internacionesServicio[$mes] ?? [], $this->casosHospitalizados[$mes] ?? []),
-                fn (array $fechas, string $caso): bool => $this->estanciaSoloServicio($caso, $fechas), ARRAY_FILTER_USE_BOTH));
-            $cierres = ($this->internaciones[$mes]['cierres'] ?? 0) + $servicio;
-            $this->agregar(['mes' => (string) $mes, 'tipo' => 'AH', 'codigo' => 'REGISTRO_INTERNACION_EGRESO', 'cantidad' => (float) $cierres,
-                'costoA' => $costo, 'descripcion' => 'Registros de internación con egreso'], self::ESTIMADA, true, 'REGISTRO DE INTERNACION x VALOR DEL PAQUETE',
-                'INFORME ADMINISTRATIVO (UNA FILA AH POR EGRESO) / NOTA TECNICA',
-                sprintf('%d registros con egreso (%d internaciones registradas solo como servicio, sin hospitalización del caso en el mes) × $%s; %d cortes 08 sin unidad en el mes. El costo A conserva %s paquetes de 25 días.',
-                    $cierres, $servicio, number_format(PoliticaPaqueteHospitalario::VALOR_PAQUETE, 2, ',', '.'),
-                    $this->internaciones[$mes]['cortes'] ?? 0, number_format($netos, 0, ',', '.')),
-                null, $costo, ResumenEconomico::centavos($cierres * PoliticaPaqueteHospitalario::VALOR_PAQUETE), 'REGISTRO', registros: 0);
+            $servicio = $this->internacionesSoloServicio($mes);
+            $unidades = (int) $netos + $servicio;
+            $this->agregar(['mes' => (string) $mes, 'tipo' => 'AH', 'codigo' => 'REGISTRO_INTERNACION_EGRESO', 'cantidad' => (float) $unidades,
+                'costoA' => $costo, 'descripcion' => 'Bloques de hospitalización de hasta 25 días'], self::ESTIMADA, true, 'BLOQUE HOSPITALARIO DE 25 DIAS x VALOR DEL PAQUETE',
+                'NOTA TECNICA Hx / RIPS / LIBRO DE PAQUETES',
+                sprintf('%d bloques reconstruidos de 25 días + %d internaciones registradas solo como servicio, sin AH del caso en el mes = %d unidades × $%s; %d egresos y %d cortes 08 son trazas clínicas, no unidades adicionales.',
+                    (int) $netos, $servicio, $unidades, number_format(PoliticaPaqueteHospitalario::VALOR_PAQUETE, 2, ',', '.'),
+                    $this->internaciones[$mes]['cierres'] ?? 0, $this->internaciones[$mes]['cortes'] ?? 0),
+                null, $costo, ResumenEconomico::centavos($unidades * PoliticaPaqueteHospitalario::VALOR_PAQUETE), 'BLOQUE', registros: 0);
         }
+    }
+
+    private function internacionesSoloServicio(string $mes): int
+    {
+        return count(array_filter(array_diff_key($this->internacionesServicio[$mes] ?? [], $this->casosHospitalizados[$mes] ?? []),
+            fn (array $fechas, string $caso): bool => $this->estanciaSoloServicio($caso, $fechas), ARRAY_FILTER_USE_BOTH));
     }
 
     /**
@@ -604,7 +627,7 @@ final class ValorizacionAdministrativa
                     .($costoASinCobertura > 0
                         ? '; ASOCIADOS A AP SIN COBERTURA DEMOSTRADA, CONDICIONADOS (COSTO A NO SUMADO: $'.number_format($costoASinCobertura / 100.0, 2, ',', '.').')'
                         : ''),
-                'AH' => 'REGISTROS DE INTERNACION CON EGRESO x VALOR DEL PAQUETE (RN-16); EL COSTO A CONSERVA LOS PAQUETES DE 25 DIAS',
+                'AH' => 'BLOQUES DE HASTA 25 DIAS x VALOR DE LA NOTA Hx (RN-16); EGRESOS Y CORTES NO SE SUMAN COMO UNIDADES',
                 default => 'ESTIMACION REFERENCIAL',
             };
             $filas[] = [$tipo, self::SERVICIOS[$tipo], $datos['registros'], $datos['costoA'] / 100.0, $sumas['estimado'] / 100.0,
@@ -702,7 +725,8 @@ final class ValorizacionAdministrativa
             ? 'unidades de transporte o albergue con base compatible'
             : 'prestaciones reconocidas; bases por código';
         $cantidades['AM']['definicion'] = 'líneas independientes reconocidas; cantidades por presentación';
-        $cantidades['AH']['definicion'] = 'egresos o internaciones reconocidos por RN-16';
+        $cantidades['AH']['definicion'] = 'bloques de hasta 25 días e internaciones solo como servicio';
+        $cantidades['AH']['soloServicio'] = $this->internacionesSoloServicio($mes);
         $cantidades['AU']['definicion'] = 'sin unidad independiente; componentes en AC/AP/AM';
 
         $egresosRips = $this->internaciones[$mes]['cierres'] ?? 0;
@@ -1309,7 +1333,7 @@ final class ValorizacionAdministrativa
             ['RN-12', 'Conciliación AC/AT por código y unidad', 'Se exponen registros, unidades, base de cobro y precio histórico por código. AC conserva costo A, AH sigue RN-16; AT solo usa la unidad históricamente comparable. Un total administrativo agregado no crea una tarifa ni modifica el costo A.'],
             ['RN-14', 'Cobertura económica de medicamentos (toda ruta y mes)', 'Cada AM queda incluido demostrado en AP, incluido demostrado en AH, independiente, condicionado o pendiente. Factura y composición histórica del CUPS no acreditan por sí solas inclusión económica: la cobertura AP solo queda demostrada si el medicamento distingue la clase de precio histórica aplicada al integral de la misma factura (al menos la mitad de sus registros y no más del 10 % de las demás clases). Esto aplica a todo AM de la factura que figure en la composición del integral, aunque la nota técnica no lo nombre en el esquema. Con precio único del CUPS o sin distintivo, el posible valor se calcula con cantidad RIPS y precio unitario histórico del mismo CUM como condicionado no aditivo (en cero mientras no haya CUM y precio compatibles); si el integral se valoró con mezcla de varios esquemas o con esquema indeterminado (RN-03), ese valor ya está en su componente condicionado y no se repite. Un integral del mismo paciente y mes en otra factura que contenga el medicamento lo deja condicionado. AH conserva la decisión de paquete y requiere un bloque neto en el episodio para acreditar su cobertura.'],
             ['RN-15', 'Valorización mensual automática', 'Cada ruta y mes se calculan exclusivamente desde sus RIPS con RN-01 a RN-16 y precios históricos comparables anteriores al mes. La referencia gerencial fija solo muestra una variación: nunca modifica cantidades, precios, inclusión, costo A ni estimación central. Los CUPS principales comparan actividad y valor aditivo entre meses cargados.'],
-            ['RN-16', 'AH por registro de internación', 'El historial registra una fila AH por registro de internación con egreso, al valor del paquete, sin dividir en bloques de 25 días y también en estancias menores de 24 horas; el corte 08 (la estancia continúa) no es unidad del mes. Una internación registrada solo como servicio (código que el historial cobra como AH y describe como internación) de un caso identificado sin hospitalización en el mes es una unidad; si ocurre dentro de una urgencia que egresa a hospitalización (destino 03) es el preingreso de una estancia que cuenta su propio registro y no suma. Estimación AH = registros con egreso del mes × valor del paquete de la nota. Es una estimación administrativa: no tiene equivalencia exacta con todas las filas del informe externo. El costo A y el libro de paquetes no cambian.'],
+            ['RN-16', 'AH por bloque de hasta 25 días', 'La nota Hx reconoce un valor por cada bloque de hasta 25 días de estancia real. El libro reconstruye los episodios y atribuye cada bloque al mes de su inicio; una estancia menor de 24 horas no genera paquete. La nota de servicios y tecnologías la trata como urgencia integral: una consulta de urgencias documentada y tarifada aporta su valor; sin ella, los componentes sin ámbito independiente demostrado quedan condicionados. Un AP con grupo RIPS 04 (quirúrgico) identifica el contexto quirúrgico, pero queda como potencial no aditivo si no se demuestra que ocurrió fuera de urgencias y que se cobra aparte. El corte 08 no es egreso ni cargo adicional: solo aporta los bloques ya transcurridos, sin duplicar la continuación. Una internación registrada solo como servicio de un caso identificado sin AH en el mes conserva una unidad provisional; el preingreso de urgencia con destino 03 no suma. Estimación AH = bloques netos reconstruidos + internaciones solo como servicio, multiplicados por el valor de Hx. Costo A y libro de paquetes conservan sus resultados.'],
             ['RN-17', 'Conciliación con el informe del mismo mes', 'Opcional: sin informe del mes el cálculo sigue con RN-01 a RN-16 y los precios históricos. Con informe del mes, cada fila se asigna a una sola línea RIPS del mismo paciente, fecha y código: (1) un esquema integral indeterminado o mezclado toma la clase que documentan todas las filas del paciente y CUPS (en la fecha o, sin fila en la fecha, en el mes) si los RIPS la respaldan (clase provisional o distintivo en la misma factura); las filas sin línea integral RIPS no crean sesiones. (2) Un AP incluido en el paquete AH que el informe cobra aparte queda condicionado: la nota y la metodología HX lo incluyen. (3) Un precio del informe mayor que la tarifa acreditada para el mismo servicio deja la diferencia condicionada. Equivalencias económicas documentadas, solo para líneas sin tarifa aplicable (en Próstata, 405407 se valora con el precio de 405406 desde abril de 2026; la tarifa de la nota no cambia), conservan el CUPS RIPS; con informe del mes se confirman (sin filas del código propio y con fila del equivalente en el 90 % de las líneas). Nunca se copian totales externos ni filas sin servicio RIPS.'],
         ];
 
@@ -1394,6 +1418,20 @@ final class ValorizacionAdministrativa
             'paquetesAh' => (int) ($detalle['episodioPaquetesSumados'] ?? 0), 'clasificacion' => self::COBERTURA_PENDIENTE,
             'precio' => 0.0, 'potencial' => 0, 'fuente' => 'Sin evaluación económica individual.',
         ];
+
+        if (($detalle['decisionPaquete'] ?? '') === DecisionPaqueteHospitalario::UrgenciaTarifaPendiente->value) {
+            [$precioHistorico, $potencialHistorico] = $this->potencialHistoricoMedicamento($linea, $detalle);
+            $cobertura = &$this->coberturaMedicamentos[$linea['id']];
+            $cobertura['clasificacion'] = self::COBERTURA_CONDICIONADO_URGENCIA;
+            $cobertura['precio'] = (float) ($precioHistorico['mediana'] ?? 0);
+            $cobertura['potencial'] = $potencialHistorico;
+            $cobertura['fuente'] = 'Nota oficial: estancia inferior a 24 horas como urgencia integral. Falta tarifa de urgencia acreditada; medicamento no aditivo.';
+            $this->agregar($linea, self::CONDICIONADA, false, 'URGENCIA <24H SIN TARIFA ACREDITADA',
+                'NOTA TÉCNICA OFICIAL · SERVICIOS Y TECNOLOGÍAS', $cobertura['fuente'],
+                $precioHistorico, 0, $potencialHistorico, 'UNIDAD');
+
+            return;
+        }
 
         if ($absorcion !== null) {
             $cobertura = &$this->coberturaMedicamentos[$linea['id']];
@@ -2538,7 +2576,7 @@ final class ValorizacionAdministrativa
             'AT' => 'Mediana administrativa por código con unidad compatible · '.$historico,
             'AU' => 'Atribución no aditiva · '.$historico,
             'AM' => 'AM independiente (A + precio histórico de dispensación por CUM); el incluido en AP integral no suma · el administrativo no registra AM aparte',
-            'AH' => 'Registro de internación con egreso × valor del paquete (RN-16) · '.$historico,
+            'AH' => 'Bloque hospitalario de hasta 25 días × valor de Hx (RN-16) · '.$historico,
             default => $historico,
         };
     }
@@ -2569,7 +2607,7 @@ final class ValorizacionAdministrativa
 
         return match ($tipo) {
             'AC' => 'CONTROL: IGUAL AL COSTO A',
-            'AH' => 'REGISTRO DE INTERNACION CON EGRESO (RN-16)',
+            'AH' => 'BLOQUE HOSPITALARIO DE 25 DIAS (RN-16)',
             'AU' => 'NO ADITIVO',
             default => 'ESTIMACION REFERENCIAL',
         };
@@ -2609,7 +2647,9 @@ final class ValorizacionAdministrativa
         return match (true) {
             str_starts_with($codigo['subtipo'], 'RADIOTERAPIA') => 'Unidad contractual (tratamiento, sesión o fracción) y tarifa vigente.',
             in_array($codigo['subtipo'], ['MEZCLA HISTORICA DE ESQUEMAS', self::SUBTIPO_RN14_MEZCLA], true) => 'Esquema real (medicamentos) de cada registro de quimioterapia.',
-            $codigo['subtipo'] === 'REGISTRO DE INTERNACION x VALOR DEL PAQUETE' => 'Acuerdo de la unidad de cobro AH: registro con egreso (historial) frente a paquete de 25 días (costo A).',
+            $codigo['subtipo'] === 'BLOQUE HOSPITALARIO DE 25 DIAS x VALOR DEL PAQUETE' => 'Confirmación contractual de vigencia de la nota Hx y soporte de la internación solo como servicio, cuando aplique.',
+            $codigo['subtipo'] === 'CIRUGÍA EN ESTANCIA <24H · ÁMBITO SIN ACREDITAR' => 'Soporte del ámbito quirúrgico fuera de urgencias y cláusula que permite su cobro independiente de la urgencia integral.',
+            $codigo['subtipo'] === 'URGENCIA <24H SIN TARIFA ACREDITADA' => 'Soporte de la modalidad de urgencias, general o por especialista, y la unidad contractual del episodio.',
             $codigo['subtipo'] === 'ESQUEMA INDETERMINADO' => 'Vínculo de la sesión con el esquema de mayor precio registrado en otra fecha de la factura (orden o protocolo de la sesión).',
             str_starts_with($codigo['subtipo'], 'ASOCIACION DESCONOCIDA') => 'Asociación del medicamento con el tratamiento (esquema y CUPS) del caso-mes.',
             $codigo['subtipo'] === self::SUBTIPO_RN14_AP => 'Prueba de que el precio del AP integral cubre esta presentación, o de que el medicamento se cobra aparte.',

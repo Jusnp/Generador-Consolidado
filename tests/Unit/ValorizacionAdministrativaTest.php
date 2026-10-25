@@ -88,7 +88,7 @@ class ValorizacionAdministrativaTest extends TestCase
             collect($valorizacion->filasPendientes())->firstWhere(4, ValorizacionAdministrativa::CONDICIONADA.' / ESQUEMA INDETERMINADO')[10]);
     }
 
-    public function test_hospital_estimate_counts_one_unit_per_discharge_record_and_keeps_cost_a_packages(): void
+    public function test_hospital_estimate_uses_reconstructed_blocks_and_keeps_cost_a_packages(): void
     {
         $valorizacion = $this->valorizacion();
         $estancia = fn (string $mes, string $ingreso, string $egreso, string $destino): array => $this->detalle('hospitalizacion', '', 1.0,
@@ -105,15 +105,15 @@ class ValorizacionAdministrativaTest extends TestCase
         $septiembre = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0);
         $octubre = collect($valorizacion->resumenServicios('2026-10')['filas'])->keyBy(0);
 
-        $this->assertSame([3, 18045943.59, 12030629.06, 0.0], array_map(static fn (int $i): mixed => $septiembre['AH'][$i], [2, 3, 4, 6]));
+        $this->assertSame([3, 18045943.59, 18045943.59, 0.0], array_map(static fn (int $i): mixed => $septiembre['AH'][$i], [2, 3, 4, 6]));
         $this->assertSame([1, 6015314.53, 6015314.53], array_map(static fn (int $i): mixed => $octubre['AH'][$i], [2, 3, 4]));
         $this->assertStringContainsString('RN-16', $septiembre['AH'][7]);
         $estados = collect($valorizacion->filasDetalle())->where(1, 'AH')->pluck(6)->unique()->sort()->values()->all();
-        $this->assertSame(['CORTE DE ESTANCIA (CONTINUA)', 'REGISTRO DE INTERNACION CON EGRESO', 'REGISTRO DE INTERNACION x VALOR DEL PAQUETE'], $estados);
+        $this->assertSame(['BLOQUE HOSPITALARIO DE 25 DIAS x VALOR DEL PAQUETE', 'CORTE DE ESTANCIA (CONTINUA)', 'REGISTRO DE INTERNACION CON EGRESO'], $estados);
         $pendiente = collect($valorizacion->filasPendientes())->first(static fn (array $fila): bool => $fila[0] === '2026-09' && $fila[2] === 'REGISTRO_INTERNACION_EGRESO');
-        $this->assertSame([2.0, 12030629.06], [$pendiente[6], $pendiente[7]]);
-        $this->assertStringContainsString('2 registros con egreso', $pendiente[9]);
-        $this->assertStringContainsString('1 cortes 08 sin unidad', $pendiente[9]);
+        $this->assertSame([3.0, 18045943.59], [$pendiente[6], $pendiente[7]]);
+        $this->assertStringContainsString('3 bloques reconstruidos de 25 días', $pendiente[9]);
+        $this->assertStringContainsString('1 cortes 08 son trazas clínicas', $pendiente[9]);
     }
 
     public function test_integral_scheme_requires_a_shared_invoice_and_keeps_other_invoice_medication_conditional(): void
@@ -302,6 +302,46 @@ class ValorizacionAdministrativaTest extends TestCase
         $this->assertSame([ValorizacionAdministrativa::COBERTURA_INCLUIDO_URGENCIA, 0.0], [$cobertura['CUM-X'][16], $cobertura['CUM-X'][18]]);
         $this->assertSame([ValorizacionAdministrativa::COBERTURA_INCLUIDO_AP, 0.0], [$cobertura['CUM-SIN-HISTORIA'][16], $cobertura['CUM-SIN-HISTORIA'][18]]);
         $this->assertSame([0.0, 0.0], [collect($valorizacion->filasComparacion([]))->firstWhere(1, 'AM')[5], collect($valorizacion->filasComparacion([]))->firstWhere(1, 'AM')[6]]);
+    }
+
+    public function test_short_stay_without_accredited_urgency_tariff_keeps_components_conditional_and_does_not_duplicate_a_billed_urgency(): void
+    {
+        $history = new HistorialAdministrativo;
+        foreach (['2026-06', '2026-07', '2026-08'] as $month) {
+            $history->registrar('CERVIX', $month, 'AC', '890701', 40195.61);
+            $history->registrar('CERVIX', $month, 'AC', '890702', 247400.0);
+            $history->registrar('CERVIX', $month, 'AP', '123456', 200.0);
+            $history->registrar('CERVIX', $month, 'AP', '654321', 500.0);
+            $history->registrar('CERVIX', $month, 'AT', 'T34004', 100.0);
+        }
+        $valuacion = new ValorizacionAdministrativa('CERVIX', $history, [],
+            static fn (string $cum): array => $cum === 'CUM-X' ? [['mes' => '2026-08', 'tarifa' => 10.0]] : []);
+        $pending = ['decisionPaquete' => 'URGENCIA_TARIFA_PENDIENTE', 'casoId' => 'SIN-URGENCIA',
+            'factura' => 'F1', 'fechaAtencion' => '2026-09-03 10:00'];
+
+        $valuacion->registrar($this->detalle('procedimientos', '123456', 1.0, $pending), ['respaldado' => 0.0]);
+        $valuacion->registrar($this->detalle('procedimientos', '654321', 1.0, [...$pending,
+            'casoId' => 'CIRUGIA', 'grupoServicios' => '04', 'tarifaReferencia' => 500.0]), ['respaldado' => 0.0]);
+        $valuacion->registrar($this->detalle('otrosServicios', 'T34004', 2.0, $pending), ['respaldado' => 0.0]);
+        $valuacion->registrar($this->detalle('medicamentos', 'MED-X', 3.0, [...$pending, 'cumResuelto' => 'CUM-X',
+            'resolucionMedicamento' => 'RESUELTO']), ['respaldado' => 0.0]);
+        $billed = ['casoId' => 'CON-URGENCIA', 'factura' => 'F2', 'fechaAtencion' => '2026-09-04 10:00'];
+        $valuacion->registrar($this->detalle('consultas', '890701', 1.0, [...$billed,
+            'decisionPaquete' => 'COBRADO_COMO_URGENCIA']), ['respaldado' => 40195.61]);
+        $valuacion->registrar($this->detalle('medicamentos', 'MED-X', 3.0, [...$billed,
+            'decisionPaquete' => 'INCLUIDO_EN_URGENCIA', 'cumResuelto' => 'CUM-X']), ['respaldado' => 0.0]);
+        $valuacion->registrar($this->detalle('consultas', '890702', 1.0, [...$billed, 'factura' => 'F3',
+            'decisionPaquete' => 'COBRADO_COMO_URGENCIA']), ['respaldado' => 247400.0]);
+
+        $rows = collect($valuacion->resumenServicios('2026-09')['filas'])->keyBy(0);
+        $this->assertSame([0.0, 0.0, 0.0, 287595.61], [$rows['AP'][4], $rows['AT'][4], $rows['AM'][4], $rows['AC'][4]]);
+        $cirugia = collect($valuacion->filasDetalle())->firstWhere(2, '654321');
+        $this->assertSame(['CIRUGÍA EN ESTANCIA <24H · ÁMBITO SIN ACREDITAR', 0.0, 500.0],
+            [$cirugia[6], $cirugia[17], $cirugia[18]]);
+        $coverage = collect($valuacion->filasCoberturaMedicamentos())->keyBy(1);
+        $this->assertSame([ValorizacionAdministrativa::COBERTURA_CONDICIONADO_URGENCIA, 30.0], [$coverage['F1'][16], $coverage['F1'][18]]);
+        $this->assertSame([ValorizacionAdministrativa::COBERTURA_INCLUIDO_URGENCIA, 0.0], [$coverage['F2'][16], $coverage['F2'][18]]);
+        $this->assertSame(3, collect($valuacion->filasDetalle())->where(6, 'URGENCIA <24H SIN TARIFA ACREDITADA')->sum(7));
     }
 
     public function test_unit_basis_compares_the_history_with_every_billed_line_of_the_code(): void
@@ -559,25 +599,25 @@ class ValorizacionAdministrativaTest extends TestCase
         $porTipo = $comparacion->filter(static fn (array $fila): bool => in_array($fila[1], ValorizacionAdministrativa::TIPOS_ORDEN, true))->keyBy(1);
         $total = $comparacion->firstWhere(1, 'TOTAL');
 
-        // Costo A conservado al centavo; AC igual al costo A y AH por registro con egreso (RN-16), no por paquetes.
+        // Costo A conservado al centavo; AC igual al costo A y AH por bloques reconstruidos (RN-16).
         $this->assertSame(['2026-09', 'TOTAL', 18, 126.0, 16060319.06, 'IGUAL AL COSTO RESPALDADO DE COSTOS Y BRECHAS'], end($costos));
         $this->assertSame(16060319.06, $total[4]);
         $this->assertSame($porTipo['AC'][4], $porTipo['AC'][5]);
-        $this->assertSame([12030629.06, 6015314.53], [$porTipo['AH'][4], $porTipo['AH'][5]]);
+        $this->assertSame([12030629.06, 12030629.06], [$porTipo['AH'][4], $porTipo['AH'][5]]);
         $this->assertSame(0.0, $porTipo['AU'][5]);
 
         // AP integral + 911107 estimado; AT por unidad compatible; AM A + C.
         $this->assertSame(8531868.98, $porTipo['AP'][5]);
         $this->assertSame(1826629.32, $porTipo['AT'][5]);
         $this->assertSame(29527552.0, $porTipo['AM'][5]);
-        $this->assertSame(45986364.83, $total[5]);
+        $this->assertSame(52001679.36, $total[5]);
         $this->assertSame(round($porTipo->sum(5), 2), $total[5]);
 
         // Componente condicionado: medicamento sin asociación demostrada (no suma) y unidad no compatible.
         $this->assertSame(500000.0, $porTipo['AM'][6]);
         $this->assertSame(1000.0, $porTipo['AT'][6]);
         $this->assertSame(501000.0, $total[6]);
-        $this->assertSame(46487364.83, $total[7]);
+        $this->assertSame(52502679.36, $total[7]);
 
         // Importes no aditivos visibles y separados.
         $noAditivos = $comparacion->where(1, 'NO ADITIVO')->pluck(11, 12);
@@ -902,9 +942,9 @@ class ValorizacionAdministrativaTest extends TestCase
         $unidad = collect($valorizacion->filasPendientes())->firstWhere(2, 'REGISTRO_INTERNACION_EGRESO');
 
         // Unidades: egreso de P2 + estancias solo como servicio de P1 y P5. El costo A conserva sus paquetes.
-        $this->assertSame([12030629.06, 18045943.59], [$ah[3], $ah[4]]);
-        $this->assertStringContainsString('3 registros con egreso (2 internaciones registradas solo como servicio', $unidad[9]);
-        $this->assertStringContainsString('1 cortes 08 sin unidad', $unidad[9]);
+        $this->assertSame([12030629.06, 24061258.12], [$ah[3], $ah[4]]);
+        $this->assertStringContainsString('2 internaciones registradas solo como servicio', $unidad[9]);
+        $this->assertStringContainsString('1 cortes 08 son trazas clínicas', $unidad[9]);
     }
 
     public function test_repeated_lines_of_the_same_service_do_not_add_units_beyond_the_historical_unit_per_patient_and_date(): void
