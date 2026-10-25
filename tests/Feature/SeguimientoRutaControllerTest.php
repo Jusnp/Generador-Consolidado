@@ -7,6 +7,7 @@ use App\Models\CatalogoReferencia;
 use App\Models\CatalogoReferenciaItem;
 use App\Models\User;
 use App\Programas\LaMaria\ExplicacionBrecha;
+use App\Programas\LaMaria\HistoricoTarifarioConsolidado;
 use App\Programas\LaMaria\LaMariaPrograma;
 use App\Programas\LaMaria\PoliticaPaqueteHospitalario;
 use App\Programas\LaMaria\ResumenEconomico;
@@ -100,6 +101,26 @@ class SeguimientoRutaControllerTest extends TestCase
         } finally {
             DB::disableQueryLog();
         }
+    }
+
+    public function test_prostata_page_identifies_the_active_autonomous_tariff_catalogue(): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        CatalogoReferencia::create([
+            'programa_slug' => LaMariaPrograma::SLUG,
+            'tipo' => HistoricoTarifarioConsolidado::TIPO,
+            'version' => 'demo-ui-2026',
+            'archivo_origen' => 'historico-demo.json',
+            'activo' => true,
+        ]);
+
+        $this->actingAs($user)
+            ->get(route('la-maria.prostata'))
+            ->assertOk()
+            ->assertSeeText('Histórico tarifario autónomo:')
+            ->assertSeeText('ACTIVO (demo-ui-2026)')
+            ->assertSeeText('se utiliza automáticamente');
     }
 
     public function test_authenticated_user_can_generate_a_prostata_workbook(): void
@@ -1132,6 +1153,31 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->assertCount(1, $review);
         $this->assertSame('hospitalizacion', $review[0]['tipoServicio']);
         $this->assertStringContainsString('URGENCIA <24H - TARIFA PENDIENTE DE DEFINICION (SIN CONSULTA DE URGENCIAS', $review[0]['MOTIVO']);
+    }
+
+    public function test_surgery_in_short_stay_is_listed_for_review_without_increasing_the_total(): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        $this->createTechnicalItem('602001', 'PROCEDIMIENTO QUIRURGICO', 120000);
+        $surgery = $this->procedimiento('602001', '2026-10-01 10:00', 2);
+        $surgery['grupoServicios'] = '04';
+
+        $workbook = $this->exportWorkbook($user, 'prostata', [
+            'cirugia-corta.json' => $this->hospitalRips(
+                ['procedimientos' => [$surgery]],
+                '2026-10-01 08:00',
+                '2026-10-02 07:59'
+            ),
+        ]);
+
+        $review = collect($this->records($workbook->getSheetByName('CASOS A REVISAR')))
+            ->keyBy('codigo (codConsulta / codProcedimiento / codTecnologiaSalud)');
+
+        $this->assertSame(0.0, $this->summaryTotal($workbook, 'COSTO ACTIVO (A + CONDICIONADO)'));
+        $this->assertTrue($review->has('602001'));
+        $this->assertStringContainsString('INDEPENDENCIA ECONOMICA SIN ACREDITAR', $review['602001']['MOTIVO']);
+        $this->assertStringContainsString('NO SUMA AL ADMINISTRATIVO', $review['602001']['MOTIVO']);
     }
 
     public function test_emergency_under_24_hours_is_charged_with_its_urgency_consult_tariff(): void

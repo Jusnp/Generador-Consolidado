@@ -155,6 +155,10 @@
                 @endforeach
             </ul>
 
+            @if ($historicoTarifarioActivo)
+                <p>Histórico tarifario autónomo: <span class="catalog-ready">ACTIVO ({{ $historicoTarifarioActivo->version }})</span>. La valorización administrativa utiliza este catálogo sin abrir informes históricos.</p>
+            @endif
+
             @if (auth()->user()->role === 'admin')
                 @if (auth()->user()->role === 'admin')
                     <a href="{{ route('catalogos-referencia.index') }}">Actualizar catálogos de La María</a>
@@ -233,8 +237,9 @@
                 <div class="form-help">
                     Se lee la hoja “inf admin” o, en los informes nuevos, la hoja de servicios con “GRUPO DEL SERVICIO”
                     (mes, tipo, código y valor) para agregar la estimación administrativa
-                    referencial. Si no se carga, se usa el informe configurado para esta ruta; si falta, el reporte
-                    se detiene con un aviso. No cambia el costo A y no es facturación.
+                    referencial. Si hay un histórico tarifario autónomo activo, se utiliza automáticamente.
+                    En su ausencia se usa el informe configurado para esta ruta; si también falta, el reporte
+                    se detiene con un aviso. No cambia el costo A y no es facturación acreditada.
                 </div>
             </div>
 
