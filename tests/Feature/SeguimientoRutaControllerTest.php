@@ -1803,6 +1803,20 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->assertSame(0, DB::table('programa_ejecuciones')->count());
     }
 
+    public function test_required_economic_mode_rejects_export_without_active_clinical_catalogues(): void
+    {
+        $user = User::factory()->create();
+        config(['programas.la-maria.informes_administrativos.requerido' => true]);
+        $json = ['archivos' => [UploadedFile::fake()->createWithContent(
+            'a.json', $this->routeJson('FAC-1', 'C61X', '2026-09-10 08:00', 'consultas')
+        )]];
+
+        $this->actingAs($user)->post(route('la-maria.prostata.export'), $json)
+            ->assertSessionHasErrors(['archivos' => 'No hay catálogos clínicos activos de La María. Active las referencias verificadas antes de generar el consolidado; no se produjo un valor económico incompleto.']);
+
+        $this->assertSame(0, DB::table('programa_ejecuciones')->count());
+    }
+
     /**
      * RN-14, RN-06 (T34004) y la procedencia del precio AM se aplican en las exportaciones
      * habituales de Próstata y Cérvix en cualquier mes (aquí octubre), sin excepciones de fecha.
