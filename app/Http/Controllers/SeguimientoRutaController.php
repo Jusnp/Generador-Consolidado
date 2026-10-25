@@ -7,6 +7,7 @@ use App\Models\CatalogoReferencia;
 use App\Models\ProgramaEjecucion;
 use App\Programas\LaMaria\ConciliacionRipsNota;
 use App\Programas\LaMaria\CondicionArchivo;
+use App\Programas\LaMaria\DecisionPaqueteHospitalario;
 use App\Programas\LaMaria\EstadoClinico;
 use App\Programas\LaMaria\EstadoDuplicidad;
 use App\Programas\LaMaria\EstadoTarifario;
@@ -186,6 +187,8 @@ class SeguimientoRutaController extends Controller
             'categoriasEconomicas' => session('la-maria.categorias.'.$ejecucion, []),
             'fuentesCatalogos' => CatalogoReferencia::query()->forPrograma(LaMariaPrograma::SLUG)->active()
                 ->whereIn('tipo', $pipeline->ownedCatalogTypes())->get(['id', 'tipo', 'version', 'archivo_origen', 'fecha_referencia']),
+            'historicoTarifarioActivo' => CatalogoReferencia::query()->forPrograma(LaMariaPrograma::SLUG)->active()
+                ->where('tipo', HistoricoTarifarioConsolidado::TIPO)->first(['version']),
         ]);
     }
 
@@ -340,7 +343,7 @@ class SeguimientoRutaController extends Controller
                 $categoriasEconomicas[$categoriaKey][4] += (int) round($estadoEconomico['condicionadoIncluido'] * 100);
                 $categoriasEconomicas[$categoriaKey][5] += (int) round($estadoEconomico['condicionadoExterno'] * 100);
 
-                if ($detail['requiereRevision']) {
+                if ($detail['requiereRevision'] || $this->isSurgeryPendingIndependentCoverage($detail)) {
                     $this->writeTemporaryRow($reviewRowsStream, $this->reviewValues($detail));
                     $reviewRowCount++;
                 }
@@ -1309,6 +1312,10 @@ class SeguimientoRutaController extends Controller
                 .$detail['categoriaPaquete'].') - SE MANTIENE EL COBRO INDIVIDUAL';
         }
 
+        if ($this->isSurgeryPendingIndependentCoverage($detail)) {
+            $reasons[] = 'CIRUGIA EN ESTANCIA <24H - INDEPENDENCIA ECONOMICA SIN ACREDITAR; TARIFA DE NOTA SOLO POTENCIAL, NO SUMA AL ADMINISTRATIVO';
+        }
+
         $reasons = [...$reasons, ...match ($detail['estadoEpisodioHospitalario'] ?? '') {
             'URGENCIA_MENOR_24H_TARIFA_PENDIENTE' => [sprintf(
                 'URGENCIA <24H - TARIFA PENDIENTE DE DEFINICION (%s); SUS SERVICIOS NO SUMAN COMO COSTO CONTRACTUAL',
@@ -1337,6 +1344,14 @@ class SeguimientoRutaController extends Controller
         }
 
         return implode(' | ', $reasons);
+    }
+
+    /** @param array<string, mixed> $detail */
+    private function isSurgeryPendingIndependentCoverage(array $detail): bool
+    {
+        return $detail['tipoServicio'] === 'procedimientos'
+            && (string) ($detail['grupoServicios'] ?? '') === '04'
+            && ($detail['decisionPaquete'] ?? '') === DecisionPaqueteHospitalario::UrgenciaTarifaPendiente->value;
     }
 
     /**
