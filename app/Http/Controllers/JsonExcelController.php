@@ -9,14 +9,14 @@ use App\Models\CodigoMedicamentoNt;
 use App\Models\MedicationAdjustment;
 use App\Models\MedicationServiceClassification;
 use App\Services\ActivityLogger;
+use App\Services\RipsJsonNormalizer;
 use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
-use JsonMachine\Items;
-use JsonMachine\JsonDecoder\ExtJsonDecoder;
 use OpenSpout\Common\Entity\Cell;
 use OpenSpout\Common\Entity\Row;
 use OpenSpout\Common\Entity\Style\Style;
@@ -91,6 +91,10 @@ class JsonExcelController extends Controller
 
     private array $medicationServiceClassifications = [];
 
+    private array $ripsPointers = [];
+
+    public function __construct(private RipsJsonNormalizer $ripsJsonNormalizer) {}
+
     public function index()
     {
         return view('converter');
@@ -132,6 +136,31 @@ class JsonExcelController extends Controller
             $contributivoPaths
         );
 
+        foreach ([
+            'subsidiado_files' => [$subsidiadoFullPaths, $subsidiadoFiles],
+            'contributivo_files' => [$contributivoFullPaths, $contributivoFiles],
+        ] as $field => [$paths, $files]) {
+            foreach ($paths as $index => $path) {
+                try {
+                    $this->ripsPointers[$path] = $this->ripsJsonNormalizer->inspect($path)['pointer'];
+                } catch (\Throwable $exception) {
+                    Storage::delete(array_merge($subsidiadoPaths, $contributivoPaths));
+                    File::deleteDirectory(storage_path('app/json-temp/'.$batchId));
+                    Log::warning('Archivo RIPS rechazado', [
+                        'batch_id' => $batchId,
+                        'lote' => $field,
+                        'indice' => $index,
+                        'tipo_error' => $exception::class,
+                        'motivo' => $exception->getMessage(),
+                    ]);
+
+                    throw ValidationException::withMessages([
+                        $field.'.'.$index => 'El archivo '.basename($files[$index]->getClientOriginalName()).': '.$exception->getMessage(),
+                    ]);
+                }
+            }
+        }
+
         $resumenMensual = [
             'Consulta Medica Especializada' => [],
             'Terapias' => [],
@@ -172,11 +201,14 @@ class JsonExcelController extends Controller
         } catch (\Throwable $exception) {
             Storage::delete(array_merge($subsidiadoPaths, $contributivoPaths));
             File::deleteDirectory(storage_path('app/json-temp/'.$batchId));
-
-            throw ValidationException::withMessages([
-                'subsidiado_files' => 'Uno de los archivos no contiene la estructura RIPS esperada (usuarios).',
-                'contributivo_files' => 'Verifica que todos los archivos JSON correspondan al formato RIPS.',
+            $incidentId = (string) Str::uuid();
+            Log::error('Fallo al preparar el consolidado RIPS', [
+                'incidente' => $incidentId,
+                'tipo_error' => $exception::class,
+                'origen' => basename($exception->getFile()).':'.$exception->getLine(),
             ]);
+
+            return response()->json(['message' => 'Ocurrió un error al preparar el consolidado. Incidente: '.$incidentId], 500);
         }
 
         $this->prepareStyles();
@@ -187,17 +219,20 @@ class JsonExcelController extends Controller
         $outputPath = $outputDirectory.DIRECTORY_SEPARATOR.$fileName;
         $tempFolder = storage_path('app/openspout-temp/'.$batchId);
 
-        File::ensureDirectoryExists($outputDirectory);
-        File::ensureDirectoryExists($tempFolder);
-
-        $options = new Options;
-        $options->setTempFolder($tempFolder);
-
-        $writer = new Writer($options);
-        $writer->openToFile($outputPath);
+        $writer = null;
+        $writerOpened = false;
         $writerClosed = false;
 
         try {
+            File::ensureDirectoryExists($outputDirectory);
+            File::ensureDirectoryExists($tempFolder);
+
+            $options = new Options;
+            $options->setTempFolder($tempFolder);
+
+            $writer = new Writer($options);
+            $writer->openToFile($outputPath);
+            $writerOpened = true;
             /*
              * 1. SUBSIDIADA
              */
@@ -354,8 +389,8 @@ class JsonExcelController extends Controller
                 (float) $request->valor_administrativo
             );
 
-            $writer->close();
             $writerClosed = true;
+            $writer->close();
 
             $activityLogger->log(
                 'conversion',
@@ -368,10 +403,25 @@ class JsonExcelController extends Controller
                     'valor_administrativo' => (float) $request->valor_administrativo,
                 ]
             );
+        } catch (\Throwable $exception) {
+            File::delete($outputPath);
+            $incidentId = (string) Str::uuid();
+            Log::error('Fallo al generar el consolidado RIPS', [
+                'incidente' => $incidentId,
+                'tipo_error' => $exception::class,
+                'origen' => basename($exception->getFile()).':'.$exception->getLine(),
+            ]);
+
+            return response()->json(['message' => 'Ocurrió un error al generar el Excel. Incidente: '.$incidentId], 500);
         } finally {
-            if (! $writerClosed) {
-                $writer->close();
-                File::delete($outputPath);
+            if ($writer instanceof Writer && $writerOpened && ! $writerClosed) {
+                try {
+                    $writer->close();
+                } catch (\Throwable $cleanupException) {
+                    Log::warning('No fue posible cerrar el escritor temporal', [
+                        'tipo_error' => $cleanupException::class,
+                    ]);
+                }
             }
 
             Storage::delete(array_merge($subsidiadoPaths, $contributivoPaths));
@@ -566,13 +616,7 @@ class JsonExcelController extends Controller
         string $path,
         array &$counts
     ): void {
-        $items = Items::fromFile(
-            $path,
-            [
-                'pointer' => '/usuarios',
-                'decoder' => new ExtJsonDecoder(true),
-            ]
-        );
+        $items = $this->ripsJsonNormalizer->users($path, $this->ripsPointers[$path]);
 
         foreach ($items as $usuario) {
             if (! is_array($usuario)) {
@@ -660,13 +704,7 @@ class JsonExcelController extends Controller
         array $catalogoInsumosNt,
         array $duplicadosMedicamentos
     ): void {
-        $items = Items::fromFile(
-            $path,
-            [
-                'pointer' => '/usuarios',
-                'decoder' => new ExtJsonDecoder(true),
-            ]
-        );
+        $items = $this->ripsJsonNormalizer->users($path, $this->ripsPointers[$path]);
 
         foreach ($items as $usuario) {
             if (! is_array($usuario)) {
@@ -810,13 +848,7 @@ class JsonExcelController extends Controller
         bool $medicamentosOnly = false,
         array $duplicadosMedicamentos = []
     ): void {
-        $items = Items::fromFile(
-            $path,
-            [
-                'pointer' => '/usuarios',
-                'decoder' => new ExtJsonDecoder(true),
-            ]
-        );
+        $items = $this->ripsJsonNormalizer->users($path, $this->ripsPointers[$path]);
 
         foreach ($items as $usuario) {
             if (! is_array($usuario)) {

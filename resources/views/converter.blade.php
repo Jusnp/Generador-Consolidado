@@ -1771,14 +1771,20 @@
             fetch(form.action, {
                 method: 'POST',
                 body: formData,
-                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json'
+                }
             })
                 .then(async function (response) {
                     clearInterval(progressTimer);
 
                     if (!response.ok) {
-                        const body = await response.text();
-                        throw new Error(body || 'El servidor devolvió un error.');
+                        const body = await response.json().catch(() => null);
+                        const detail = body?.errors
+                            ? Object.values(body.errors).flat()[0]
+                            : body?.message;
+                        throw new Error(detail || 'El servidor devolvió un error al generar el consolidado.');
                     }
 
                     const blob = await response.blob();
@@ -1804,7 +1810,7 @@
                 .catch(function (error) {
                     clearInterval(progressTimer);
                     console.error(error);
-                    alert('No fue posible generar el consolidado. Revisa los archivos y vuelve a intentarlo.');
+                    alert(error.message);
                     progressArea.classList.remove('active');
                 })
                 .finally(function () {
