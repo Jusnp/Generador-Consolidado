@@ -27,6 +27,20 @@ return [
         // Paquetes hospitalarios: POR_LOTE (predeterminado) o PERSISTENTE (libro entre
         // ejecuciones). PERSISTENTE exige un punto de inicio por ruta y su aprobación.
         'libro_paquetes' => env('LA_MARIA_LIBRO_PAQUETES', 'POR_LOTE'),
+        // R-B: la cirugía acreditada de una estancia de menos de 24 horas recibe la excepción
+        // cobrable por fuera de la política hospitalaria (igual que en una estancia de 24 horas
+        // o más). Sin acuerdo contractual firmado queda desactivada y la cirugía sigue condicionada.
+        'excepcion_cirugia_estancia_corta' => (bool) env('LA_MARIA_EXCEPCION_CIRUGIA_ESTANCIA_CORTA', false),
+        // Historial hospitalario versionado (tablas ah_antecedentes y ah_estancias_abiertas): con ACTIVO
+        // y libro POR_LOTE, cada mes usa el cierre del mes anterior guardado con la-maria:cerrar-periodo.
+        // DESACTIVADO conserva la continuidad dentro del lote. El secreto (HMAC del paciente) es obligatorio
+        // al activarlo y no debe cambiar: las claves guardadas dependen de él.
+        'historial_hospitalario' => [
+            'modo' => env('LA_MARIA_HISTORIAL_HOSPITALARIO', 'DESACTIVADO'),
+            'secreto' => env('LA_MARIA_HISTORIAL_SECRETO'),
+            // Único período (aaaa-mm) autorizado para cerrar sin antecedente (--arranque). Sin valor no hay arranque.
+            'arranque' => env('LA_MARIA_HISTORIAL_ARRANQUE'),
+        ],
         // Informe administrativo histórico de cada ruta (hoja «inf admin»). Se lee
         // automáticamente; un informe cargado en el formulario reemplaza al de su ruta.
         // Si es requerido y falta, el reporte se detiene con un error claro.

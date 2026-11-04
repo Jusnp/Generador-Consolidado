@@ -79,6 +79,49 @@ DOCUMENTO,REGIMEN,CODIGO,FECHA,OCURRENCIA,VALOR_TOTAL,MOTIVO
 - `VALOR_TOTAL`: puede ser `0` para una anulación.
 - `MOTIVO`: justificación obligatoria y auditable.
 
+## Tarifarios CUPS e insumos
+
+La carga web del tarifario y los comandos `catalogo:importar-cups` y
+`catalogo:importar-insumos-nt` aplican la misma regla
+(`CatalogoConsolidadoImporter`):
+
+- `codigo_cups` solo se alimenta de una hoja con código, **tipo de servicio**
+  y tarifa. La hoja `INSUMOS` del mismo libro también trae código y tarifa,
+  pero no clasifica el servicio; por eso nunca reemplaza una tarifa CUPS.
+- La hoja `INSUMOS` solo alimenta `codigo_insumos_nt`. Un código repetido en
+  la hoja queda como un único registro.
+- Cada fila guarda en `hoja` la hoja de origen. Los códigos que no vienen en
+  un archivo nuevo no se borran ni se desactivan.
+- Una celda de tarifa CUPS vacía o no numérica no borra la tarifa vigente: se
+  conservan la tarifa y su hoja de origen, y el código se informa al terminar
+  la carga. Un código sin ninguna tarifa válida queda sin valor y también se
+  informa; el sistema no asigna tarifas por su cuenta.
+- Las fórmulas se leen por su valor calculado.
+
+```powershell
+php artisan catalogo:importar-cups C:\ruta\tarifario.xlsx --hoja=CUPS
+php artisan catalogo:importar-insumos-nt C:\ruta\tarifario.xlsx --hoja=INSUMOS
+```
+
+Si la hoja indicada no tiene las columnas de su tarifario, el comando se
+detiene sin modificar ninguna tarifa.
+
+### Transporte T34004
+
+El tarifario contractual registra dos valores para T34004:
+
+| Hoja | Tabla | Clasificación | Valor |
+|---|---|---|---|
+| CUPS | `codigo_cups` | TRANSPORTE | $165.000 |
+| INSUMOS | `codigo_insumos_nt` | NT Sí | $135.000 |
+
+El valor aplicable es el de la hoja CUPS. En la hoja `OTROS`, T34004 se
+liquida como Transporte (`ENCONTRADO TRANSPORTE CUPS`) por las unidades RIPS
+(`cantidadOS` × $165.000) y no se suma además como insumo. Los $135.000 se
+conservan en `codigo_insumos_nt` como referencia de la hoja INSUMOS. Cambiar
+el valor aplicable exige un tarifario CUPS nuevo con respaldo contractual
+aprobado.
+
 ## Despliegue
 
 Antes de publicar una versión ejecute:

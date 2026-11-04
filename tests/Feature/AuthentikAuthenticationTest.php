@@ -2,9 +2,11 @@
 
 namespace Tests\Feature;
 
+use App\Models\AuthentikStatus;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Testing\TestResponse;
 use Tests\TestCase;
 
 class AuthentikAuthenticationTest extends TestCase
@@ -100,36 +102,22 @@ class AuthentikAuthenticationTest extends TestCase
             ]);
     }
 
-    public function test_callback_logs_in_active_matching_local_user_and_binds_authentik_subject(): void
+    public function test_callback_logs_in_the_user_linked_to_the_verified_subject(): void
     {
-        $user = User::factory()->create([
-            'email' => 'persona@ejemplo.com',
+        $user = User::factory()->provisionedInAuthentik()->create([
+            'email' => null,
             'active' => true,
         ]);
 
-        Http::preventStrayRequests();
-        Http::fake([
-            'https://auth.example.test/application/o/token/' => Http::response([
-                'access_token' => 'access-token',
-            ]),
-            'https://auth.example.test/application/o/userinfo/' => Http::response([
-                'sub' => 'authentik-subject-123',
-                'email' => 'persona@ejemplo.com',
-            ]),
-        ]);
+        $this->fakeAuthentikIdentity(['sub' => $user->authentik_subject]);
 
-        $this->withSession([
-            'authentik_oauth_state' => 'valid-state',
-            'authentik_code_verifier' => 'valid-verifier',
-        ])
-            ->get(route('authentik.callback', [
-                'state' => 'valid-state',
-                'code' => 'authorization-code',
-            ]))
-            ->assertRedirectToRoute('dashboard');
+        $this->freezeSecond(function () use ($user): void {
+            $this->authentikCallback()->assertRedirectToRoute('dashboard');
 
-        $this->assertAuthenticatedAs($user);
-        $this->assertSame('authentik-subject-123', $user->fresh()->authentik_subject);
+            $this->assertAuthenticatedAs($user);
+            $this->assertEquals(now(), $user->fresh()->authentik_first_login_at);
+        });
+
         $this->assertDatabaseHas('activity_logs', [
             'user_id' => $user->id,
             'action' => 'login_authentik',
@@ -139,63 +127,110 @@ class AuthentikAuthenticationTest extends TestCase
 
     public function test_callback_refuses_authentik_identity_without_an_active_local_user(): void
     {
-        Http::preventStrayRequests();
-        Http::fake([
-            'https://auth.example.test/application/o/token/' => Http::response([
-                'access_token' => 'access-token',
-            ]),
-            'https://auth.example.test/application/o/userinfo/' => Http::response([
-                'sub' => 'unknown-subject',
-                'email' => 'desconocido@ejemplo.com',
-            ]),
+        $this->fakeAuthentikIdentity([
+            'sub' => 'unknown-subject',
+            'email' => 'desconocido@ejemplo.com',
         ]);
 
-        $this->withSession([
-            'authentik_oauth_state' => 'valid-state',
-            'authentik_code_verifier' => 'valid-verifier',
-        ])
-            ->get(route('authentik.callback', [
-                'state' => 'valid-state',
-                'code' => 'authorization-code',
-            ]))
+        $this->authentikCallback()
             ->assertRedirectToRoute('login')
             ->assertSessionHasErrors([
                 'email' => 'Tu cuenta de Authentik no tiene un usuario activo autorizado en este sistema.',
             ]);
 
         $this->assertGuest();
+        $this->assertDatabaseCount('users', 0);
+        $this->assertDatabaseHas('activity_logs', [
+            'user_id' => null,
+            'action' => 'login_authentik_rejected',
+        ]);
     }
 
-    public function test_callback_reconciles_a_changed_authentik_subject_by_trusted_email(): void
+    public function test_callback_never_links_an_unlinked_user_by_matching_email(): void
     {
         $user = User::factory()->create([
-            'email' => 'CarlosPrueba@hotmail.com',
-            'authentik_subject' => 'old-subject',
+            'email' => 'persona@ejemplo.com',
+            'authentik_subject' => null,
             'active' => true,
         ]);
 
-        Http::fake([
-            'https://auth.example.test/application/o/token/' => Http::response([
-                'access_token' => 'access-token',
-            ]),
-            'https://auth.example.test/application/o/userinfo/' => Http::response([
-                'sub' => 'new-subject-from-provider',
-                'email' => 'carlosprueba@hotmail.com',
-            ]),
+        $this->fakeAuthentikIdentity([
+            'sub' => 'subject-of-another-account',
+            'email' => 'persona@ejemplo.com',
+            'email_verified' => true,
         ]);
 
-        $this->withSession([
-            'authentik_oauth_state' => 'valid-state',
-            'authentik_code_verifier' => 'valid-verifier',
-        ])
-            ->get(route('authentik.callback', [
-                'state' => 'valid-state',
-                'code' => 'authorization-code',
-            ]))
-            ->assertRedirectToRoute('dashboard');
+        $this->authentikCallback()->assertRedirectToRoute('login');
+
+        $this->assertGuest();
+        $this->assertNull($user->fresh()->authentik_subject);
+    }
+
+    public function test_callback_never_replaces_a_linked_subject_with_an_identity_sharing_the_email(): void
+    {
+        $user = User::factory()->linkedToAuthentik()->create([
+            'email' => 'comite@ejemplo.com',
+            'role' => 'admin',
+            'active' => true,
+        ]);
+        $linkedSubject = $user->authentik_subject;
+
+        $this->fakeAuthentikIdentity([
+            'sub' => 'subject-of-another-application-account',
+            'email' => 'COMITE@ejemplo.com',
+        ]);
+
+        $this->authentikCallback()->assertRedirectToRoute('login');
+
+        $this->assertGuest();
+        $this->assertSame($linkedSubject, $user->fresh()->authentik_subject);
+    }
+
+    public function test_callback_refuses_an_inactive_linked_user(): void
+    {
+        $user = User::factory()->provisionedInAuthentik()->create(['active' => false]);
+
+        $this->fakeAuthentikIdentity(['sub' => $user->authentik_subject]);
+
+        $this->authentikCallback()->assertRedirectToRoute('login');
+
+        $this->assertGuest();
+    }
+
+    public function test_callback_refuses_a_subject_whose_provisioning_did_not_finish(): void
+    {
+        $user = User::factory()->provisionedInAuthentik()->create([
+            'authentik_status' => AuthentikStatus::Failed,
+            'active' => true,
+        ]);
+
+        $this->fakeAuthentikIdentity(['sub' => $user->authentik_subject]);
+
+        $this->authentikCallback()->assertRedirectToRoute('login');
+
+        $this->assertGuest();
+        $this->assertNull($user->fresh()->authentik_first_login_at);
+    }
+
+    public function test_callback_takes_the_role_from_siruta_and_ignores_privilege_claims(): void
+    {
+        $user = User::factory()->provisionedInAuthentik()->create([
+            'role' => 'user',
+            'active' => true,
+        ]);
+
+        $this->fakeAuthentikIdentity([
+            'sub' => $user->authentik_subject,
+            'groups' => ['authentik Admins'],
+            'is_superuser' => true,
+            'role' => 'admin',
+        ]);
+
+        $this->authentikCallback()->assertRedirectToRoute('dashboard');
 
         $this->assertAuthenticatedAs($user);
-        $this->assertSame('new-subject-from-provider', $user->fresh()->authentik_subject);
+        $this->assertSame('user', $user->fresh()->role);
+        $this->get(route('users.index'))->assertForbidden();
     }
 
     public function test_logout_continues_working_when_authentik_is_enabled(): void
@@ -211,6 +246,31 @@ class AuthentikAuthenticationTest extends TestCase
             'user_id' => $user->id,
             'action' => 'logout',
         ]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $claims
+     */
+    private function fakeAuthentikIdentity(array $claims): void
+    {
+        Http::preventStrayRequests();
+        Http::fake([
+            'https://auth.example.test/application/o/token/' => Http::response([
+                'access_token' => 'access-token',
+            ]),
+            'https://auth.example.test/application/o/userinfo/' => Http::response($claims),
+        ]);
+    }
+
+    private function authentikCallback(): TestResponse
+    {
+        return $this->withSession([
+            'authentik_oauth_state' => 'valid-state',
+            'authentik_code_verifier' => 'valid-verifier',
+        ])->get(route('authentik.callback', [
+            'state' => 'valid-state',
+            'code' => 'authorization-code',
+        ]));
     }
 
     private function configureAuthentik(): void

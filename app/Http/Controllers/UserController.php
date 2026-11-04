@@ -2,74 +2,71 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\AuthentikStatus;
 use App\Models\User;
 use App\Services\ActivityLogger;
+use App\Services\AuthentikProvisioningException;
 use App\Services\AuthentikUserProvisioner;
+use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
-use RuntimeException;
+use Illuminate\View\View;
 
 class UserController extends Controller
 {
-    public function index()
+    public function index(AuthentikUserProvisioner $authentikUserProvisioner): View
     {
-        $users = User::orderBy('name')->get();
-
-        return view('users.index', compact('users'));
+        return view('users.index', [
+            'users' => User::orderBy('name')->get(),
+            'authentikConfigured' => $authentikUserProvisioner->isConfigured(),
+        ]);
     }
 
-    public function create()
+    public function create(): View
     {
         return view('users.create');
     }
 
+    /**
+     * Registra el usuario en SIRUTA y lo aprovisiona en Authentik con su cédula
+     * como username. La confirmación solo se muestra si quedó en ambos sistemas.
+     */
     public function store(
         Request $request,
         ActivityLogger $activityLogger,
         AuthentikUserProvisioner $authentikUserProvisioner
-    ) {
+    ): RedirectResponse {
         $validated = $request->validate([
             'name' => ['required', 'string', 'min:2', 'max:100'],
-            'email' => ['required', 'string', 'email', 'max:255', 'unique:users,email'],
+            'cedula' => ['required', 'string', 'regex:/^[0-9]{5,15}$/', 'unique:users,cedula'],
+            'email' => ['nullable', 'string', 'email', 'max:255', 'unique:users,email'],
             'role' => ['required', Rule::in(['admin', 'user'])],
-            'password' => ['required', 'string', 'min:8', 'confirmed'],
             'active' => ['required', 'boolean'],
-        ], [
-            'name.required' => 'El nombre es obligatorio.',
-            'name.min' => 'El nombre debe tener al menos 2 caracteres.',
-            'name.max' => 'El nombre no puede superar los 100 caracteres.',
-            'email.required' => 'El correo electrónico es obligatorio.',
-            'email.email' => 'Ingresa un correo electrónico válido.',
-            'email.unique' => 'Ese correo electrónico ya está registrado.',
-            'role.required' => 'Debes seleccionar un rol.',
-            'role.in' => 'El rol seleccionado no es válido.',
-            'password.required' => 'La contraseña es obligatoria.',
-            'password.min' => 'La contraseña debe tener al menos 8 caracteres.',
-            'password.confirmed' => 'Las contraseñas no coinciden.',
-            'active.required' => 'Debes indicar el estado del usuario.',
-            'active.boolean' => 'El estado seleccionado no es válido.',
-        ]);
+        ], $this->validationMessages());
 
-        try {
-            $authentikUser = $authentikUserProvisioner->provision(
-                $validated['name'],
-                $validated['email'],
-                $validated['password']
-            );
-        } catch (RuntimeException $exception) {
+        if (! $authentikUserProvisioner->isConfigured()) {
             return back()
-                ->withInput($request->except('password', 'password_confirmation'))
-                ->withErrors(['email' => $exception->getMessage()]);
+                ->withInput()
+                ->withErrors(['cedula' => 'El aprovisionamiento en Authentik no está configurado; no se creó el usuario.']);
         }
 
-        $user = User::create([
-            'name' => $validated['name'],
-            'email' => $validated['email'],
-            'authentik_subject' => $authentikUser['uuid'],
-            'password' => $validated['password'],
-            'role' => $validated['role'],
-            'active' => (bool) $validated['active'],
-        ]);
+        try {
+            $user = User::create([
+                'name' => $validated['name'],
+                'cedula' => $validated['cedula'],
+                'email' => $validated['email'] ?? null,
+                // La contraseña vive en Authentik; la local queda inutilizable.
+                'password' => Str::password(64),
+                'role' => $validated['role'],
+                'active' => (bool) $validated['active'],
+            ]);
+        } catch (UniqueConstraintViolationException) {
+            return back()
+                ->withInput()
+                ->withErrors(['cedula' => 'Esa cédula o ese correo ya están registrados.']);
+        }
 
         $activityLogger->log(
             'user_created',
@@ -78,97 +75,87 @@ class UserController extends Controller
                 'created_user_id' => $user->id,
                 'created_user_name' => $user->name,
                 'created_user_email' => $user->email,
+                'cedula' => $user->maskedCedula(),
                 'role' => $user->role,
                 'active' => $user->active,
             ]
         );
 
-        return redirect()
-            ->route('users.index')
-            ->with('success', 'Usuario creado correctamente.');
+        return $this->redirectAfterProvisioning($authentikUserProvisioner, $user);
     }
 
-    public function edit(User $user)
+    public function edit(User $user): View
     {
         return view('users.edit', compact('user'));
     }
 
+    /**
+     * Actualiza solo los datos de SIRUTA. Authentik es compartido: el nombre,
+     * el correo y la contraseña de la cuenta no se modifican desde aquí.
+     */
     public function update(
         Request $request,
         User $user,
-        ActivityLogger $activityLogger,
-        AuthentikUserProvisioner $authentikUserProvisioner
-    ) {
+        ActivityLogger $activityLogger
+    ): RedirectResponse {
         $validated = $request->validate([
             'name' => ['required', 'string', 'min:2', 'max:100'],
+            'cedula' => [
+                Rule::requiredIf($user->cedula !== null),
+                'nullable',
+                'string',
+                'regex:/^[0-9]{5,15}$/',
+                Rule::unique('users', 'cedula')->ignore($user->id),
+            ],
             'email' => [
-                'required',
+                'nullable',
                 'string',
                 'email',
                 'max:255',
                 Rule::unique('users', 'email')->ignore($user->id),
             ],
             'role' => ['required', Rule::in(['admin', 'user'])],
-            'password' => ['nullable', 'string', 'min:8', 'confirmed'],
             'active' => ['required', 'boolean'],
-        ], [
-            'name.required' => 'El nombre es obligatorio.',
-            'name.min' => 'El nombre debe tener al menos 2 caracteres.',
-            'name.max' => 'El nombre no puede superar los 100 caracteres.',
-            'email.required' => 'El correo electrónico es obligatorio.',
-            'email.email' => 'Ingresa un correo electrónico válido.',
-            'email.unique' => 'Ese correo electrónico ya está registrado.',
-            'role.required' => 'Debes seleccionar un rol.',
-            'role.in' => 'El rol seleccionado no es válido.',
-            'password.min' => 'La contraseña debe tener al menos 8 caracteres.',
-            'password.confirmed' => 'Las contraseñas no coinciden.',
-            'active.required' => 'Debes indicar el estado del usuario.',
-            'active.boolean' => 'El estado seleccionado no es válido.',
-        ]);
+        ], $this->validationMessages());
+
+        $cedula = $validated['cedula'] ?? null;
+
+        if ($cedula !== $user->cedula && ! $user->canChangeCedula()) {
+            return back()
+                ->withInput()
+                ->withErrors(['cedula' => 'La cédula no se puede cambiar: ya identifica una cuenta de Authentik.']);
+        }
+
+        if ($user->is(auth()->user())
+            && ($validated['role'] !== $user->role || ! $validated['active'])) {
+            return back()
+                ->withInput()
+                ->withErrors(['role' => 'No puedes quitarte el rol de administrador ni desactivar tu propio usuario.']);
+        }
 
         $oldData = [
             'name' => $user->name,
+            'cedula' => $user->maskedCedula(),
             'email' => $user->email,
             'role' => $user->role,
             'active' => $user->active,
         ];
 
-        $authentikSubject = $user->authentik_subject;
-
-        if ($authentikSubject === null && empty($validated['password'])) {
-            return back()
-                ->withInput($request->except('password', 'password_confirmation'))
-                ->withErrors([
-                    'password' => 'Define una contraseña para crear esta cuenta en Authentik.',
-                ]);
-        }
-
-        if (! empty($validated['password'])) {
-            try {
-                $authentikUser = $authentikUserProvisioner->provision(
-                    $validated['name'],
-                    $validated['email'],
-                    $validated['password']
-                );
-                $authentikSubject = $authentikUser['uuid'];
-            } catch (RuntimeException $exception) {
-                return back()
-                    ->withInput($request->except('password', 'password_confirmation'))
-                    ->withErrors(['email' => $exception->getMessage()]);
-            }
+        if ($cedula !== $user->cedula) {
+            $user->authentik_status = AuthentikStatus::Unlinked;
+            $user->authentik_sync_error = null;
         }
 
         $user->name = $validated['name'];
-        $user->email = $validated['email'];
-        $user->authentik_subject = $authentikSubject;
+        $user->cedula = $cedula;
+        $user->email = $validated['email'] ?? null;
         $user->role = $validated['role'];
         $user->active = (bool) $validated['active'];
-
-        if (! empty($validated['password'])) {
-            $user->password = $validated['password'];
-        }
-
         $user->save();
+
+        if ($oldData['active'] && ! $user->active) {
+            $user->invalidateSessions();
+        }
 
         $activityLogger->log(
             'user_updated',
@@ -179,23 +166,27 @@ class UserController extends Controller
                 'old_data' => $oldData,
                 'new_data' => [
                     'name' => $user->name,
+                    'cedula' => $user->maskedCedula(),
                     'email' => $user->email,
                     'role' => $user->role,
                     'active' => $user->active,
                 ],
-                'password_changed' => ! empty($validated['password']),
             ]
         );
 
         return redirect()
             ->route('users.index')
-            ->with('success', 'Usuario actualizado correctamente.');
+            ->with('success', 'Usuario actualizado correctamente en SIRUTA.');
     }
 
+    /**
+     * Activa o desactiva el acceso a SIRUTA. La cuenta de Authentik no se
+     * desactiva porque puede usarse en otras aplicaciones.
+     */
     public function toggleActive(
         User $user,
         ActivityLogger $activityLogger
-    ) {
+    ): RedirectResponse {
         if ($user->id === auth()->id()) {
             return redirect()
                 ->route('users.index')
@@ -209,6 +200,10 @@ class UserController extends Controller
 
         $user->active = ! $user->active;
         $user->save();
+
+        if (! $user->active) {
+            $user->invalidateSessions();
+        }
 
         $status = $user->active ? 'activado' : 'desactivado';
 
@@ -225,8 +220,8 @@ class UserController extends Controller
         );
 
         $message = $user->active
-            ? 'Usuario activado correctamente.'
-            : 'Usuario desactivado correctamente.';
+            ? 'Usuario activado correctamente en SIRUTA.'
+            : 'Usuario desactivado en SIRUTA. Su cuenta de Authentik no se modificó.';
 
         return redirect()
             ->route('users.index')
@@ -236,13 +231,22 @@ class UserController extends Controller
     public function destroy(
         User $user,
         ActivityLogger $activityLogger
-    ) {
+    ): RedirectResponse {
         if ($user->id === auth()->id()) {
             return redirect()
                 ->route('users.index')
                 ->with(
                     'error',
                     'No puedes eliminar tu propio usuario.'
+                );
+        }
+
+        if (! $user->canBeDeleted()) {
+            return redirect()
+                ->route('users.index')
+                ->with(
+                    'error',
+                    'Este usuario tiene una cuenta creada por SIRUTA en Authentik: desactívalo en lugar de eliminarlo.'
                 );
         }
 
@@ -262,6 +266,7 @@ class UserController extends Controller
         $deletedUser = [
             'id' => $user->id,
             'name' => $user->name,
+            'cedula' => $user->maskedCedula(),
             'email' => $user->email,
             'role' => $user->role,
             'active' => $user->active,
@@ -280,5 +285,49 @@ class UserController extends Controller
         return redirect()
             ->route('users.index')
             ->with('success', 'Usuario eliminado correctamente.');
+    }
+
+    private function redirectAfterProvisioning(
+        AuthentikUserProvisioner $authentikUserProvisioner,
+        User $user
+    ): RedirectResponse {
+        try {
+            $user = $authentikUserProvisioner->provision($user);
+        } catch (AuthentikProvisioningException $exception) {
+            return redirect()
+                ->route('users.index')
+                ->with('error', "El usuario quedó registrado en SIRUTA, pero no en Authentik: {$exception->getMessage()}");
+        }
+
+        if ($user->authentik_status === AuthentikStatus::Provisioned) {
+            return redirect()
+                ->route('users.index')
+                ->with('success', 'Usuario creado en SIRUTA y en Authentik. Genera el enlace de activación para que defina su contraseña.');
+        }
+
+        return redirect()
+            ->route('users.index')
+            ->with('error', "El usuario quedó registrado en SIRUTA, pero no en Authentik: {$user->authentik_sync_error}");
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function validationMessages(): array
+    {
+        return [
+            'name.required' => 'El nombre es obligatorio.',
+            'name.min' => 'El nombre debe tener al menos 2 caracteres.',
+            'name.max' => 'El nombre no puede superar los 100 caracteres.',
+            'cedula.required' => 'El número de cédula es obligatorio.',
+            'cedula.regex' => 'La cédula debe tener entre 5 y 15 dígitos, sin puntos ni espacios.',
+            'cedula.unique' => 'Esa cédula ya está registrada en SIRUTA.',
+            'email.email' => 'Ingresa un correo electrónico válido.',
+            'email.unique' => 'Ese correo electrónico ya está registrado.',
+            'role.required' => 'Debes seleccionar un rol.',
+            'role.in' => 'El rol seleccionado no es válido.',
+            'active.required' => 'Debes indicar el estado del usuario.',
+            'active.boolean' => 'El estado seleccionado no es válido.',
+        ];
     }
 }

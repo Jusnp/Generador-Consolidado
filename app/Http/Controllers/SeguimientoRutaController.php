@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Exceptions\LibroPaquetesException;
 use App\Models\CatalogoReferencia;
 use App\Models\ProgramaEjecucion;
+use App\Programas\LaMaria\CierreHospitalarioPeriodo;
 use App\Programas\LaMaria\ConciliacionRipsNota;
 use App\Programas\LaMaria\CondicionArchivo;
 use App\Programas\LaMaria\DecisionPaqueteHospitalario;
@@ -14,6 +15,7 @@ use App\Programas\LaMaria\EstadoTarifario;
 use App\Programas\LaMaria\ExplicacionBrecha;
 use App\Programas\LaMaria\FuenteTarifa;
 use App\Programas\LaMaria\HistorialAdministrativo;
+use App\Programas\LaMaria\HistorialHospitalario;
 use App\Programas\LaMaria\HistoricoTarifarioConsolidado;
 use App\Programas\LaMaria\LaMariaCervixPipeline;
 use App\Programas\LaMaria\LaMariaPrograma;
@@ -22,6 +24,7 @@ use App\Programas\LaMaria\LibroPaquetesEjecucion;
 use App\Programas\LaMaria\ModoLibroPaquetes;
 use App\Programas\LaMaria\PoliticaPaqueteHospitalario;
 use App\Programas\LaMaria\ReconstructorEpisodiosHospitalarios;
+use App\Programas\LaMaria\ReporteConciliacionAdministrativa;
 use App\Programas\LaMaria\ResumenEconomico;
 use App\Programas\LaMaria\RutaCalculo;
 use App\Programas\LaMaria\ValorizacionAdministrativa;
@@ -201,14 +204,18 @@ class SeguimientoRutaController extends Controller
         $pipeline = $this->pipelineFor($ejecucion);
         $ruta = (string) $pipeline->rutaCodigo();
         $this->verificarCatalogosClinicos();
-        $referenciaRutaMatcher = new ReferenciaRutaMatcher;
+        $referenciaRutaMatcher = new ReferenciaRutaMatcher(exigirIumAcreditado: true);
 
         $validated = $this->validateUpload($request);
+        $fuenteConciliacion = $this->fuenteIndividualConciliacion($validated);
+        $reporteConciliacion = new ReporteConciliacionAdministrativa;
+        $ripsConciliacion = [];
 
         $sqlFile = $request->file('sql_archivo');
 
         $files = $this->uploadedFiles($validated['archivos']);
         $recepcion = $this->verifyReception($request, $validated['archivos'], $files, $seguimientoRutaClassifier);
+        $this->prepararHistorialHospitalario($seguimientoRutaClassifier);
         $historialAdministrativo = $this->administrativeHistory($validated, [$ruta]);
         $batchId = (string) Str::uuid();
         $modoPaquetes = LibroPaquetesEjecucion::modo();
@@ -329,6 +336,7 @@ class SeguimientoRutaController extends Controller
                 $estadoEconomico = $resumenEconomico->registrar($detail);
                 $conciliacionRipsNota->registrar($detail, $estadoEconomico);
                 $valorizacion->registrar($detail, $estadoEconomico);
+                $ripsConciliacion[] = $reporteConciliacion->normalizar($ruta, $detail, $fuenteConciliacion);
                 $estadosEconomicos[] = [$detail['mesAtencion'], $detail['factura'], $detail['tipoServicio'], $detail['codigo'],
                     $detail['cantidad'], $detail['tarifaReferencia'], $detail['cumResuelto'] ?? '', $detail['metodoResolucion'] ?? '',
                     $estadoEconomico['estado'], $estadoEconomico['respaldado'], $estadoEconomico['condicionadoIncluido'],
@@ -424,6 +432,9 @@ class SeguimientoRutaController extends Controller
                 $writer->addRow(Row::fromValues($reference));
             }
 
+            $bridgeSheet = $writer->addNewSheetAndMakeItCurrent();
+            $bridgeSheet->setName('PUENTE ECONOMICO');
+
             $catalogSheet = $writer->addNewSheetAndMakeItCurrent();
             $catalogSheet->setName('CATALOGOS APLICADOS');
             $this->configureSheet($catalogSheet, [48, 24, 38, 22, 28, 16]);
@@ -492,11 +503,17 @@ class SeguimientoRutaController extends Controller
 
             $resultadoEconomico = $this->economicResult($resumenEconomico, $profiles, $sharedProfiles, $ruta);
             $conciliacionRipsNota->atribuirPaquetes($resultadoEconomico['hospitalizacion']);
-            $valorizacion->atribuirPaquetes($resultadoEconomico['hospitalizacion']);
+            $valorizacion->atribuirPaquetes($resultadoEconomico['hospitalizacion'], $this->continuidadesDeRuta($seguimientoRutaClassifier, $processableFiles, $allProfiles, $ruta),
+                $this->cierresHospitalariosDeRuta($seguimientoRutaClassifier, $ruta));
             $valorizacion->atribuirUrgencias($conciliacionRipsNota->filasEpisodiosUrgencias(), $conciliacionRipsNota->costoUrgenciasPorTipo());
+            if ($fuenteConciliacion !== null) {
+                $ripsConciliacion = $reporteConciliacion->incorporarCobertura($ripsConciliacion, $valorizacion->filasCoberturaMedicamentos(), $fuenteConciliacion, $ruta);
+            }
             $estimacionAdministrativa = $this->administrativeComparison([$ruta => $valorizacion], [$ruta => $resultadoEconomico]);
             $writer->setCurrentSheet($summarySheet);
             $this->writeMonthlyAdministrativeSummary($writer, [$ruta => $valorizacion], [$ruta => $resultadoEconomico]);
+            $writer->setCurrentSheet($bridgeSheet);
+            $this->writeEconomicBridge($writer, [$ruta => $valorizacion], [$ruta => $resultadoEconomico]);
             $hospitalizacionDemo = $resultadoEconomico['hospitalizacion'];
             foreach ($hospitalizacionDemo as $filaHospital) {
                 if ($filaHospital[0] !== 'TOTAL') {
@@ -510,6 +527,12 @@ class SeguimientoRutaController extends Controller
                 }
             }
             unset($filaCategoria);
+            $tarifasTransporte = $fuenteConciliacion === null ? [] : $reporteConciliacion->tarifasTransporte($ripsConciliacion, $fuenteConciliacion);
+            if ($fuenteConciliacion !== null) {
+                $ripsConciliacion = $reporteConciliacion->incorporarFirmasCompletas($ripsConciliacion, $processableFiles, $fuenteConciliacion);
+            }
+            $fuentesReporte = [...($fuenteConciliacion?->fuentes() ?? []), ...$this->fuentesTrazabilidad($files, $referenciaRutaMatcher)];
+            $reporteConciliacion->escribir($writer, $fuenteConciliacion?->filasIndividuales() ?? [], $ripsConciliacion, $fuentesReporte, [], $tarifasTransporte, $fuenteConciliacion);
             $writer->close();
             $writerClosed = true;
 
@@ -535,6 +558,7 @@ class SeguimientoRutaController extends Controller
                         'fuentes' => $historialAdministrativo->fuentes(),
                         'totales' => $valorizacion->totalesPorMes(),
                     ],
+                    ...$this->trazaHistorialHospitalario($seguimientoRutaClassifier),
                 ]
             );
 
@@ -613,10 +637,14 @@ class SeguimientoRutaController extends Controller
 
         $this->verificarCatalogosClinicos();
         $validated = $this->validateUpload($request);
+        $fuenteConciliacion = $this->fuenteIndividualConciliacion($validated);
+        $reporteConciliacion = new ReporteConciliacionAdministrativa;
+        $ripsConciliacion = [];
         $files = $this->uploadedFiles($validated['archivos']);
         $recepcion = $this->verifyReception($request, $validated['archivos'], $files, $seguimientoRutaClassifier);
+        $this->prepararHistorialHospitalario($seguimientoRutaClassifier);
         $historialAdministrativo = $this->administrativeHistory($validated, [LaMariaPrograma::RUTA_PROSTATA, LaMariaPrograma::RUTA_CERVIX]);
-        $referenciaRutaMatcher = new ReferenciaRutaMatcher;
+        $referenciaRutaMatcher = new ReferenciaRutaMatcher(exigirIumAcreditado: true);
         $batchId = (string) Str::uuid();
         $fileName = 'LA_MARIA_CONSOLIDADO_'.now()->format('Ymd_His').'_'.Str::lower(Str::random(8)).'.xlsx';
         $outputDirectory = storage_path('app/generated');
@@ -652,11 +680,17 @@ class SeguimientoRutaController extends Controller
                     $estadoEconomico = $resumenEconomico->registrar($detail);
                     $conciliacionRipsNota->registrar($detail, $estadoEconomico);
                     $valorizaciones[$ruta]->registrar($detail, $estadoEconomico);
+                    $ripsConciliacion[] = $reporteConciliacion->normalizar($ruta, $detail, $fuenteConciliacion);
                 }
 
                 $resultados[$ruta] = $this->economicResult($resumenEconomico, $profiles, $sharedProfiles, $ruta);
-                $valorizaciones[$ruta]->atribuirPaquetes($resultados[$ruta]['hospitalizacion']);
+                $valorizaciones[$ruta]->atribuirPaquetes($resultados[$ruta]['hospitalizacion'],
+                    $this->continuidadesDeRuta($seguimientoRutaClassifier, $processableFiles, $allProfiles, $ruta),
+                    $this->cierresHospitalariosDeRuta($seguimientoRutaClassifier, $ruta));
                 $valorizaciones[$ruta]->atribuirUrgencias($conciliacionRipsNota->filasEpisodiosUrgencias(), $conciliacionRipsNota->costoUrgenciasPorTipo());
+                if ($fuenteConciliacion !== null) {
+                    $ripsConciliacion = $reporteConciliacion->incorporarCobertura($ripsConciliacion, $valorizaciones[$ruta]->filasCoberturaMedicamentos(), $fuenteConciliacion, $ruta);
+                }
             }
 
             $summaryHeaders = ['RUTA', ...self::MONTHLY_SUMMARY_HEADERS];
@@ -667,6 +701,10 @@ class SeguimientoRutaController extends Controller
 
             $estimacionAdministrativa = $this->administrativeComparison($valorizaciones, $resultados);
             $this->writeMonthlyAdministrativeSummary($writer, $valorizaciones, $resultados, true);
+
+            $bridgeSheet = $writer->addNewSheetAndMakeItCurrent();
+            $bridgeSheet->setName('PUENTE ECONOMICO');
+            $this->writeEconomicBridge($writer, $valorizaciones, $resultados);
 
             $catalogSheet = $writer->addNewSheetAndMakeItCurrent();
             $catalogSheet->setName('CATALOGOS APLICADOS');
@@ -693,6 +731,12 @@ class SeguimientoRutaController extends Controller
                 $writer->addRow(Row::fromValues($receptionRow));
             }
 
+            $tarifasTransporte = $fuenteConciliacion === null ? [] : $reporteConciliacion->tarifasTransporte($ripsConciliacion, $fuenteConciliacion);
+            if ($fuenteConciliacion !== null) {
+                $ripsConciliacion = $reporteConciliacion->incorporarFirmasCompletas($ripsConciliacion, $processableFiles, $fuenteConciliacion);
+            }
+            $fuentesReporte = [...($fuenteConciliacion?->fuentes() ?? []), ...$this->fuentesTrazabilidad($files, $referenciaRutaMatcher)];
+            $reporteConciliacion->escribir($writer, $fuenteConciliacion?->filasIndividuales() ?? [], $ripsConciliacion, $fuentesReporte, [], $tarifasTransporte, $fuenteConciliacion);
             $writer->close();
             $writerClosed = true;
 
@@ -716,6 +760,7 @@ class SeguimientoRutaController extends Controller
                         'fuentes' => $historialAdministrativo->fuentes(),
                         'totales' => array_map(static fn (ValorizacionAdministrativa $valorizacion): array => $valorizacion->totalesPorMes(), $valorizaciones),
                     ],
+                    ...$this->trazaHistorialHospitalario($seguimientoRutaClassifier),
                 ]
             );
 
@@ -1381,6 +1426,19 @@ class SeguimientoRutaController extends Controller
                 default => '',
             };
 
+        $motivo = (string) ($detail['motivoNoSuma'] ?? '');
+        $decision = (string) ($detail['decisionPaquete'] ?? '');
+        if ($motivo !== '' || $decision !== '' || $observation === '') {
+            $observation = implode(' | ', array_unique(array_filter([
+                $observation,
+                'ESTADO TARIFARIO: '.(string) $detail['estadoTarifario'],
+                $decision === '' ? '' : 'PAQUETE: '.$decision,
+                $motivo === '' ? '' : 'NO SUMA AL COSTO ACTIVO: '.$motivo,
+                ($detail['resolucionMedicamento'] ?? '') === '' ? '' : 'RESOLUCION: '.$detail['resolucionMedicamento'],
+                'AUSENCIA EN NOTA NO IMPLICA COBRO ADICIONAL; CONSULTAR PUENTE ECONOMICO',
+            ])));
+        }
+
         return [
             $detail['factura'],
             $this->jsonValue($detail['usuarioJson'], ['tipoDocumentoIdentificacion']),
@@ -1962,6 +2020,68 @@ class SeguimientoRutaController extends Controller
     }
 
     /**
+     * Historial hospitalario versionado: solo con modo ACTIVO, libro POR_LOTE y un secreto propio. Sin
+     * activarlo, la continuidad RN-16 se resuelve dentro del lote, como hasta ahora.
+     */
+    private function prepararHistorialHospitalario(SeguimientoRutaClassifier $classifier): void
+    {
+        $configuracion = (array) config('programas.la-maria.historial_hospitalario', []);
+
+        if (($configuracion['modo'] ?? 'DESACTIVADO') !== 'ACTIVO' || LibroPaquetesEjecucion::modo() !== ModoLibroPaquetes::PorLote) {
+            return;
+        }
+
+        $secreto = (string) ($configuracion['secreto'] ?? '');
+
+        if (strlen($secreto) < 32) {
+            throw ValidationException::withMessages(['archivos' => 'El historial hospitalario está activo sin LA_MARIA_HISTORIAL_SECRETO (mínimo 32 caracteres).']);
+        }
+
+        $classifier->usarHistorialHospitalario(app(HistorialHospitalario::class), new CierreHospitalarioPeriodo(new PoliticaPaqueteHospitalario, $secreto));
+    }
+
+    /**
+     * @return array<string, list<array<string, mixed>>>
+     */
+    private function trazaHistorialHospitalario(SeguimientoRutaClassifier $classifier): array
+    {
+        $traza = $classifier->trazaHistorialHospitalario();
+
+        return $traza === [] ? [] : ['historial_hospitalario' => $traza];
+    }
+
+    /**
+     * Estado del cierre hospitalario de cada mes de la ruta (solo con el historial activo).
+     *
+     * @return array<string, string>
+     */
+    private function cierresHospitalariosDeRuta(SeguimientoRutaClassifier $classifier, string $ruta): array
+    {
+        $cierres = [];
+
+        foreach ($classifier->trazaHistorialHospitalario() as $traza) {
+            if ($traza['ruta'] === $ruta) {
+                $cierres[$traza['periodo']] = $traza['cierreDelPeriodo'].' · antecedente '.$traza['antecedente'].' ('.$traza['estadoAntecedente'].')';
+            }
+        }
+
+        return $cierres;
+    }
+
+    /**
+     * Continuaciones de cortes 08 entre meses del lote para la estimación RN-16 de la ruta.
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     * @param  array<int, array<string, mixed>>  $profiles
+     * @return list<array{ruta: string, mes: string, documento: string, inicio: string, fin: string, bloquesLote: int, bloquesEstancia: int, ajuste: int, motivo: string}>
+     */
+    private function continuidadesDeRuta(SeguimientoRutaClassifier $classifier, array $files, array $profiles, string $ruta): array
+    {
+        return array_values(array_filter($classifier->continuidadesEntreMeses($files, $profiles),
+            static fn (array $continuidad): bool => $continuidad['ruta'] === $ruta));
+    }
+
+    /**
      * Resumen mensual de la ejecución: COSTO ACTIVO solo incluye lo que suma.
      * CASOS A REVISAR cuenta las líneas de esa hoja, incluidas las compartidas
      * no asignables.
@@ -2007,8 +2127,6 @@ class SeguimientoRutaController extends Controller
     private function writeMonthlyAdministrativeSummary(Writer $writer, array $valorizaciones, array $resultados, bool $includeRoute = false): void
     {
         $money = (new Style)->setFormat('"$"#,##0.00');
-        $integer = (new Style)->setFormat('#,##0');
-        $quantity = (new Style)->setFormat('#,##0.####');
         $monthlyRows = [];
         $serviceBlocks = [];
 
@@ -2019,8 +2137,7 @@ class SeguimientoRutaController extends Controller
                 $monthlyRows[] = $includeRoute
                     ? [$ruta, $mes, $summary[1], $summary[2], $economic['totales']['estimado']]
                     : [$mes, $summary[1], $summary[2], $economic['totales']['estimado']];
-                $serviceBlocks[] = [$ruta, $mes, $economic, $valorizaciones[$ruta]->cantidadesEconomicas($mes),
-                    $valorizaciones[$ruta]->consultaUrgencias890701($mes), $valorizaciones[$ruta]->pendientesApPorCausa($mes)];
+                $serviceBlocks[] = [$ruta, $mes, $economic];
             }
         }
 
@@ -2028,10 +2145,10 @@ class SeguimientoRutaController extends Controller
             $writer->addRow(Row::fromValuesWithStyles($row, null, [$includeRoute ? 4 : 3 => $money]));
         }
 
-        foreach ($serviceBlocks as [$ruta, $mes, $economic, $cantidades, $consultaUrgencias, $pendientesAp]) {
+        foreach ($serviceBlocks as [$ruta, $mes, $economic]) {
             $writer->addRow(Row::fromValues(['']));
             $writer->addRow(Row::fromValues([($includeRoute ? self::ROUTE_NAMES[$ruta].' · ' : '').$mes]));
-            $writer->addRow(Row::fromValues(['TIPO RIPS / SERVICIO', 'REGISTROS RIPS', 'UNIDADES VALORIZADAS', 'VALOR ADMINISTRATIVO'], $this->headerStyle()));
+            $writer->addRow(Row::fromValues(['TIPO RIPS / SERVICIO', 'VALOR ADMINISTRATIVO'], $this->headerStyle()));
 
             foreach ($economic['filas'] as $service) {
                 if ($service[0] === 'TOTAL' || ! in_array($service[0], ['AC', 'AP', 'AT', 'AU', 'AM', 'AH'], true)) {
@@ -2040,54 +2157,14 @@ class SeguimientoRutaController extends Controller
 
                 $tipo = (string) $service[0];
                 $label = $tipo.' — '.$service[1].($tipo === 'AU' ? ' (sin cobro propio; no aditivo)' : '');
-                $writer->addRow(Row::fromValuesWithStyles([$label, (int) $service[2], $cantidades[$tipo]['unidades'],
-                    $tipo === 'AU' ? 0.0 : (float) $service[4]], null, [1 => $integer, 2 => $quantity, 3 => $money]));
+                $writer->addRow(Row::fromValuesWithStyles([$label,
+                    $tipo === 'AU' ? 0.0 : (float) $service[4]], null, [1 => $money]));
             }
 
-            $writer->addRow(Row::fromValuesWithStyles(['TOTAL DEL MES', $economic['totales']['registros'], '',
-                $economic['totales']['estimado']], null, [1 => $integer, 3 => $money]));
-            $writer->addRow(Row::fromValuesWithStyles(['COSTO A ACREDITADO (NO SUMA AL ADMINISTRATIVO)', '', '',
-                $economic['totales']['costoA']], null, [3 => $money]));
-
-            $writer->addRow(Row::fromValues(['FUENTE DEL TOTAL', 'CÁLCULO AUTÓNOMO: RIPS, catálogos, reglas RN-01 a RN-16 y precios históricos anteriores a '.$mes.'; sin informe administrativo del mes.']));
-
-            $writer->addRow(Row::fromValues(['']));
-            $writer->addRow(Row::fromValues(['DETALLE AU (NO ADITIVO)', 'REGISTROS / EPISODIOS', 'UNIDADES RECONOCIDAS', 'VALOR INFORMATIVO'], $this->headerStyle()));
-            $writer->addRow(Row::fromValuesWithStyles(['EPISODIOS AU RIPS', $economic['urgencias']['episodios'], 0, 0.0], null, [1 => $integer, 2 => $integer, 3 => $money]));
-            $writer->addRow(Row::fromValuesWithStyles(['CONSULTA 890701 RIPS (YA VALORADA EN AC)', $consultaUrgencias['rips'],
-                $consultaUrgencias['reconocidas'], $consultaUrgencias['valorAc']], null, [1 => $integer, 2 => $integer, 3 => $money]));
-            $writer->addRow(Row::fromValuesWithStyles(['TARIFA HISTÓRICA 890701 POR CONSULTA', '', '',
-                $consultaUrgencias['tarifaHistorica'] ?? ''], null, [3 => $money]));
-            $writer->addRow(Row::fromValuesWithStyles(['CONSULTAS 890701 ENLAZADAS A AU (SUBCONJUNTO DE AC)',
-                $consultaUrgencias['enlazadas'], $consultaUrgencias['enlazadas'], $consultaUrgencias['valorEnlazado']], null,
-                [1 => $integer, 2 => $integer, 3 => $money]));
-            $writer->addRow(Row::fromValuesWithStyles(['OTROS SERVICIOS ATRIBUIDOS A AU (YA EN AC/AP/AM)', '', '',
-                round($economic['urgencias']['atribuidoAdministrativo'] - $consultaUrgencias['valorEnlazado'], 2)], null, [3 => $money]));
-            foreach ($consultaUrgencias['sinValor'] as $motivo => $registros) {
-                $writer->addRow(Row::fromValues(['CONSULTA 890701 SIN VALOR INDEPENDIENTE', $registros, '', $motivo]));
-            }
-            $writer->addRow(Row::fromValues(['']));
-            $writer->addRow(Row::fromValues(['ESTADO DE REGISTROS', 'RECONOCIDOS', 'DUPLICADOS', 'INCLUIDOS / CONDICIONADOS-PENDIENTES'], $this->headerStyle()));
-
-            foreach (['AC', 'AP', 'AT', 'AU', 'AM', 'AH'] as $tipo) {
-                $estado = $cantidades[$tipo];
-                $writer->addRow(Row::fromValuesWithStyles([$tipo, $estado['reconocidos'], $estado['duplicados'],
-                    $estado['incluidos'].' / '.$estado['pendientes']], null, [1 => $integer, 2 => $integer]));
-            }
-
-            $writer->addRow(Row::fromValues(['AH: REGISTROS RIPS CON EGRESO', $cantidades['AH']['reconocidos'],
-                'BLOQUES VALORIZADOS E INTERNACIONES SOLO COMO SERVICIO (RN-16)', $cantidades['AH']['unidades']]));
-            $writer->addRow(Row::fromValues(['AH: INTERNACIONES SOLO COMO SERVICIO AP',
-                $cantidades['AH']['soloServicio'],
-                'Se incluyen una vez en AH cuando no hay hospitalización del caso; no se suman como AP.', '']));
-            $writer->addRow(Row::fromValues(['AH: REGISTROS INCLUIDOS', $cantidades['AH']['incluidos'],
-                'Cortes 08 o estancias sin cobro independiente; el egreso se valora una sola vez.', '']));
-            $writer->addRow(Row::fromValues(['AP: CONDICIONADO POR POSIBLE INCLUSIÓN EN PAQUETE AH', $pendientesAp['paquete'],
-                'La nota Hx incluye la prestación; solo una excepción contractual acreditada permitiría sumarla.', '']));
-            $writer->addRow(Row::fromValues(['AP: SIN TARIFA / OTROS PENDIENTES', $pendientesAp['sinTarifa'],
-                'Otros pendientes: '.$pendientesAp['otros'].'; no equivalen a prestaciones sin RIPS.', '']));
-            $writer->addRow(Row::fromValues(['DEFINICIÓN DE UNIDADES', 'AC/AP: prestaciones reconocidas; AT: base compatible por código; '
-                .'AM: líneas independientes, sin sumar cantidades de presentaciones distintas; AH: bloques de 25 días; AU: cero unidades independientes.']));
+            $writer->addRow(Row::fromValuesWithStyles(['TOTAL DEL MES', $economic['totales']['estimado']], null, [1 => $money]));
+            $writer->addRow(Row::fromValuesWithStyles(['COSTO A ACREDITADO (NO SUMA AL ADMINISTRATIVO)',
+                $economic['totales']['costoA']], null, [1 => $money]));
+            $writer->addRow(Row::fromValues(['FUENTE DEL TOTAL', 'Cálculo autónomo con RIPS y referencias económicas vigentes.']));
         }
     }
 
@@ -2363,6 +2440,58 @@ class SeguimientoRutaController extends Controller
         return $historial;
     }
 
+    /**
+     * @param  list<array{path: string, fileName: string}>  $files
+     * @return list<array<string, mixed>>
+     */
+    private function fuentesTrazabilidad(array $files, ReferenciaRutaMatcher $matcher): array
+    {
+        $filas = [];
+        foreach ($files as $file) {
+            $filas[] = ['archivo' => $file['fileName'], 'hoja' => 'JSON RIPS', 'sha256' => hash_file('sha256', $file['path']), 'control' => 'SHA256 DEL ARCHIVO ORIGINAL'];
+        }
+        foreach ($matcher->appliedCatalogsSnapshot() as $catalogo) {
+            $hash = hash_init('sha256');
+            $cantidad = 0;
+            $items = DB::table('catalogo_referencia_items')->where('catalogo_referencia_id', $catalogo['id'])->where('activo', true)
+                ->orderBy('id')->select(['id', 'codigo', 'hoja', 'ruta', 'categoria', 'descripcion', 'tarifa_referencia', 'metadatos'])->cursor();
+            foreach ($items as $item) {
+                hash_update($hash, json_encode((array) $item, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n");
+                $cantidad++;
+            }
+            $filas[] = ['archivo' => $catalogo['archivo_origen'], 'hoja' => 'CATALOGO '.$catalogo['tipo'].' '.$catalogo['version'],
+                'filas' => $cantidad, 'sha256' => hash_final($hash), 'control' => 'SHA256 DE ITEMS ACTIVOS ORDENADOS POR ID'];
+        }
+
+        return $filas;
+    }
+
+    /** @param array<string, mixed> $validated */
+    private function fuenteIndividualConciliacion(array $validated): ?HistorialAdministrativo
+    {
+        $archivos = $validated['informes_administrativos'] ?? [];
+        if ($archivos === []) {
+            return null;
+        }
+        $historial = new HistorialAdministrativo;
+        $historial->habilitarFilasIndividuales();
+        try {
+            foreach ($archivos as $archivo) {
+                if (! $archivo instanceof UploadedFile || $archivo->getRealPath() === false) {
+                    throw new \RuntimeException('Archivo administrativo no disponible.');
+                }
+                $ruta = $historial->cargarArchivo($archivo->getRealPath(), $archivo->getClientOriginalName());
+                if ($ruta !== null && ! in_array($ruta, ['PROSTATA', 'CERVIX'], true)) {
+                    throw new \RuntimeException('Informe sin hoja, periodo o programa identificable.');
+                }
+            }
+        } catch (\Throwable $exception) {
+            throw ValidationException::withMessages(['informes_administrativos' => 'No se pudo validar una hoja de servicios, periodo y programa del informe administrativo.']);
+        }
+
+        return $historial;
+    }
+
     private function administrativeValuation(string $ruta, HistorialAdministrativo $historial, ReferenciaRutaMatcher $matcher): ValorizacionAdministrativa
     {
         return new ValorizacionAdministrativa(
@@ -2400,6 +2529,28 @@ class SeguimientoRutaController extends Controller
         }
 
         return $comparacion;
+    }
+
+    /**
+     * @param  array<string, ValorizacionAdministrativa>  $valorizaciones
+     * @param  array<string, array<string, mixed>>  $resultados
+     */
+    private function writeEconomicBridge(Writer $writer, array $valorizaciones, array $resultados): void
+    {
+        $this->configureSheet($writer->getCurrentSheet(), [16, 14, 44, 16, 24, 40, 16, 16, 24, 24, 24, 58, 100]);
+        $writer->addRow(Row::fromValues(['RUTA', ...ValorizacionAdministrativa::PUENTE_HEADERS], $this->headerStyle()));
+        $money = (new Style)->setFormat('"$"#,##0.00');
+        foreach ($valorizaciones as $ruta => $valorizacion) {
+            $activos = [];
+            foreach ($resultados[$ruta]['costos'] as $costo) {
+                if ($costo[1] !== 'TOTAL PERIODO') {
+                    $activos[(string) $costo[1]] = (float) $costo[9];
+                }
+            }
+            foreach ($valorizacion->filasPuente($activos) as $fila) {
+                $writer->addRow(Row::fromValuesWithStyles([$ruta, ...$fila], null, [8 => $money, 9 => $money, 10 => $money]));
+            }
+        }
     }
 
     /**

@@ -12,6 +12,60 @@ class ReferenciaRutaMatcherTest extends TestCase
 {
     private int $nextCatalogId = 1;
 
+    public function test_unverified_reported_iums_do_not_inherit_commercial_prices_from_dispensation(): void
+    {
+        $matcher = new ReferenciaRutaMatcher(new Collection([
+            $this->catalog('MEDICAMENTOS_CUM', [
+                $this->item('20195068-1', null, 'CUM', 'ENZALUTAMIDA 40 MG', null,
+                    ['ium' => '1E1033301002100', 'principio_activo' => 'ENZALUTAMIDA', 'cantidad' => 40, 'unidad_medida' => 'mg', 'forma_farmaceutica' => 'CAPSULA', 'muestra_medica' => 'No']),
+                $this->item('20254463-2', null, 'CUM', 'APALUTAMIDA 240 MG', null,
+                    ['ium' => '1A1060601000101', 'principio_activo' => 'APALUTAMIDA', 'cantidad' => 240, 'unidad_medida' => 'mg', 'forma_farmaceutica' => 'TABLETA', 'muestra_medica' => 'Si']),
+                $this->item('20254463-1', null, 'CUM', 'APALUTAMIDA 240 MG', null,
+                    ['ium' => '1A1060601000100', 'principio_activo' => 'APALUTAMIDA', 'cantidad' => 240, 'unidad_medida' => 'mg', 'forma_farmaceutica' => 'TABLETA', 'muestra_medica' => 'No']),
+            ]),
+            $this->catalog('NOTA_MEDICAMENTOS', [
+                $this->item('20195068-1', 'PROSTATA', 'MEDICAMENTO_NT', 'ENZALUTAMIDA 40 MG', 46624, ['principio_activo' => 'ENZALUTAMIDA']),
+                $this->item('20254463-1', 'PROSTATA', 'MEDICAMENTO_NT', 'APALUTAMIDA 240 MG', 339686, ['principio_activo' => 'APALUTAMIDA']),
+            ]),
+            $this->catalog('DISPENSACION_PROSTATA', [
+                $this->item('20195068-1', 'PROSTATA', 'DISPENSACION_ADMINISTRATIVA', 'ENZALUTAMIDA', 46624,
+                    ['documento_paciente' => '100', 'fecha_dispensacion' => '2026-08-18']),
+                $this->item('20254463-1', 'PROSTATA', 'DISPENSACION_ADMINISTRATIVA', 'APALUTAMIDA', 339686,
+                    ['documento_paciente' => '100', 'fecha_dispensacion' => '2026-08-18']),
+            ]),
+        ]), exigirIumAcreditado: true);
+
+        foreach (['1E1033301000101' => 'ENZALUTAMIDA', '1A1060601000101' => 'APALUTAMIDA'] as $code => $name) {
+            $match = $matcher->match(['codigo' => $code, 'tipoServicio' => 'medicamentos', 'cantidad' => 30,
+                'numDocumentoIdentificacion' => '100', 'fechaAtencion' => '2026-08-18', 'nombreServicio' => $name], 'PROSTATA');
+
+            $this->assertSame(0.0, $match['costoEstimadoReferencia']);
+            $this->assertNotSame('CON_TARIFA', $match['estadoTarifario']);
+            $this->assertSame('', $match['cumResuelto']);
+            $this->assertStringContainsString('NO ACREDITADA', $match['evidenciaResolucion']);
+        }
+    }
+
+    public function test_previously_unverified_ium_can_be_valued_after_an_exact_commercial_catalog_match(): void
+    {
+        $matcher = new ReferenciaRutaMatcher(new Collection([
+            $this->catalog('MEDICAMENTOS_CUM', [
+                $this->item('20195068-1', null, 'CUM', 'ENZALUTAMIDA 40 MG', null,
+                    ['ium' => '1E1033301000101', 'principio_activo' => 'ENZALUTAMIDA', 'cantidad' => 40, 'unidad_medida' => 'mg', 'forma_farmaceutica' => 'CAPSULA', 'muestra_medica' => 'No']),
+            ]),
+            $this->catalog('NOTA_MEDICAMENTOS', [
+                $this->item('20195068-1', 'PROSTATA', 'MEDICAMENTO_NT', 'ENZALUTAMIDA 40 MG', 46624, ['principio_activo' => 'ENZALUTAMIDA']),
+            ]),
+        ]), exigirIumAcreditado: true);
+
+        $match = $matcher->match(['codigo' => '1E1033301000101', 'tipoServicio' => 'medicamentos', 'cantidad' => 2,
+            'nombreServicio' => 'ENZALUTAMIDA', 'fechaAtencion' => '2026-08-18'], 'PROSTATA');
+
+        $this->assertSame('RESUELTO', $match['resolucionMedicamento']);
+        $this->assertSame('20195068-1', $match['cumResuelto']);
+        $this->assertSame(93248.0, $match['costoEstimadoReferencia']);
+    }
+
     public function test_matches_official_and_technical_references_and_estimates_cost(): void
     {
         $matcher = new ReferenciaRutaMatcher(new Collection([
@@ -394,6 +448,77 @@ class ReferenciaRutaMatcherTest extends TestCase
         $this->assertSame('SIN_CRUCE', $match['formaCruce']);
         $this->assertFalse($match['enNotaTecnica']);
         $this->assertSame(0.0, $match['costoEstimadoReferencia']);
+    }
+
+    public function test_prostate_note_cups_loaded_without_its_leading_zero_prices_the_rips_code(): void
+    {
+        $matcher = new ReferenciaRutaMatcher(new Collection([
+            $this->catalog('ANEXOS_2706', [
+                $this->item('053101', null, 'ANEXO_2', 'BLOQUEO DE NERVIO SIMPÁTICO ÚNICO'),
+            ]),
+            $this->catalog('NOTA_PROSTATA', [
+                $this->item('53101', 'PROSTATA', 'SERVICIO_TECNICO', 'BLOQUEO DE NERVIO SIMPATICO UNICO', 610000, ['servicio' => 'Procedimientos quirurgicos']),
+            ]),
+        ]));
+
+        $match = $matcher->match(['codigo' => '053101', 'tipoServicio' => 'procedimientos', 'cantidad' => 1, 'valorRips' => 0], 'PROSTATA');
+        $entradas = $matcher->entradasNotaTecnica('PROSTATA');
+
+        $this->assertTrue($match['encontradoEnNotaTecnica']);
+        $this->assertSame(610000.0, $match['tarifaReferencia']);
+        $this->assertSame('CON_TARIFA', $match['estadoTarifario']);
+        $this->assertSame(610000.0, $matcher->technicalTariff('PROSTATA', '053101'));
+        $this->assertCount(1, $entradas);
+        $this->assertSame('053101', $entradas[0]['codigo']);
+        $this->assertSame('53101', $entradas[0]['metadatos']['codigo_fuente']);
+    }
+
+    public function test_cervix_note_keeps_its_six_digit_cups_and_each_route_keeps_its_own_rate(): void
+    {
+        $matcher = new ReferenciaRutaMatcher(new Collection([
+            $this->catalog('ANEXOS_2706', [
+                $this->item('053101', null, 'ANEXO_2', 'BLOQUEO DE NERVIO SIMPATICO UNICO'),
+            ]),
+            $this->catalog('NOTA_CERVIX', [
+                $this->item('053101', 'CERVIX', 'SERVICIO_TECNICO', 'BLOQUEO DE NERVIO SIMPATICO UNICO', 620000),
+            ]),
+            $this->catalog('NOTA_PROSTATA', [
+                $this->item('53101', 'PROSTATA', 'SERVICIO_TECNICO', 'BLOQUEO DE NERVIO SIMPATICO UNICO', 610000),
+            ]),
+        ]));
+
+        $cervix = $matcher->entradasNotaTecnica('CERVIX');
+
+        $this->assertSame(620000.0, $matcher->technicalTariff('CERVIX', '053101'));
+        $this->assertSame(610000.0, $matcher->technicalTariff('PROSTATA', '053101'));
+        $this->assertCount(1, $cervix);
+        $this->assertSame('053101', $cervix[0]['codigo']);
+        $this->assertArrayNotHasKey('codigo_fuente', $cervix[0]['metadatos']);
+    }
+
+    public function test_five_digit_note_code_is_not_padded_when_the_official_procedure_differs_or_is_missing(): void
+    {
+        $distinto = new ReferenciaRutaMatcher(new Collection([
+            $this->catalog('ANEXOS_2706', [
+                $this->item('053101', null, 'ANEXO_2', 'BLOQUEO DE NERVIO SIMPATICO UNICO'),
+            ]),
+            $this->catalog('NOTA_PROSTATA', [
+                $this->item('53101', 'PROSTATA', 'SERVICIO_TECNICO', 'NEUROLISIS DE PLEJO HIPOGASTRICO', 3500000),
+            ]),
+        ]));
+        $sinOficial = new ReferenciaRutaMatcher(new Collection([
+            $this->catalog('NOTA_PROSTATA', [
+                $this->item('53101', 'PROSTATA', 'SERVICIO_TECNICO', 'BLOQUEO DE NERVIO SIMPATICO UNICO', 610000),
+            ]),
+        ]));
+
+        foreach ([$distinto, $sinOficial] as $matcher) {
+            $match = $matcher->match(['codigo' => '053101', 'tipoServicio' => 'procedimientos', 'cantidad' => 1, 'valorRips' => 0], 'PROSTATA');
+
+            $this->assertFalse($match['encontradoEnNotaTecnica']);
+            $this->assertNull($matcher->technicalTariff('PROSTATA', '053101'));
+            $this->assertSame('53101', $matcher->entradasNotaTecnica('PROSTATA')[0]['codigo']);
+        }
     }
 
     private function apalutamidaNote(): CatalogoReferencia

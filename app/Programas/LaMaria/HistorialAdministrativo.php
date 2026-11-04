@@ -8,6 +8,7 @@ use OpenSpout\Common\Entity\Cell;
 use OpenSpout\Common\Entity\Cell\FormulaCell;
 use OpenSpout\Common\Exception\OpenSpoutException;
 use OpenSpout\Reader\SheetInterface;
+use OpenSpout\Reader\XLSX\Options as ReaderOptions;
 use OpenSpout\Reader\XLSX\Reader;
 use ZipArchive;
 
@@ -25,6 +26,22 @@ use ZipArchive;
  */
 final class HistorialAdministrativo
 {
+    private bool $capturarFilasIndividuales = false;
+
+    /** @var list<array<string, mixed>> */
+    private array $filasIndividuales = [];
+
+    public function habilitarFilasIndividuales(): void
+    {
+        $this->capturarFilasIndividuales = true;
+    }
+
+    /** @return list<array<string, mixed>> */
+    public function filasIndividuales(): array
+    {
+        return $this->filasIndividuales;
+    }
+
     public const HOJA = 'inf admin';
 
     private const MESES_VENTANA = 3;
@@ -593,7 +610,9 @@ final class HistorialAdministrativo
     private function leerArchivo(string $ruta, string $nombre): void
     {
         $filasDeclaradas = self::filasDeclaradas($ruta);
-        $reader = new Reader;
+        $opciones = new ReaderOptions;
+        $opciones->SHOULD_PRESERVE_EMPTY_ROWS = $this->capturarFilasIndividuales;
+        $reader = new Reader($opciones);
         $reader->open($ruta);
         $elegida = null;
         $leida = null;
@@ -629,10 +648,17 @@ final class HistorialAdministrativo
             : ($diagnosticos['PROSTATA'] > $diagnosticos['CERVIX'] ? 'PROSTATA' : 'CERVIX');
         $meses = [];
 
-        foreach ($leida['filas'] as [$mes, $tipo, $codigo, $valor, $descripcion, $medicamento, $fecha, $paciente]) {
+        $huella = $this->capturarFilasIndividuales ? (string) hash_file('sha256', $ruta) : '';
+        foreach ($leida['filas'] as [$mes, $tipo, $codigo, $valor, $descripcion, $medicamento, $fecha, $paciente, $numeroFila]) {
             $this->registrarServicio($rutaPrograma, $mes, $tipo, $codigo, $valor, $fecha, $paciente, $medicamento);
             $this->registrar($rutaPrograma, $mes, $tipo, $codigo, $valor, $descripcion, $medicamento);
             $meses[$mes] = true;
+            if ($this->capturarFilasIndividuales) {
+                $this->filasIndividuales[] = ['ruta' => $rutaPrograma, 'mes' => $mes, 'tipo' => $tipo, 'codigo' => $codigo,
+                    'paciente' => $paciente, 'fecha' => $fecha, 'centavos' => (int) round($valor * 100),
+                    'comparable' => $paciente !== '' && $fecha !== '' && in_array($tipo, ['AC', 'AP', 'AT'], true), 'fuente' => $nombre.'!'.$elegida['nombre'].'!fila '.$numeroFila,
+                    'sha256' => $huella, 'valor_sin_redondeo' => $valor, 'descripcion' => $descripcion, 'medicamento' => $medicamento];
+            }
         }
 
         $advertencias = [];
@@ -648,7 +674,76 @@ final class HistorialAdministrativo
         ksort($meses);
         $this->fuentes[] = ['archivo' => $nombre, 'ruta' => $rutaPrograma === '' ? 'NO IDENTIFICADA' : $rutaPrograma,
             'filas' => count($leida['filas']), 'meses' => $meses === [] ? '' : array_key_first($meses).' a '.array_key_last($meses),
-            'hoja' => $elegida['nombre'] ?? '', 'advertencias' => $advertencias];
+            'hoja' => $elegida['nombre'] ?? '', 'advertencias' => $advertencias, ...($this->capturarFilasIndividuales ? ['sha256' => $huella] : [])];
+        if ($this->capturarFilasIndividuales && $rutaPrograma !== '' && $meses !== []) {
+            $this->leerReferenciaMedicamentos($ruta, $nombre, $rutaPrograma, array_keys($meses), $huella);
+        }
+    }
+
+    /** @param list<string> $meses */
+    private function leerReferenciaMedicamentos(string $ruta, string $nombre, string $programa, array $meses, string $huella): void
+    {
+        $antes = count($this->filasIndividuales);
+        $nombres = ['ENERO' => '01', 'FEBRERO' => '02', 'MARZO' => '03', 'ABRIL' => '04', 'MAYO' => '05', 'JUNIO' => '06',
+            'JULIO' => '07', 'AGOSTO' => '08', 'SEPTIEMBRE' => '09', 'OCTUBRE' => '10', 'NOVIEMBRE' => '11', 'DICIEMBRE' => '12'];
+        $options = new ReaderOptions;
+        $options->SHOULD_PRESERVE_EMPTY_ROWS = true;
+        $reader = new Reader($options);
+        $reader->open($ruta);
+        try {
+            foreach ($reader->getSheetIterator() as $hoja) {
+                if (self::normalizar($hoja->getName()) !== 'ESCENARIOS') {
+                    continue;
+                }
+                $columnasMes = [];
+                $capturada = false;
+                foreach ($hoja->getRowIterator() as $numeroFila => $fila) {
+                    if ($capturada) {
+                        continue;
+                    }
+                    $valores = self::valoresFila($fila->getCells());
+                    foreach ($valores as $columna => $valor) {
+                        $nombreMes = is_string($valor) ? self::normalizar($valor) : '';
+                        if (isset($nombres[$nombreMes])) {
+                            $columnasMes[$columna] = $nombres[$nombreMes];
+                        }
+                    }
+                    if (self::normalizar((string) ($valores[0] ?? '')) !== 'MEDICAMENTOS' || $columnasMes === []) {
+                        continue;
+                    }
+                    foreach ($columnasMes as $columna => $numeroMes) {
+                        $periodos = array_values(array_filter($meses, static fn (string $mes): bool => substr($mes, 5, 2) === $numeroMes));
+                        $valor = $valores[$columna] ?? null;
+                        if (count($periodos) !== 1 || ! is_numeric($valor) || (float) $valor <= 0) {
+                            continue;
+                        }
+                        $indice = $columna + 1;
+                        $letras = '';
+                        while ($indice > 0) {
+                            $indice--;
+                            $letras = chr(65 + $indice % 26).$letras;
+                            $indice = intdiv($indice, 26);
+                        }
+                        $this->filasIndividuales[] = ['ruta' => $programa, 'mes' => $periodos[0], 'tipo' => 'AM', 'codigo' => 'AGREGADO_ESCENARIO',
+                            'paciente' => '', 'fecha' => '', 'centavos' => (int) round((float) $valor * 100), 'comparable' => false,
+                            'fuente' => $nombre.'!ESCENARIOS!'.$letras.$numeroFila, 'sha256' => $huella, 'valor_sin_redondeo' => (float) $valor,
+                            'descripcion' => 'Referencia agregada de medicamentos; sin correspondencia individual', 'medicamento' => ''];
+                    }
+                    $capturada = true;
+                }
+            }
+        } finally {
+            unset($fila, $hoja);
+            $reader->close();
+        }
+        $adicionales = array_slice($this->filasIndividuales, $antes);
+        if ($adicionales !== []) {
+            $periodos = array_column($adicionales, 'mes');
+            sort($periodos);
+            $this->fuentes[] = ['archivo' => $nombre, 'ruta' => $programa, 'filas' => count($adicionales),
+                'meses' => $periodos[0].' a '.$periodos[array_key_last($periodos)], 'hoja' => 'ESCENARIOS',
+                'advertencias' => ['Referencia AM agregada sin identidad individual.'], 'sha256' => $huella];
+        }
     }
 
     /**
@@ -739,7 +834,7 @@ final class HistorialAdministrativo
         $leidas = 0;
         $resultado = ['filas' => [], 'diagnosticos' => ['PROSTATA' => 0, 'CERVIX' => 0], 'sinGrupo' => [], 'noVerificables' => 0];
 
-        foreach ($hoja->getRowIterator() as $fila) {
+        foreach ($hoja->getRowIterator() as $numeroFila => $fila) {
             $celdas = $fila->getCells();
             $valores = self::valoresFila($celdas);
 
@@ -784,7 +879,7 @@ final class HistorialAdministrativo
                 $columnas['descripcion'] === null ? '' : trim((string) ($valores[$columnas['descripcion']] ?? '')),
                 $columnas['medicamento'] === null ? '' : trim((string) ($valores[$columnas['medicamento']] ?? '')),
                 self::dia($valores[$columnas['fecha']] ?? null),
-                $columnas['documento'] === null ? '' : $this->clavePaciente((string) ($valores[$columnas['documento']] ?? ''))];
+                $columnas['documento'] === null ? '' : $this->clavePaciente((string) ($valores[$columnas['documento']] ?? '')), $numeroFila];
         }
 
         return $resultado;

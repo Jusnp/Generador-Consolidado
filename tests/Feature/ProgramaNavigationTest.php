@@ -78,10 +78,28 @@ class ProgramaNavigationTest extends TestCase
             ->assertSee(route('programas.show', 'la-maria'))
             ->assertDontSee('Amarilla')
             ->assertSee('Salud Mental')
-            ->assertSee('Coosalud')
             ->assertDontSee('Posalud')
-            ->assertSee('Nueva EPS')
             ->assertDontSee('Contratantes');
+    }
+
+    public function test_side_menu_lists_only_autoinmunes_la_maria_and_salud_mental(): void
+    {
+        $user = User::factory()->create();
+
+        $this->actingAs($user)
+            ->get(route('dashboard'))
+            ->assertOk()
+            ->assertSeeInOrder([
+                route('programas.show', 'autoinmunes'),
+                route('programas.show', 'la-maria'),
+                route('programas.show', 'salud-mental'),
+                'Pendiente de configuración',
+            ], false)
+            ->assertDontSee('">Inicio</a>', false)
+            ->assertDontSee('Coosalud')
+            ->assertDontSee('Nueva EPS')
+            ->assertDontSee(route('programas.show', 'coosalud'))
+            ->assertDontSee(route('programas.show', 'nueva-eps'));
     }
 
     public function test_nueva_eps_and_coosalud_are_pending_programas(): void

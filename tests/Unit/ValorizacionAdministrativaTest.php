@@ -3,6 +3,7 @@
 namespace Tests\Unit;
 
 use App\Programas\LaMaria\HistorialAdministrativo;
+use App\Programas\LaMaria\ReconstructorEpisodiosHospitalarios;
 use App\Programas\LaMaria\ValorizacionAdministrativa;
 use PHPUnit\Framework\TestCase;
 
@@ -32,7 +33,7 @@ class ValorizacionAdministrativaTest extends TestCase
             collect($valorizacion->filasCoberturaMedicamentos())->firstWhere(6, 'CUM-PEMBRO')[16]);
     }
 
-    public function test_session_with_its_own_medication_joins_the_scheme_series_of_another_integral_in_the_invoice(): void
+    public function test_session_does_not_inherit_scheme_from_another_date_in_the_invoice(): void
     {
         $valorizacion = $this->valorizacionCervix(static fn (string $cum): array => []);
         $caso = ['mesAtencion' => '2026-10', 'casoId' => 'C1', 'factura' => 'F1'];
@@ -49,13 +50,13 @@ class ValorizacionAdministrativaTest extends TestCase
 
         $tratamientos = collect($valorizacion->filasTratamientos())->keyBy(3);
 
-        // La sesión con carboplatino pertenece a la serie con pembrolizumab; el distintivo propio de la base (paclitaxel) la conserva.
-        $this->assertSame([32000000.0, 0.0], [$tratamientos['DISTINTIVO EN OTRA SESION INTEGRAL DEL MISMO CUPS Y FACTURA (PEMB): SERIE DEL ESQUEMA'][8],
-            $tratamientos['DISTINTIVO EN OTRA SESION INTEGRAL DEL MISMO CUPS Y FACTURA (PEMB): SERIE DEL ESQUEMA'][9]]);
+        // Otra sesión de la factura no demuestra el vínculo con el esquema de pembrolizumab.
+        $indeterminado = $tratamientos['PRECIO BASE PROVISIONAL; MEDICAMENTO DISTINTIVO EN OTRA FECHA DE LA FACTURA'];
+        $this->assertSame([2000000.0, 30000000.0], [$indeterminado[8], $indeterminado[9]]);
         $this->assertSame(32000000.0, $tratamientos['MEDICAMENTO DISTINTIVO EN LA FECHA DEL AP (PEMB)'][8]);
         $this->assertSame(2000000.0, $tratamientos['MEDICAMENTO DISTINTIVO EN LA FECHA DEL AP (PACL)'][8]);
-        $this->assertSame(66000000.0, $tratamientos->sum(8));
-        $this->assertSame(0.0, $tratamientos->sum(9));
+        $this->assertSame(36000000.0, $tratamientos->sum(8));
+        $this->assertSame(30000000.0, $tratamientos->sum(9));
         $this->assertSame(ValorizacionAdministrativa::COBERTURA_INCLUIDO_AP,
             collect($valorizacion->filasCoberturaMedicamentos())->firstWhere(6, 'CUM-PEMBRO')[16]);
     }
@@ -114,6 +115,40 @@ class ValorizacionAdministrativaTest extends TestCase
         $this->assertSame([3.0, 18045943.59], [$pendiente[6], $pendiente[7]]);
         $this->assertStringContainsString('3 bloques reconstruidos de 25 días', $pendiente[9]);
         $this->assertStringContainsString('1 cortes 08 son trazas clínicas', $pendiente[9]);
+    }
+
+    public function test_cut_continuation_joined_with_its_previous_month_does_not_open_a_new_block(): void
+    {
+        $valorizacion = $this->valorizacion();
+        $estancia = fn (string $mes, string $ingreso, string $egreso, string $destino): array => $this->detalle('hospitalizacion', '', 1.0,
+            ['mesAtencion' => $mes, 'fechaAtencion' => $ingreso, 'servicioJson' => ['fechaEgreso' => $egreso, 'condicionDestinoUsuarioEgreso' => $destino]]);
+        $continuidad = static fn (string $documento, string $inicio, string $fin, int $lote, int $estancia, string $motivo): array => [
+            'ruta' => 'PROSTATA', 'mes' => '2026-09', 'documento' => $documento, 'inicio' => $inicio, 'fin' => $fin,
+            'bloquesLote' => $lote, 'bloquesEstancia' => $estancia, 'ajuste' => $estancia - $lote, 'motivo' => $motivo,
+        ];
+
+        // Corte 08 en agosto y su continuación en septiembre (10 días en total); otra estancia inicia el 1 sin corte previo.
+        $valorizacion->registrar($estancia('2026-08', '2026-08-24 18:00', '2026-08-31 17:00', '08'), ['respaldado' => 0.0]);
+        $valorizacion->registrar($estancia('2026-09', '2026-09-01 00:00', '2026-09-03 15:00', '01'), ['respaldado' => 0.0]);
+        $valorizacion->registrar($estancia('2026-09', '2026-09-01 00:00', '2026-09-05 10:00', '01'), ['respaldado' => 0.0]);
+        $valorizacion->atribuirPaquetes([['2026-08', 1, 6015314.53], ['2026-09', 2, 12030629.06], ['TOTAL', 3, 18045943.59]], [
+            $continuidad('9001', '2026-08-24 18:00', '2026-09-03 15:00', 1, 0, ReconstructorEpisodiosHospitalarios::CONTINUACION_UNIDA),
+            $continuidad('9002', '2026-09-01 00:00', '2026-09-05 10:00', 1, 1, ReconstructorEpisodiosHospitalarios::INICIO_SIN_CORTE_PREVIO),
+        ]);
+
+        $agosto = collect($valorizacion->resumenServicios('2026-08')['filas'])->keyBy(0);
+        $septiembre = collect($valorizacion->resumenServicios('2026-09')['filas'])->keyBy(0);
+
+        $this->assertSame([6015314.53, 6015314.53], [$agosto['AH'][3], $agosto['AH'][4]]);
+        $this->assertSame([12030629.06, 6015314.53], [$septiembre['AH'][3], $septiembre['AH'][4]], 'El costo A conserva el paquete de cada mes; la estimación no repite el de la continuación.');
+        $estimacion = collect($valorizacion->filasPendientes())->first(static fn (array $fila): bool => $fila[0] === '2026-09' && $fila[2] === 'REGISTRO_INTERNACION_EGRESO');
+        $this->assertSame([1.0, 6015314.53], [$estimacion[6], $estimacion[7]]);
+        $this->assertStringContainsString('2 bloques reconstruidos de 25 días − 1 ya reconocidos en el mes anterior', $estimacion[9]);
+        $this->assertStringContainsString('1 estancias inician el día 1 a las 00:00 sin corte 08 previo unido', $estimacion[9]);
+        $trazas = collect($valorizacion->filasDetalle())->where(1, 'AH')->keyBy(2);
+        $this->assertStringContainsString('ingreso 2026-08-24 18:00 · tramo hasta 2026-09-03 15:00 · bloques del lote 1 · bloques de la estancia completa en el mes 0', $trazas['CONTINUACION_CORTE_08'][20]);
+        $this->assertStringNotContainsString('9001', $trazas['CONTINUACION_CORTE_08'][20], 'La traza usa la clave seudónima del paciente.');
+        $this->assertSame([0.0, 0.0], [$trazas['CONTINUACION_CORTE_08'][17], $trazas['INICIO_DIA_1_SIN_CORTE_PREVIO'][17]]);
     }
 
     public function test_integral_scheme_requires_a_shared_invoice_and_keeps_other_invoice_medication_conditional(): void
@@ -1069,13 +1104,12 @@ class ValorizacionAdministrativaTest extends TestCase
         $tratamientos = collect($valorizacion->filasTratamientos());
         $documentados = $tratamientos->filter(static fn (array $fila): bool => str_starts_with($fila[3], 'ESQUEMA DOCUMENTADO EN EL INFORME DEL MES'));
 
-        // D1 toma el esquema con pembrolizumab y D3 el base; D2 conserva la base provisional y su mezcla condicionada.
+        // D1 y D2 quedan condicionados: el medicamento de otra fecha no acredita la sesión; D3 conserva la base documentada.
         // La segunda sesión administrativa de D1 no crea una sesión RIPS.
         $this->assertSame(3, $tratamientos->sum(4));
-        $this->assertSame([36000000.0, 9000000.0], [$tratamientos->sum(8), $tratamientos->sum(9)]);
-        $this->assertSame([2000000.0, 32000000.0], $documentados->pluck(6)->sort()->values()->all());
-        $this->assertStringContainsString('RESPALDO RIPS: DISTINTIVO PEMB EN LA FACTURA', $documentados->firstWhere(6, 32000000.0)[3]);
-        $this->assertSame(ValorizacionAdministrativa::COBERTURA_INCLUIDO_AP,
+        $this->assertSame([6000000.0, 39000000.0], [$tratamientos->sum(8), $tratamientos->sum(9)]);
+        $this->assertSame([2000000.0], $documentados->pluck(6)->sort()->values()->all());
+        $this->assertSame(ValorizacionAdministrativa::COBERTURA_CONDICIONADO_AP,
             collect($valorizacion->filasCoberturaMedicamentos())->firstWhere(6, 'CUM-PEMBRO')[16]);
     }
 
@@ -1135,7 +1169,7 @@ class ValorizacionAdministrativaTest extends TestCase
         $this->assertSame([0, 33797.0], [$diferencia[7], $diferencia[18]]);
     }
 
-    public function test_documented_equivalence_prices_the_rips_code_with_its_equivalent_and_keeps_the_cups(): void
+    public function test_different_surgical_codes_are_not_priced_by_patient_and_date_coincidence(): void
     {
         $historial = new HistorialAdministrativo;
 
@@ -1157,10 +1191,10 @@ class ValorizacionAdministrativaTest extends TestCase
         $valorizacion->registrar($linfadenectomia('A', '2026-09-04'), ['respaldado' => 0.0]);
         $valorizacion->registrar($linfadenectomia('B', '2026-09-11'), ['respaldado' => 0.0]);
 
-        $fila = collect($valorizacion->filasDetalle())->firstWhere(6, 'EQUIVALENCIA DOCUMENTADA CON 405406');
+        $fila = collect($valorizacion->filasDetalle())->firstWhere(2, '405407');
 
-        $this->assertSame(['405407', 2, 7611230.0], [$fila[2], $fila[7], $fila[17]]);
-        $this->assertStringContainsString('Informe del mes: 2 de 2 líneas con fila 405406 del mismo paciente y fecha; ninguna fila 405407.', $fila[20]);
+        $this->assertSame(['405407', 2, 0.0], [$fila[2], $fila[7], $fila[17]]);
+        $this->assertSame('SIN TARIFA NI PRECIO HISTORICO', $fila[6]);
 
         // Si el informe del mes cobra el código propio, la equivalencia no se aplica.
         $historial->registrar('PROSTATA', '2026-09', 'AP', '405407', 5052320.0, '', '', '2026-09-20', 'C');
@@ -1287,7 +1321,7 @@ class ValorizacionAdministrativaTest extends TestCase
         $this->assertSame(600000.0, $resumen['urgencias']['atribuidoAdministrativo']);
     }
 
-    public function test_documented_equivalence_needs_its_start_date_and_enough_correspondence_and_works_without_the_month_report(): void
+    public function test_distinct_surgical_codes_remain_independent_with_or_without_the_month_report(): void
     {
         $historial = new HistorialAdministrativo;
 
@@ -1299,18 +1333,18 @@ class ValorizacionAdministrativaTest extends TestCase
             'casoId' => $documento, 'numDocumentoIdentificacion' => $documento, 'fechaAtencion' => $fecha.' 07:00']);
         $subtipo = static fn (ValorizacionAdministrativa $valorizacion): ?string => collect($valorizacion->filasDetalle())->firstWhere(2, '405407')[6] ?? null;
 
-        // Sin informe del mes: equivalencia autónoma desde abril; antes de la vigencia, precio propio.
+        // Sin informe del mes, un procedimiento de otra vía no aporta tarifa.
         $septiembre = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
         $septiembre->registrar($linfadenectomia('2026-09', 'A', '2026-09-04'), ['respaldado' => 0.0]);
         $marzo = new ValorizacionAdministrativa('PROSTATA', $historial, [], static fn (string $cum): array => []);
         $marzo->registrar($linfadenectomia('2026-03', 'A', '2026-03-04'), ['respaldado' => 0.0]);
         $fila = collect($septiembre->filasDetalle())->firstWhere(2, '405407');
 
-        $this->assertSame(['EQUIVALENCIA DOCUMENTADA CON 405406', 3805615.0], [$fila[6], $fila[17]]);
+        $this->assertSame(['SIN TARIFA NI PRECIO HISTORICO', 0.0], [$fila[6], $fila[17]]);
         $this->assertStringNotContainsString('Informe del mes', $fila[20]);
         $this->assertNotSame('EQUIVALENCIA DOCUMENTADA CON 405406', $subtipo($marzo));
 
-        // Cérvix tarifa 405407 en su propia nota: la equivalencia documentada es solo de Próstata, aunque 405406 tenga precio en Cérvix.
+        // Una referencia de 405406 en Cérvix tampoco crea equivalencia.
         foreach (['2026-06', '2026-07', '2026-08'] as $mes) {
             $historial->registrar('CERVIX', $mes, 'AP', '405406', 3805615.0, '', '', $mes.'-10', 'Z'.$mes);
         }

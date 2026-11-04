@@ -443,7 +443,7 @@
                         <h2 id="login-title">Iniciar sesión</h2>
                         <p>
                             @if ($authentikEnabled)
-                                Valida tu identidad con tu cuenta institucional.
+                                Valida tu identidad en Authentik con tu número de cédula.
                             @else
                                 Ingresa con tu correo y contraseña del sistema.
                             @endif

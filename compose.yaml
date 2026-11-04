@@ -1,0 +1,92 @@
+# Entorno principal de SIRUTA: Laravel + PostgreSQL en Docker, en http://localhost:8000.
+# No usa el .env ni la base MariaDB de Laragon, ni escribe en el proyecto.
+# Guía: DOCKER_POSTGRESQL.md
+name: json-excel
+
+services:
+  postgres:
+    image: postgres:16.10-bookworm
+    restart: unless-stopped
+    # La clave se lee de un secret: no queda en variables de entorno ni en `docker inspect`.
+    # Debe coincidir con DB_PASSWORD de .env.docker.
+    environment:
+      POSTGRES_DB: json_excel_dev
+      POSTGRES_USER: json_excel
+      POSTGRES_PASSWORD_FILE: /run/secrets/json_excel_db_password
+      TZ: UTC
+      PGTZ: UTC
+    secrets:
+      - json_excel_db_password
+    # Sin puerto publicado en Windows: Laravel se conecta por la red interna (postgres:5432).
+    volumes:
+      - json_excel_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks:
+      - json_excel
+
+  app:
+    build:
+      context: .
+      target: app
+    image: json-excel-app:dev
+    restart: unless-stopped
+    # Mismo usuario que los workers de PHP-FPM: `docker compose exec app …` no deja en storage archivos de root
+    # que luego www-data no puede escribir (laravel.log, Excel generados, vistas compiladas).
+    user: www-data
+    # Sin env_file ni variables DB_*: Laravel lee .env.docker como su .env. Así phpunit.xml
+    # puede forzar SQLite en memoria y las pruebas nunca tocan la base PostgreSQL.
+    volumes:
+      # Código en solo lectura: el contenedor ve los cambios pero no puede escribir en el proyecto.
+      - ./app:/var/www/html/app:ro
+      - ./config:/var/www/html/config:ro
+      - ./database:/var/www/html/database:ro
+      - ./public:/var/www/html/public:ro
+      - ./resources:/var/www/html/resources:ro
+      - ./routes:/var/www/html/routes:ro
+      - ./tests:/var/www/html/tests:ro
+      - type: bind
+        source: ./.env.docker
+        target: /var/www/html/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      # storage propio (logs, sesiones, Excel generados): no comparte storage/ con Laragon.
+      - json_excel_storage:/var/www/html/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - json_excel
+
+  web:
+    image: nginx:1.27.5-alpine
+    restart: unless-stopped
+    # Dirección habitual de SIRUTA; el retorno de Authentik apunta a http://localhost:8000/auth/authentik/callback.
+    ports:
+      - "127.0.0.1:8000:80"
+    volumes:
+      - ./public:/var/www/html/public:ro
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+    networks:
+      - json_excel
+
+secrets:
+  json_excel_db_password:
+    file: ./docker/secrets/postgres_password.txt
+
+networks:
+  json_excel:
+    name: json_excel_net
+
+volumes:
+  json_excel_pgdata:
+    name: json_excel_pgdata
+  json_excel_storage:
+    name: json_excel_storage

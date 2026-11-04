@@ -8,6 +8,7 @@ use App\Models\CodigoMedicamento;
 use App\Models\CodigoMedicamentoNt;
 use App\Models\MedicationAdjustment;
 use App\Models\MedicationServiceClassification;
+use App\Programas\Autoinmunes\HomologacionRegistroCum;
 use App\Services\ActivityLogger;
 use App\Services\RipsJsonNormalizer;
 use Illuminate\Http\Request;
@@ -26,6 +27,27 @@ use OpenSpout\Writer\XLSX\Writer;
 
 class JsonExcelController extends Controller
 {
+    /**
+     * Pares del catálogo activo cuya identidad o presentación contradice el
+     * registro CUM oficial o no puede verificarse en él. La clave es el CUM RIPS
+     * y el valor el homólogo actualmente publicado; otros homólogos no quedan
+     * afectados.
+     *
+     * @var array<string, array{homologo: string, motivo: string}>
+     */
+    private const HOMOLOGACIONES_NO_ACREDITADAS = [
+        '20062328-1' => ['homologo' => '20100066-3', 'motivo' => 'TOCILIZUMAB FRENTE A TERIPARATIDA'],
+        '20066631-1' => ['homologo' => '20048122-1', 'motivo' => 'BELIMUMAB 400 MG FRENTE A 120 MG'],
+        '19943979-1' => ['homologo' => '19963298-2', 'motivo' => 'LEVOTIROXINA FRENTE A LEFLUNOMIDA'],
+        '20087738-7' => ['homologo' => '20143172-1', 'motivo' => 'ACETAMINOFEN/HIDROCODONA FRENTE A ACIDO MICOFENOLICO'],
+        '20061025-10' => ['homologo' => '19999002-2', 'motivo' => 'COMPOSICION Y CONCENTRACION DISTINTAS'],
+        '216049-3' => ['homologo' => '20143172-1', 'motivo' => 'HOMOLOGO 20143172-1 SIN REGISTRO CUM VERIFICABLE'],
+        '20023910-3' => ['homologo' => '20143172-1', 'motivo' => 'HOMOLOGO 20143172-1 SIN REGISTRO CUM VERIFICABLE'],
+        '230658-1' => ['homologo' => '19963298-2', 'motivo' => 'TABLETA FRENTE A CAPSULA BLANDA'],
+        '20155046-2' => ['homologo' => '20001633-2', 'motivo' => 'TUBO 60 G FRENTE A 50 G'],
+        '20155046-5' => ['homologo' => '20001633-2', 'motivo' => 'TUBO 30 G FRENTE A 50 G'],
+    ];
+
     /*
      * La estructura de salida se conserva sin cambios:
      * SUBSIDIADA, CONTRIBUTIVO, AC-AP, AM, OTROS, RESUMEN.
@@ -62,7 +84,7 @@ class JsonExcelController extends Controller
 
     private array $amHeaders = [
         'Fecha cargue RIPS', 'Regimen', 'Servicio', 'Documento', 'fecha Inicio Atencion',
-        'Codigo', 'Descripcion', 'Cantidad', 'Servicio.1', 'LLAVE SOLO MES AÑO',
+        'Codigo', 'Descripcion', 'Cantidad', 'Servicio.1', 'LLAVE DÍA MES AÑO',
         'DUPLICADOS MES AÑO', 'NT', 'CUMS HOMOLOGO', 'Tarifa UNITARIO',
         'VALOR TOTAL DIVIDO TODO - llave solo mes año', 'TIPO MEDICAMENTO RIPS',
         'VR DISPENSACION RIPS', 'REGLA LIQUIDACION', 'VALIDACION LIQUIDACION',
@@ -93,6 +115,9 @@ class JsonExcelController extends Controller
 
     private array $ripsPointers = [];
 
+    /** Homologación por registro CUM oficial para medicamentos sin tarifa (se crea con el catálogo NT de la carga). */
+    private ?HomologacionRegistroCum $homologacionRegistroCum = null;
+
     public function __construct(private RipsJsonNormalizer $ripsJsonNormalizer) {}
 
     public function index()
@@ -107,7 +132,7 @@ class JsonExcelController extends Controller
             'subsidiado_files.*' => ['required', 'file', 'mimes:json,txt', 'max:512000'],
             'contributivo_files' => ['required', 'array', 'min:1', 'max:25'],
             'contributivo_files.*' => ['required', 'file', 'mimes:json,txt', 'max:512000'],
-            'valor_administrativo' => ['required', 'numeric', 'min:0'],
+            'valor_administrativo' => ['nullable', 'numeric', 'min:0'],
         ]);
 
         $batchId = (string) Str::uuid();
@@ -177,6 +202,7 @@ class JsonExcelController extends Controller
         $catalogoMedicamentosNt = $this->loadMedicamentosNtCatalog();
         $catalogoMedicamentosMap = $this->loadMedicamentosMappingCatalog();
         $catalogoInsumosNt = $this->loadInsumosNtCatalog();
+        $this->homologacionRegistroCum = new HomologacionRegistroCum($catalogoMedicamentosNt);
         $this->medicationAdjustments = $this->loadMedicationAdjustments();
         $this->medicationServiceClassifications = $this->loadMedicationServiceClassifications();
 
@@ -386,7 +412,7 @@ class JsonExcelController extends Controller
             $this->writeResumen(
                 $writer,
                 $resumenMensual,
-                (float) $request->valor_administrativo
+                $request->filled('valor_administrativo') ? (float) $request->valor_administrativo : null
             );
 
             $writerClosed = true;
@@ -400,7 +426,7 @@ class JsonExcelController extends Controller
                     'subsidiado_files' => $subsidiadoOriginalNames,
                     'contributivo_files' => $contributivoOriginalNames,
                     'excel_file' => $fileName,
-                    'valor_administrativo' => (float) $request->valor_administrativo,
+                    'valor_administrativo' => $request->filled('valor_administrativo') ? (float) $request->valor_administrativo : null,
                 ]
             );
         } catch (\Throwable $exception) {
@@ -1070,6 +1096,16 @@ class JsonExcelController extends Controller
                     );
                 }
 
+                $homologacionNoAcreditada = self::HOMOLOGACIONES_NO_ACREDITADAS[$codigoNormalizado] ?? null;
+                if ($homologacionNoAcreditada !== null
+                    && $cumsHomologo !== $homologacionNoAcreditada['homologo']) {
+                    $homologacionNoAcreditada = null;
+                }
+
+                if ($homologacionNoAcreditada !== null) {
+                    $cumsHomologo = $codigoNormalizado;
+                }
+
                 /*
                  * Fuente tarifaria principal: CUMS homologado exacto
                  * en codigo_medicamentos_nt.
@@ -1104,6 +1140,7 @@ class JsonExcelController extends Controller
                 if (
                     $estado === 'NO ENCONTRADO'
                     && $mapping !== null
+                    && $homologacionNoAcreditada === null
                     && $this->isNtYes($nt)
                 ) {
                     $tarifaHistorica = $this->numberValue(
@@ -1138,6 +1175,35 @@ class JsonExcelController extends Controller
                     if ($this->isNtYes($nt) && $tarifa > 0) {
                         $estado = 'ENCONTRADO CUMS EXACTO';
                     }
+                }
+
+                /*
+                 * Homologación técnica por registro CUM oficial: mismos
+                 * principios activos, concentración y forma sólida oral, con
+                 * una única tarifa NT. Es solo referencia: el precio queda
+                 * condicionado y no se suma. No aplica si el catálogo deja el
+                 * código fuera de la NT o si el CUM exacto ya figura en ella.
+                 */
+                $homologoRegistro = null;
+                $valorReferencia = 0;
+
+                if ($estado === 'NO ENCONTRADO'
+                    && ! isset($catalogoMedicamentosNt[$codigoNormalizado])
+                    && ($mapping === null || $this->isNtYes($mapping['nt'] ?? ''))) {
+                    $homologoRegistro = $this->homologacionRegistroCum?->homologo($codigoNormalizado);
+                }
+
+                if ($homologoRegistro !== null) {
+                    $cumsHomologo = $homologoRegistro['cums'];
+                    $nt = $this->stringValue($catalogoMedicamentosNt[$cumsHomologo]['nt'] ?? '');
+                    $tarifa = $homologoRegistro['tarifa'];
+                    $estado = 'ENCONTRADO REGISTRO CUM';
+                }
+
+                if ($homologacionNoAcreditada !== null && $estado === 'NO ENCONTRADO') {
+                    $nt = '';
+                    $tarifa = 0;
+                    $estado = 'HOMOLOGACION PENDIENTE';
                 }
 
                 $cantidadNumerica = $this->numberValue($cantidad);
@@ -1191,12 +1257,19 @@ class JsonExcelController extends Controller
                         $reglaLiquidacion = 'CATALOGO: DIVIDIR POR DUPLICADOS';
                     }
 
-                    $this->addResumenValue(
-                        $resumenMensual,
-                        'Medicamentos',
-                        $fecha,
-                        $valorTotal
-                    );
+                    // La nota técnica tarifa por CUM y no define equivalencias: el homólogo técnico solo da un valor de referencia.
+                    if ($homologoRegistro !== null && $reglaLiquidacion !== 'AJUSTE APROBADO') {
+                        $valorReferencia = $valorTotal;
+                        $valorTotal = 0;
+                        $reglaLiquidacion = 'PRECIO CONDICIONADO';
+                    } else {
+                        $this->addResumenValue(
+                            $resumenMensual,
+                            'Medicamentos',
+                            $fecha,
+                            $valorTotal
+                        );
+                    }
                 }
 
                 /*
@@ -1214,6 +1287,26 @@ class JsonExcelController extends Controller
                     $validacionLiquidacion = 'SIN TARIFA NT';
                 }
 
+                if ($homologacionNoAcreditada !== null) {
+                    $validacionLiquidacion = $estado === 'HOMOLOGACION PENDIENTE'
+                        ? 'REVISAR HOMOLOGACION: '.$homologacionNoAcreditada['motivo']
+                        : 'CUM RIPS EXACTO; HOMOLOGO DESCARTADO: '.$homologacionNoAcreditada['motivo'];
+                }
+
+                if ($homologoRegistro !== null) {
+                    $validacionLiquidacion = ($reglaLiquidacion === 'PRECIO CONDICIONADO'
+                        ? 'PRECIO CONDICIONADO SIN RESPALDO EN LA NOTA TECNICA: VALOR DE REFERENCIA '.number_format($valorReferencia, 2, '.', '').'; '
+                        : '')
+                        .'HOMOLOGACION TECNICA REGISTRO CUM: '.$homologoRegistro['clave']
+                        .($homologacionNoAcreditada !== null ? '; HOMOLOGO ANTERIOR DESCARTADO: '.$homologacionNoAcreditada['motivo'] : '');
+                }
+
+                // La advertencia de duplicados sin clasificación se conserva cuando el valor liquidado depende de ella.
+                if ($duplicados > 1 && $clasificacionServicio === '' && $reglaLiquidacion !== 'SIN TARIFA NT'
+                    && $validacionLiquidacion !== 'REQUIERE FUENTE DE CLASIFICACION') {
+                    $validacionLiquidacion = 'REQUIERE FUENTE DE CLASIFICACION; '.$validacionLiquidacion;
+                }
+
                 $row = [
                     'Fecha cargue RIPS' => now()->format('d/m/Y'),
                     'Regimen' => $regimen,
@@ -1224,8 +1317,8 @@ class JsonExcelController extends Controller
                     'Descripcion' => $descripcion,
                     'Cantidad' => $cantidadNumerica,
                     'Servicio.1' => 'Medicamento',
-                    'LLAVE SOLO MES AÑO' => $documento.'-'.$codigo.'-'.
-                        $this->extractMonth($fecha),
+                    'LLAVE DÍA MES AÑO' => $documento.'-'.$codigo.'-'.
+                        $this->formatMedicationDay($fecha),
                     'DUPLICADOS MES AÑO' => $duplicados,
                     'NT' => $nt,
                     'CUMS HOMOLOGO' => $cumsHomologo,
@@ -1265,16 +1358,28 @@ class JsonExcelController extends Controller
                 $estado = 'NO ENCONTRADO';
                 $categoria = null;
 
-                if (
-                    $cups !== null
-                    &&
-                    $this->isTransportType($cups['tipo_servicio'])
-                ) {
+                $esTransporteCups = $cups !== null && ($this->isTransportType($cups['tipo_servicio'])
+                    || $this->isTransportType($cups['descripcion']));
+
+                // Un código tipificado como transporte nunca se liquida como insumo, aunque el CUPS no tenga tarifa.
+                if ($esTransporteCups && $cups['tarifa'] > 0) {
                     $tipoCatalogo = 'Transporte';
                     $descripcionCatalogo = $cups['descripcion'];
                     $tarifa = $cups['tarifa'];
                     $estado = 'ENCONTRADO TRANSPORTE CUPS';
                     $categoria = 'Transporte';
+                } elseif ($insumo !== null && ($esTransporteCups || $this->isTransportType($insumo['descripcion']))
+                    && $this->isNtYes($insumo['nt']) && $insumo['tarifa'] > 0) {
+                    $tipoCatalogo = 'Transporte';
+                    $descripcionCatalogo = $insumo['descripcion'];
+                    $nt = $insumo['nt'];
+                    $tarifa = $insumo['tarifa'];
+                    $estado = 'ENCONTRADO TRANSPORTE INSUMOS NT';
+                    $categoria = 'Transporte';
+                } elseif ($esTransporteCups) {
+                    $tipoCatalogo = 'Transporte';
+                    $descripcionCatalogo = $cups['descripcion'];
+                    $estado = 'TRANSPORTE SIN TARIFA';
                 } elseif ($insumo !== null) {
                     $tipoCatalogo = 'Insumos';
                     $descripcionCatalogo = $insumo['descripcion'];
@@ -1287,39 +1392,15 @@ class JsonExcelController extends Controller
                     }
                 }
 
-                $cantidadNumerica = max(
-                    1,
-                    $this->numberValue($cantidad)
-                );
+                $cantidadNumerica = $tipoCatalogo === 'Transporte'
+                    ? max(0, $this->numberValue($cantidad))
+                    : max(1, $this->numberValue($cantidad));
 
-                /*
-                 * Ajuste final Transporte:
-                 * Los servicios de transporte se liquidan por tarifa del
-                 * evento CUPS y no por multiplicación de cantidadOS.
-                 * Los demás OTROS conservan cantidad x tarifa.
-                 */
-                if ($categoria === 'Transporte') {
-                    /*
-                     * Regla puntual Transporte T34004:
-                     * La guía de validación maneja esta tarifa unitaria
-                     * específica para transporte.
-                     *
-                     * No afecta AM, AC-AP ni otros códigos.
-                     */
-                    if ($codigoNormalizado === 'T34004') {
-                        $valorTotal = $cantidadNumerica * 135000;
-                    } else {
-                        $valorTotal = $this->numberValue(
-                            $servicio['vrServicio'] ?? 0
-                        );
-
-                        if ($valorTotal <= 0) {
-                            $valorTotal = $tarifa;
-                        }
-                    }
-                } else {
-                    $valorTotal = $cantidadNumerica * $tarifa;
+                if ($tipoCatalogo === 'Transporte' && $cantidadNumerica <= 0) {
+                    $estado = 'TRANSPORTE SIN UNIDAD RIPS';
                 }
+
+                $valorTotal = $cantidadNumerica * $tarifa;
 
                 if ($categoria !== null && $valorTotal > 0) {
                     $this->addResumenValue(
@@ -1328,33 +1409,6 @@ class JsonExcelController extends Controller
                         $fecha,
                         $valorTotal
                     );
-                }
-
-                /*
-                 * Ajuste final OTROS / T34004:
-                 * Cuando el código también existe en el catálogo INSUMOS NT,
-                 * se recupera su valor como Insumo NT sin alterar Transporte.
-                 *
-                 * Esto evita perder el valor que estaba desplazado entre
-                 * Transporte e Insumos en la comparación con la guía.
-                 */
-                if (
-                    $codigoNormalizado === 'T34004'
-                    &&
-                    $insumo !== null
-                    &&
-                    $this->isNtYes($insumo['nt'])
-                ) {
-                    $valorInsumoNt = $cantidadNumerica * (float) $insumo['tarifa'];
-
-                    if ($valorInsumoNt > 0) {
-                        $this->addResumenValue(
-                            $resumenMensual,
-                            'Insumos',
-                            $fecha,
-                            $valorInsumoNt
-                        );
-                    }
                 }
 
                 $row = [
@@ -1569,8 +1623,11 @@ class JsonExcelController extends Controller
     private function writeResumen(
         Writer $writer,
         array $resumenMensual,
-        float $costoMes
+        ?float $costoMes
     ): void {
+        // Sin COSTO MES positivo no hay referencia: se declara en lugar de mostrar 0 % de ejecución.
+        $conReferencia = $costoMes !== null && $costoMes > 0;
+
         $months = [];
 
         foreach ($resumenMensual as $servicios) {
@@ -1625,7 +1682,7 @@ class JsonExcelController extends Controller
             $cells = [];
 
             $cells[] = Cell::fromValue(
-                $index === 0 ? $costoMes : '',
+                $index === 0 ? ($conReferencia ? $costoMes : 'SIN REFERENCIA') : '',
                 $this->moneyStyle
             );
 
@@ -1683,9 +1740,9 @@ class JsonExcelController extends Controller
                     $resumenMensual[$service][$month] ?? 0;
             }
 
-            $porcentaje = $costoMes > 0
+            $porcentaje = $conReferencia
                 ? $valorMes / $costoMes
-                : 0;
+                : 'SIN REFERENCIA';
 
             $cells[] = Cell::fromValue(
                 $porcentaje,
@@ -1897,6 +1954,16 @@ class JsonExcelController extends Controller
         return $timestamp === false
             ? $date
             : date('j/n/Y', $timestamp);
+    }
+
+    private function formatMedicationDay(string $date): string
+    {
+        if (preg_match('/^(\d{4})-(\d{2})-(\d{2})(?:[ T].*)?$/', $date, $matches) !== 1
+            || ! checkdate((int) $matches[2], (int) $matches[3], (int) $matches[1])) {
+            return 'SIN FECHA VÁLIDA';
+        }
+
+        return $matches[3].'/'.$matches[2].'/'.$matches[1];
     }
 
     private function extractDateOnly(string $date): string

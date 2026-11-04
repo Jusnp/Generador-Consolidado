@@ -105,10 +105,8 @@
             <button type="button" id="siruta-menu-close" aria-label="Cerrar menú">✕</button>
         </header>
         <nav aria-label="Navegación principal">
-            <a href="{{ route('dashboard') }}">Inicio</a>
-
             <h2>Programas</h2>
-            @foreach (app(\App\Programas\ProgramaRegistry::class)->all() as $slug => $definition)
+            @foreach (collect(app(\App\Programas\ProgramaRegistry::class)->all())->only(['autoinmunes', 'la-maria', 'salud-mental']) as $slug => $definition)
                 @php
                     $isCurrent = request()->route('programa') === $slug
                         || ($definition['hub'] && request()->routeIs('la-maria', 'la-maria.*'))

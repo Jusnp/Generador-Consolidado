@@ -3,10 +3,15 @@
 namespace Tests\Feature;
 
 use App\Http\Controllers\SeguimientoRutaController;
+use App\Models\ActivityLog;
 use App\Models\CatalogoReferencia;
 use App\Models\CatalogoReferenciaItem;
 use App\Models\User;
+use App\Programas\LaMaria\CierreHospitalarioPeriodo;
+use App\Programas\LaMaria\EstadoAntecedenteHospitalario;
+use App\Programas\LaMaria\EstadoEstanciaHospitalaria;
 use App\Programas\LaMaria\ExplicacionBrecha;
+use App\Programas\LaMaria\HistorialHospitalario;
 use App\Programas\LaMaria\HistoricoTarifarioConsolidado;
 use App\Programas\LaMaria\LaMariaPrograma;
 use App\Programas\LaMaria\PoliticaPaqueteHospitalario;
@@ -18,6 +23,7 @@ use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Str;
+use Illuminate\Testing\PendingCommand;
 use OpenSpout\Common\Entity\Row as OpenSpoutRow;
 use OpenSpout\Writer\XLSX\Writer as XlsxWriter;
 use PhpOffice\PhpSpreadsheet\Cell\Cell;
@@ -161,7 +167,7 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->assertSame('consultas', $detail['tipoServicio']);
         $this->assertSame('890201', (string) $detail['codigo (codConsulta / codProcedimiento / codTecnologiaSalud)']);
         $this->assertSame('2026-06-10', $detail['fecha (fechaInicioAtencion / fechaDispensAdmon / fechaSuministroTecnologia)']);
-        $this->assertSame('050010608601', (string) $detail['codPrestador']);
+        $this->assertSame('9000000102', (string) $detail['codPrestador']);
         $this->assertSame('C61X', $detail['codDiagnosticoPrincipal']);
         $this->assertSame('Z001', $detail['codDiagnosticoRelacionado1']);
         $this->assertSame('7', (string) $detail['consecutivo (usuario)']);
@@ -232,7 +238,7 @@ class SeguimientoRutaControllerTest extends TestCase
         ]);
 
         $this->assertSame(
-            ['SEGUIMIENTO MENSUAL', 'SEGUIMIENTO PACIENTE MES', 'DETALLE RIPS', 'CASOS A REVISAR', 'NO ENCONTRADOS NOTA TECNICA', 'REPETICIONES Y DUPLICADOS', 'REFERENCIA TECNICA', 'CATALOGOS APLICADOS', 'CONTROL DE CARGUE'],
+            ['SEGUIMIENTO MENSUAL', 'SEGUIMIENTO PACIENTE MES', 'DETALLE RIPS', 'CASOS A REVISAR', 'NO ENCONTRADOS NOTA TECNICA', 'REPETICIONES Y DUPLICADOS', 'REFERENCIA TECNICA', 'PUENTE ECONOMICO', 'CATALOGOS APLICADOS', 'CONTROL DE CARGUE', 'CONCILIACION ADMIN', 'DETALLE POR CODIGO', 'QUIMIOTERAPIA', 'PENDIENTES ADMIN', 'FUENTES Y CONTROL'],
             $workbook->getSheetNames()
         );
         $this->assertSame(
@@ -272,7 +278,7 @@ class SeguimientoRutaControllerTest extends TestCase
         ]);
 
         $sheet = $workbook->getSheetByName('SEGUIMIENTO MENSUAL');
-        $this->assertSame('CONTROL DE CARGUE', $workbook->getSheetNames()[array_key_last($workbook->getSheetNames())]);
+        $this->assertSame(['CONTROL DE CARGUE', 'CONCILIACION ADMIN', 'DETALLE POR CODIGO', 'QUIMIOTERAPIA', 'PENDIENTES ADMIN', 'FUENTES Y CONTROL'], array_slice($workbook->getSheetNames(), -6));
         $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS', 'VALOR TOTAL MES'], $this->headers($sheet));
         $this->assertSame([
             ['MES' => '2026-06', 'PACIENTES' => 1, 'SERVICIOS' => 1, 'VALOR TOTAL MES' => 5000],
@@ -583,7 +589,7 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->assertStringContainsString('PRESENTACION DEL MEDICAMENTO NO DETERMINADA - NO SUMA', $review[0]['MOTIVO']);
         $this->assertStringContainsString('APALUTAMIDA 60 MG', $review[0]['MOTIVO']);
         $this->assertSame(['19979158-2'], $notFound->keys()->all());
-        $this->assertSame('', (string) $notFound['19979158-2']['OBSERVACION']);
+        $this->assertStringContainsString('ESTADO TARIFARIO:', (string) $notFound['19979158-2']['OBSERVACION']);
         $this->assertSame('', (string) $detail['1A1027731000100']['NOMBRE NOTA TECNICA']);
         $this->assertSame('', (string) $detail['1A1027731000100']['TARIFA']);
         $this->assertSame('', (string) $detail['1A1027731000100']['COSTO']);
@@ -603,7 +609,7 @@ class SeguimientoRutaControllerTest extends TestCase
                     'medicamentos' => [$this->medicamento('19979158-2', 'SODIO CLORURO', 2, 2)],
                     'otrosServicios' => [$this->otroServicio('DM00114', 'C61X', '2026-07-10 09:00', 3)],
                     'urgencias' => [[
-                        'codPrestador' => '050010608601',
+                        'codPrestador' => '9000000102',
                         'fechaInicioAtencion' => '2026-07-09 20:00',
                         'codDiagnosticoPrincipal' => 'C61X',
                         'condicionDestinoUsuarioEgreso' => '01',
@@ -621,7 +627,7 @@ class SeguimientoRutaControllerTest extends TestCase
 
         $this->assertSame(['19979158-2', 'DM00114'], $notFound->keys()->all());
         $this->assertSame('TARIFA APLICADA POR DISPENSACION ADMINISTRATIVA', $notFound['19979158-2']['OBSERVACION']);
-        $this->assertSame('', (string) $notFound['DM00114']['OBSERVACION']);
+        $this->assertStringContainsString('ESTADO TARIFARIO:', (string) $notFound['DM00114']['OBSERVACION']);
         $this->assertSame('medicamentos', $notFound['19979158-2']['tipoServicio']);
         $this->assertSame(2000.0, (float) $detail['medicamentos']['COSTO']);
         $this->assertSame('01', (string) $detail['urgencias']['condicionDestinoUsuarioEgreso']);
@@ -1002,7 +1008,7 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->createReferenceCatalogs();
         $consulta = $this->consulta('890201', 'C61X', '2026-07-10 08:00');
         $consulta['tipoDocumentoIdentificacion'] = 'CC';
-        $consulta['numDocumentoIdentificacion'] = '1017273218';
+        $consulta['numDocumentoIdentificacion'] = '9000000001';
 
         $workbook = $this->exportWorkbook($user, 'prostata', [
             'profesional.json' => $this->rips('FAC-PRO', [
@@ -1178,6 +1184,550 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->assertTrue($review->has('602001'));
         $this->assertStringContainsString('INDEPENDENCIA ECONOMICA SIN ACREDITAR', $review['602001']['MOTIVO']);
         $this->assertStringContainsString('NO SUMA AL ADMINISTRATIVO', $review['602001']['MOTIVO']);
+    }
+
+    /**
+     * R-B (desactivada por defecto): la cirugía acreditada del episodio dentro de una estancia de menos de
+     * 24 horas pasa del condicionado a la estimación central como excepción cobrable por fuera. El total
+     * combinado y el costo A no cambian. Próstata y Cérvix aplican la misma regla.
+     */
+    #[DataProvider('rutasConCirugiaEnEstanciaCorta')]
+    public function test_rb_moves_an_accredited_short_stay_surgery_from_conditioned_to_central_only_when_enabled(string $ejecucion, string $codigo, float $tarifa, string $diagnostico, string $sexo): void
+    {
+        $user = User::factory()->create();
+        $this->createSurgicalNote($ejecucion, $codigo, $tarifa);
+        $files = ['corta.json' => $this->ripsQuirurgico($this->estanciaQuirurgica($codigo, $diagnostico), $diagnostico, $sexo)];
+
+        $apagada = $this->rbEconomia($user, $ejecucion, $files, [[$codigo, 'AP', $tarifa]], $diagnostico, false);
+        $encendida = $this->rbEconomia($user, $ejecucion, $files, [[$codigo, 'AP', $tarifa]], $diagnostico, true);
+
+        $this->assertSame(['central' => 0.0, 'condicionado' => $tarifa, 'combinado' => $tarifa, 'costoA' => 0.0, 'cirugiaPendiente' => true], $apagada);
+        $this->assertSame(['central' => $tarifa, 'condicionado' => 0.0, 'combinado' => $tarifa, 'costoA' => 0.0, 'cirugiaPendiente' => false], $encendida);
+    }
+
+    /**
+     * @return array<string, array{0: string, 1: string, 2: float, 3: string, 4: string}>
+     */
+    public static function rutasConCirugiaEnEstanciaCorta(): array
+    {
+        return [
+            'próstata' => ['prostata', '602001', 7233560.0, 'C61X', 'M'],
+            'cérvix' => ['cervix', '574201', 4733560.0, 'C53X', 'F'],
+        ];
+    }
+
+    /**
+     * R-B solo cambia la cirugía dentro del tramo de una estancia de menos de 24 horas: antes del ingreso
+     * a piso ya es una prestación aparte y dentro de una estancia de 24 horas o más ya es la excepción
+     * cobrable por fuera del paquete.
+     */
+    public function test_rb_does_not_change_surgeries_before_the_stay_or_inside_a_stay_of_24_hours_or_more(): void
+    {
+        $user = User::factory()->create();
+        $this->createSurgicalNote('prostata', '602001', 7233560.0);
+        $antes = $this->estanciaQuirurgica();
+        $antes['procedimientos'][0]['fechaInicioAtencion'] = '2026-09-10 12:00';
+        $larga = $this->estanciaQuirurgica();
+        $larga['hospitalizacion'][0]['fechaInicioAtencion'] = '2026-09-10 08:00';
+        $larga['hospitalizacion'][0]['fechaEgreso'] = '2026-09-12 08:00';
+
+        foreach (['antes del ingreso AH' => $antes, 'estancia de 48 horas' => $larga] as $caso => $servicios) {
+            $files = ['estancia.json' => $this->ripsQuirurgico($servicios)];
+            $apagada = $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', false);
+
+            $this->assertSame($apagada, $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', true), $caso);
+            $this->assertFalse($apagada['cirugiaPendiente'], $caso);
+        }
+    }
+
+    /**
+     * Una estancia que inicia el día 1 a las 00:00 es la continuación de un corte 08: su cirugía se acredita
+     * cuando el mes anterior está en el lote y se une a ese corte; sin antecedente sigue condicionada.
+     */
+    public function test_rb_accepts_a_day_one_continuation_only_with_its_previous_month_cut(): void
+    {
+        $user = User::factory()->create();
+        $this->createSurgicalNote('prostata', '602001', 7233560.0);
+        $agosto = $this->ripsQuirurgico(['hospitalizacion' => [[...$this->estanciaQuirurgica()['hospitalizacion'][0],
+            'fechaInicioAtencion' => '2026-08-30 10:00', 'fechaEgreso' => '2026-08-31 23:59', 'condicionDestinoUsuarioEgreso' => '08']]], factura: 'FAC-AGO');
+        $continuacion = $this->estanciaQuirurgica();
+        $continuacion['hospitalizacion'][0]['fechaInicioAtencion'] = '2026-09-01 00:00';
+        $continuacion['hospitalizacion'][0]['fechaEgreso'] = '2026-09-01 16:00';
+        $continuacion['procedimientos'][0]['fechaInicioAtencion'] = '2026-09-01 10:00';
+        $septiembre = $this->ripsQuirurgico($continuacion);
+        $historial = [['602001', 'AP', 7233560.0]];
+
+        $conAntecedente = fn (bool $rb): array => $this->rbEconomia($user, 'prostata', ['agosto.json' => $agosto, 'septiembre.json' => $septiembre], $historial, 'C61X', $rb);
+        $sinAntecedente = fn (bool $rb): array => $this->rbEconomia($user, 'prostata', ['septiembre.json' => $septiembre], $historial, 'C61X', $rb);
+
+        $apagada = $conAntecedente(false);
+        $encendida = $conAntecedente(true);
+        $this->assertSame(round($apagada['central'] + 7233560.0, 2), $encendida['central']);
+        $this->assertSame(round($apagada['condicionado'] - 7233560.0, 2), $encendida['condicionado']);
+        $this->assertSame($apagada['combinado'], $encendida['combinado']);
+        $this->assertSame($apagada['costoA'], $encendida['costoA']);
+        $this->assertSame($sinAntecedente(false), $sinAntecedente(true), 'Sin el corte 08 de agosto la continuidad no es verificable.');
+    }
+
+    /**
+     * Sin evidencia de que la cirugía pertenece al episodio, o si otra vía ya la reconoce, R-B no cambia nada.
+     *
+     * @param  array<string, array<int, array<string, mixed>>>  $cambios
+     */
+    #[DataProvider('cirugiasSinEvidenciaDelEpisodio')]
+    public function test_rb_keeps_the_surgery_conditioned_without_episode_evidence(array $cambios, bool $urgenciaConTarifa): void
+    {
+        $user = User::factory()->create();
+        $this->createSurgicalNote('prostata', '602001', 7233560.0);
+
+        if ($urgenciaConTarifa) {
+            $this->createTechnicalItem('890701', 'CONSULTA DE URGENCIAS POR MEDICINA GENERAL', 40195.6077);
+        }
+
+        $servicios = $this->estanciaQuirurgica();
+
+        foreach ($cambios as $tipo => $registros) {
+            foreach ($registros as $indice => $campos) {
+                $servicios[$tipo][$indice] = [...($servicios[$tipo][$indice] ?? []), ...$campos];
+            }
+        }
+
+        $files = ['corta.json' => $this->ripsQuirurgico($servicios)];
+
+        $this->assertSame(
+            $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', false),
+            $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', true)
+        );
+    }
+
+    /**
+     * @return array<string, array{0: array<string, array<int, array<string, mixed>>>, 1: bool}>
+     */
+    public static function cirugiasSinEvidenciaDelEpisodio(): array
+    {
+        return [
+            'autorización distinta a la del AH' => [['procedimientos' => [['numAutorizacion' => 'PROSTATECTOMIA']]], false],
+            'autorizaciones vacías' => [['procedimientos' => [['numAutorizacion' => '']], 'hospitalizacion' => [['numAutorizacion' => '']]], false],
+            'ingreso AH que no viene de sala de cirugía' => [['hospitalizacion' => [['viaIngresoServicioSalud' => '01']]], false],
+            'servicio no quirúrgico' => [['procedimientos' => [['codServicio' => '328']]], false],
+            'urgencia AU que contiene la cirugía' => [['urgencias' => [['codPrestador' => '9000000102', 'fechaInicioAtencion' => '2026-09-11 07:00',
+                'fechaEgreso' => '2026-09-11 11:00', 'codDiagnosticoPrincipal' => 'C61X', 'condicionDestinoUsuarioEgreso' => '03', 'consecutivo' => 1]]], false],
+            'episodio ya reconocido como urgencia con su consulta' => [['consultas' => [['codPrestador' => '9000000102', 'fechaInicioAtencion' => '2026-09-10 19:00',
+                'codConsulta' => '890701', 'codDiagnosticoPrincipal' => 'C61X', 'vrServicio' => 0, 'consecutivo' => 3]]], true],
+        ];
+    }
+
+    /**
+     * Una cirugía repetida de forma idéntica en el RIPS solo se reconoce una vez.
+     */
+    public function test_rb_recognizes_a_duplicated_surgery_line_only_once(): void
+    {
+        $user = User::factory()->create();
+        $this->createSurgicalNote('prostata', '602001', 7233560.0);
+        $servicios = $this->estanciaQuirurgica();
+        $servicios['procedimientos'][] = $servicios['procedimientos'][0];
+        $files = ['corta.json' => $this->ripsQuirurgico($servicios)];
+
+        $apagada = $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', false);
+        $encendida = $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', true);
+
+        $this->assertSame(7233560.0, round($encendida['central'] - $apagada['central'], 2));
+        $this->assertSame(7233560.0, round($apagada['condicionado'] - $encendida['condicionado'], 2));
+        $this->assertSame($apagada['combinado'], $encendida['combinado']);
+        $this->assertSame($apagada['costoA'], $encendida['costoA']);
+    }
+
+    /**
+     * La misma cirugía facturada otra vez en otra factura es una posible doble facturación: R-B no la
+     * reconoce como excepción del episodio, para no sumarla dos veces.
+     */
+    public function test_rb_does_not_recognize_a_surgery_billed_again_in_another_invoice(): void
+    {
+        $user = User::factory()->create();
+        $this->createSurgicalNote('prostata', '602001', 7233560.0);
+        $servicios = $this->estanciaQuirurgica();
+        $files = [
+            'corta.json' => $this->ripsQuirurgico($servicios),
+            'otra-factura.json' => $this->ripsQuirurgico(['procedimientos' => $servicios['procedimientos']], factura: 'FAC-SEP-2'),
+        ];
+
+        $this->assertSame(
+            $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', false),
+            $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', true)
+        );
+    }
+
+    /**
+     * Historial hospitalario: septiembre con el cierre guardado de agosto da la misma estimación AH que agosto y
+     * septiembre en una carga, sin importar el orden de los archivos; costo A y hojas no cambian. Próstata y Cérvix.
+     */
+    #[DataProvider('rutasDelHistorial')]
+    public function test_historial_september_with_the_stored_august_closure_equals_one_batch(string $ejecucion, string $diagnostico, string $sexo): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        [$agosto, $septiembre] = [$this->ripsAgosto($diagnostico, $sexo), $this->ripsSeptiembre($diagnostico, $sexo)];
+        $ruta = strtoupper($ejecucion);
+
+        $lote = $this->ahDelMes($this->exportWorkbook($user, $ejecucion, ['agosto.json' => $agosto, 'septiembre.json' => $septiembre]), $ruta);
+        $soloSinHistorial = $this->exportWorkbook($user, $ejecucion, ['septiembre.json' => $septiembre]);
+        $this->activarHistorial();
+        $this->cerrarPeriodo($ruta, '2026-08', ['agosto.json' => $agosto], arranque: true)->assertSuccessful();
+        $soloConHistorial = $this->exportWorkbook($user, $ejecucion, ['septiembre.json' => $septiembre]);
+        $invertido = $this->ahDelMes($this->exportWorkbook($user, $ejecucion, ['septiembre.json' => $septiembre, 'agosto.json' => $agosto]), $ruta);
+
+        $this->assertSame(PoliticaPaqueteHospitalario::VALOR_PAQUETE, $lote['central'], 'La continuación de agosto no abre un bloque nuevo.');
+        $this->assertSame(round(2 * PoliticaPaqueteHospitalario::VALOR_PAQUETE, 2), $this->ahDelMes($soloSinHistorial, $ruta)['central']);
+        $this->assertSame($lote, $this->ahDelMes($soloConHistorial, $ruta));
+        $this->assertSame($lote, $invertido);
+        $this->assertSame($this->ahDelMes($soloSinHistorial, $ruta)['costoA'], $this->ahDelMes($soloConHistorial, $ruta)['costoA']);
+        $this->assertSame($soloSinHistorial->getSheetNames(), $soloConHistorial->getSheetNames());
+
+        $traza = fn (): array => collect(ActivityLog::query()->where('action', 'seguimiento_rutas')->latest('id')->first()->metadata['historial_hospitalario'])
+            ->firstWhere('periodo', '2026-09');
+        $this->exportWorkbook($user, $ejecucion, ['septiembre.json' => $septiembre]);
+        $this->assertStringStartsWith('PROVISIONAL', $traza()['cierreDelPeriodo'], 'Septiembre sin cierre guardado es provisional.');
+        $this->assertSame(EstadoAntecedenteHospitalario::Comprobado->value, $traza()['estadoAntecedente']);
+        $this->cerrarPeriodo($ruta, '2026-09', ['septiembre.json' => $septiembre])->assertSuccessful();
+        $this->exportWorkbook($user, $ejecucion, ['septiembre.json' => $septiembre]);
+        $this->assertStringStartsWith('CERRADO '.$ruta.' 2026-09 v1', $traza()['cierreDelPeriodo']);
+    }
+
+    /**
+     * @return array<string, array{0: string, 1: string, 2: string}>
+     */
+    public static function rutasDelHistorial(): array
+    {
+        return ['próstata' => ['prostata', 'C61X', 'M'], 'cérvix' => ['cervix', 'C53X', 'F']];
+    }
+
+    /**
+     * Sin cierre del mes anterior no se inventan unidades: los bloques de la continuación quedan condicionados.
+     */
+    public function test_historial_without_the_previous_closure_keeps_the_continuation_conditioned(): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        $septiembre = ['septiembre.json' => $this->ripsSeptiembre()];
+        $sinHistorial = $this->ahDelMes($this->exportWorkbook($user, 'prostata', $septiembre), 'PROSTATA');
+        $this->activarHistorial();
+
+        $conHistorial = $this->ahDelMes($this->exportWorkbook($user, 'prostata', $septiembre), 'PROSTATA');
+
+        $this->assertSame(PoliticaPaqueteHospitalario::VALOR_PAQUETE, $conHistorial['central']);
+        $this->assertSame(PoliticaPaqueteHospitalario::VALOR_PAQUETE, $conHistorial['condicionado']);
+        $this->assertSame($sinHistorial['central'], round($conHistorial['central'] + $conHistorial['condicionado'], 2));
+        $this->assertSame($sinHistorial['costoA'], $conHistorial['costoA']);
+    }
+
+    /**
+     * Cerrar es idempotente, nunca parcial y versionado: las estancias sin continuación quedan como evidencia sin
+     * arrastrarse; corregir un JSON crea una versión nueva y deja incompleto el cierre que dependía de la anterior.
+     */
+    public function test_closing_a_period_is_idempotent_versioned_and_never_partial(): void
+    {
+        $this->createReferenceCatalogs();
+        $this->activarHistorial();
+        $historial = app(HistorialHospitalario::class);
+        $cierre = new CierreHospitalarioPeriodo(new PoliticaPaqueteHospitalario, str_repeat('s', 40));
+        [$agosto, $septiembre] = [['agosto.json' => $this->ripsAgosto()], ['septiembre.json' => $this->ripsSeptiembre()]];
+
+        $this->cerrarPeriodo('PROSTATA', '2026-08', $agosto, arranque: true, aplicar: false)->assertSuccessful();
+        $this->assertNull($historial->vigente('PROSTATA', '2026-08'), 'La simulación no guarda nada.');
+        $this->cerrarPeriodo('PROSTATA', '2026-09', $septiembre)->assertFailed();
+        $this->cerrarPeriodo('PROSTATA', '2026-08', $agosto, arranque: true)->assertSuccessful();
+        $this->cerrarPeriodo('PROSTATA', '2026-08', $agosto, arranque: true)->expectsOutputToContain('SIN CAMBIOS')->assertSuccessful();
+        $this->cerrarPeriodo('PROSTATA', '2026-09', $septiembre)->assertSuccessful();
+
+        $septiembreV1 = $historial->vigente('PROSTATA', '2026-09');
+        $estados = array_count_values(array_column($septiembreV1->estancias, 'estado'));
+        ksort($estados);
+        $this->assertCount(1, $historial->versiones('PROSTATA', '2026-08'));
+        $this->assertSame(['ABIERTA_VERIFICADA' => 1, 'CERRADA_CON_SOPORTE' => 1, 'SIN_CONTINUACION_OBSERVADA' => 1], $estados);
+        $this->assertCount(1, $septiembreV1->abiertas(), 'La estancia sin continuación no pasa a octubre.');
+        $this->assertSame(EstadoAntecedenteHospitalario::Comprobado, $cierre->estadoAntecedente($septiembreV1, $historial, []));
+
+        $corregido = ['agosto.json' => str_replace('2026-08-25 10:00', '2026-08-25 09:00', $agosto['agosto.json'])];
+        $this->cerrarPeriodo('PROSTATA', '2026-09', [...$septiembre, 'agosto-modificado.json' => $corregido['agosto.json']])->assertFailed();
+        $this->cerrarPeriodo('PROSTATA', '2026-08', $corregido, arranque: true)->expectsOutputToContain('vuelva a cerrarlo')->assertSuccessful();
+        $agostoV2 = $historial->vigente('PROSTATA', '2026-08');
+
+        $this->assertSame(2, $agostoV2->version);
+        $this->assertSame($septiembreV1->hashContenido(), $historial->version('PROSTATA', '2026-09', 1)->hashContenido());
+        $this->assertSame(EstadoAntecedenteHospitalario::Incompleto, $cierre->estadoAntecedente($historial->vigente('PROSTATA', '2026-09'), $historial, []));
+        $this->assertContains('RECTIFICADA', array_column($agostoV2->estancias, 'estado'));
+        $this->cerrarPeriodo('PROSTATA', '2026-09', $septiembre)->assertSuccessful();
+        $this->assertSame(EstadoAntecedenteHospitalario::Comprobado, $cierre->estadoAntecedente($historial->vigente('PROSTATA', '2026-09'), $historial, []));
+    }
+
+    /**
+     * R-B con historial: la cirugía de un tramo del día 1 se acredita cuando el cierre guardado del mes anterior
+     * contiene el corte 08 de la estancia.
+     */
+    public function test_rb_accepts_a_day_one_continuation_with_the_stored_previous_closure(): void
+    {
+        $user = User::factory()->create();
+        $this->createSurgicalNote('prostata', '602001', 7233560.0);
+        $this->activarHistorial();
+        $corte = $this->ripsQuirurgico(['hospitalizacion' => [[...$this->estanciaQuirurgica()['hospitalizacion'][0],
+            'fechaInicioAtencion' => '2026-08-30 10:00', 'fechaEgreso' => '2026-08-31 23:59', 'condicionDestinoUsuarioEgreso' => '08']]], factura: 'FAC-AGO');
+        $continuacion = $this->estanciaQuirurgica();
+        $continuacion['hospitalizacion'][0]['fechaInicioAtencion'] = '2026-09-01 00:00';
+        $continuacion['hospitalizacion'][0]['fechaEgreso'] = '2026-09-01 16:00';
+        $continuacion['procedimientos'][0]['fechaInicioAtencion'] = '2026-09-01 10:00';
+        $files = ['septiembre.json' => $this->ripsQuirurgico($continuacion)];
+        $this->cerrarPeriodo('PROSTATA', '2026-08', ['agosto.json' => $corte], arranque: true)->assertSuccessful();
+
+        $apagada = $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', false);
+        $encendida = $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', true);
+
+        $this->assertSame(round($apagada['central'] + 7233560.0, 2), $encendida['central']);
+        $this->assertSame($apagada['combinado'], $encendida['combinado']);
+        $this->assertSame($apagada['costoA'], $encendida['costoA']);
+    }
+
+    /**
+     * Riesgo B: la estancia que inicia en agosto, sigue en septiembre tras el corte 08 y supera 25 días el 4 de
+     * septiembre suma su segundo bloque en septiembre una sola vez: en lote (con o sin historial), con el cierre
+     * guardado de agosto o, sin él, condicionado. El costo A no cambia.
+     */
+    #[DataProvider('rutasDelHistorial')]
+    public function test_historial_counts_the_block_reached_in_september_once(string $ejecucion, string $diagnostico, string $sexo): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        $ruta = strtoupper($ejecucion);
+        $agosto = ['agosto.json' => $this->rips('FAC-AGO', [$this->usuario('100', $sexo, ['hospitalizacion' => [$this->registroAh('2026-08-10 08:00', '2026-08-31 23:59', '08', 'AUT-A', $diagnostico)]])])];
+        $septiembre = ['septiembre.json' => $this->rips('FAC-SEP', [$this->usuario('100', $sexo, ['hospitalizacion' => [$this->registroAh('2026-09-01 00:00', '2026-09-28 08:00', '01', 'AUT-A', $diagnostico)]])])];
+        $paquete = PoliticaPaqueteHospitalario::VALOR_PAQUETE;
+
+        $loteSinHistorial = $this->exportWorkbook($user, $ejecucion, [...$agosto, ...$septiembre]);
+        $this->activarHistorial();
+        $loteConHistorial = $this->exportWorkbook($user, $ejecucion, [...$septiembre, ...$agosto]);
+        $sinCierre = $this->ahDelMes($this->exportWorkbook($user, $ejecucion, $septiembre), $ruta);
+        $this->cerrarPeriodo($ruta, '2026-08', $agosto, arranque: true)->assertSuccessful();
+        $conCierre = $this->ahDelMes($this->exportWorkbook($user, $ejecucion, $septiembre), $ruta);
+        $this->cerrarPeriodo($ruta, '2026-09', $septiembre)->assertSuccessful();
+
+        foreach ([$loteSinHistorial, $loteConHistorial] as $lote) {
+            $this->assertSame($paquete, $this->ahDelMes($lote, $ruta, '2026-08')['central']);
+            $this->assertSame($paquete, $this->ahDelMes($lote, $ruta)['central'], 'El bloque 2 de la estancia se suma una sola vez.');
+            $this->assertSame([], array_values(array_diff($lote->getSheetNames(), ['SEGUIMIENTO MENSUAL', 'SEGUIMIENTO PACIENTE MES', 'DETALLE RIPS',
+                'CASOS A REVISAR', 'NO ENCONTRADOS NOTA TECNICA', 'REPETICIONES Y DUPLICADOS', 'REFERENCIA TECNICA', 'PUENTE ECONOMICO', 'CATALOGOS APLICADOS', 'CONTROL DE CARGUE', 'CONCILIACION ADMIN', 'DETALLE POR CODIGO', 'QUIMIOTERAPIA', 'PENDIENTES ADMIN', 'FUENTES Y CONTROL'])));
+            $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS', 'VALOR TOTAL MES'], $this->headers($lote->getSheetByName('SEGUIMIENTO MENSUAL')));
+        }
+
+        $this->assertSame($loteSinHistorial->getSheetNames(), $loteConHistorial->getSheetNames());
+
+        $this->assertSame($this->ahDelMes($loteSinHistorial, $ruta), $conCierre);
+        $this->assertSame([0.0, round(2 * $paquete, 2), $conCierre['costoA']], [$sinCierre['central'], $sinCierre['condicionado'], $sinCierre['costoA']]);
+        $estancia = app(HistorialHospitalario::class)->vigente($ruta, '2026-09')->estancias[0];
+        $this->assertSame(EstadoEstanciaHospitalaria::CerradaConSoporte->value, $estancia['estado']);
+        $this->assertSame(2, $estancia['bloquesReconocidos']);
+        $this->assertSame([['numero' => 1, 'inicio' => '2026-08-10 08:00', 'periodo' => '2026-08'], ['numero' => 2, 'inicio' => '2026-09-04 08:00', 'periodo' => '2026-09']],
+            $estancia['bloquesPeriodo']);
+    }
+
+    /**
+     * Riesgo B: estancias que inician en agosto y se facturan completas en septiembre no reemplazan el cierre
+     * guardado de agosto (la continuación del documento 100 se sigue uniendo); la que sigue abierta al 30 de
+     * septiembre queda en el cierre de septiembre con cada bloque en el mes en que empieza.
+     */
+    public function test_historial_stays_billed_across_months_keep_the_stored_closure_and_their_period(): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        $agosto = ['agosto.json' => $this->ripsAgosto()];
+        $septiembre = ['septiembre.json' => $this->rips('FAC-SEP', [
+            $this->usuario('100', 'M', ['hospitalizacion' => [$this->registroAh('2026-09-01 00:00', '2026-09-10 08:00', '01', 'AUT-A', 'C61X')]]),
+            $this->usuario('103', 'M', ['hospitalizacion' => [$this->registroAh('2026-08-25 08:00', '2026-09-25 08:00', '01', 'AUT-D', 'C61X')]]),
+            $this->usuario('104', 'M', ['hospitalizacion' => [$this->registroAh('2026-08-28 08:00', '2026-09-30 23:59', '08', 'AUT-E', 'C61X')]]),
+        ])];
+        $lote = $this->ahDelMes($this->exportWorkbook($user, 'prostata', [...$agosto, ...$septiembre]), 'PROSTATA');
+        $this->activarHistorial();
+        $this->cerrarPeriodo('PROSTATA', '2026-08', $agosto, arranque: true)->assertSuccessful();
+
+        $conCierre = $this->ahDelMes($this->exportWorkbook($user, 'prostata', $septiembre), 'PROSTATA');
+        $this->cerrarPeriodo('PROSTATA', '2026-09', $septiembre)->assertSuccessful();
+
+        $this->assertSame(round(2 * PoliticaPaqueteHospitalario::VALOR_PAQUETE, 2), $lote['central']);
+        $this->assertSame($lote, $conCierre);
+        $abiertas = app(HistorialHospitalario::class)->vigente('PROSTATA', '2026-09')->abiertas();
+        $this->assertSame(['2026-08-28 08:00'], array_column($abiertas, 'ingresoOriginal'));
+        $this->assertSame(['2026-08', '2026-09'], array_column($abiertas[0]['bloquesPeriodo'], 'periodo'));
+    }
+
+    /**
+     * Riesgo A: el cierre de agosto calculado en una carga tiene la misma identidad (contenido y origen) solo, con
+     * septiembre o en otro orden, y es el mismo cierre guardado.
+     */
+    public function test_historial_the_august_closure_identity_does_not_depend_on_other_files_in_the_batch(): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        [$agosto, $septiembre] = [['agosto.json' => $this->ripsAgosto()], ['septiembre.json' => $this->ripsSeptiembre()]];
+        $this->activarHistorial();
+        $this->cerrarPeriodo('PROSTATA', '2026-08', $agosto, arranque: true)->assertSuccessful();
+        $guardado = app(HistorialHospitalario::class)->vigente('PROSTATA', '2026-08');
+
+        foreach ([$agosto, [...$agosto, ...$septiembre], [...$septiembre, ...$agosto]] as $files) {
+            $this->exportWorkbook($user, 'prostata', $files);
+            $traza = collect(ActivityLog::query()->where('action', 'seguimiento_rutas')->latest('id')->first()->metadata['historial_hospitalario'])
+                ->first(static fn (array $traza): bool => $traza['ruta'] === 'PROSTATA' && $traza['periodo'] === '2026-08');
+
+            $this->assertSame($guardado->hashContenido(), $traza['hashCierre']);
+            $this->assertSame($guardado->hashOrigen(), $traza['hashOrigen'] ?? null);
+            $this->assertStringStartsWith('CERRADO PROSTATA 2026-08 v1', $traza['cierreDelPeriodo']);
+            $this->assertStringContainsString('completitud confirmada por el operador', $traza['cierreDelPeriodo']);
+        }
+    }
+
+    /**
+     * Riesgo D: una carga con solo parte de las facturas de agosto no reemplaza el cierre completo guardado de
+     * agosto como antecedente de septiembre.
+     */
+    public function test_historial_a_partial_month_in_the_batch_never_replaces_its_stored_closure(): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        $otraFactura = $this->rips('FAC-AGO-2', [$this->usuario('105', 'M', ['hospitalizacion' => [$this->registroAh('2026-08-03 08:00', '2026-08-09 08:00', '01', 'AUT-F', 'C61X')]])]);
+        $agosto = ['agosto.json' => $this->ripsAgosto(), 'agosto-2.json' => $otraFactura];
+        $septiembre = ['septiembre.json' => $this->ripsSeptiembre()];
+        $lote = $this->ahDelMes($this->exportWorkbook($user, 'prostata', [...$agosto, ...$septiembre]), 'PROSTATA');
+        $this->activarHistorial();
+        $this->cerrarPeriodo('PROSTATA', '2026-08', $agosto, arranque: true)->assertSuccessful();
+
+        $parcial = $this->ahDelMes($this->exportWorkbook($user, 'prostata', ['agosto-2.json' => $otraFactura, ...$septiembre]), 'PROSTATA');
+
+        $this->assertSame(PoliticaPaqueteHospitalario::VALOR_PAQUETE, $lote['central']);
+        $this->assertSame($lote, $parcial);
+    }
+
+    /**
+     * Antecedente incompleto: si una corrección cambia el cierre de julio, el de agosto deja de acreditar la
+     * continuación de septiembre, que queda condicionada, hasta volver a cerrar agosto.
+     */
+    public function test_historial_an_incomplete_previous_closure_keeps_the_continuation_conditioned(): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        $julio = fn (string $ingreso): array => ['julio.json' => $this->rips('FAC-JUL', [$this->usuario('106', 'M', ['hospitalizacion' => [$this->registroAh($ingreso, '2026-07-31 23:59', '08', 'AUT-G', 'C61X')]])])];
+        [$agosto, $septiembre] = [['agosto.json' => $this->ripsAgosto()], ['septiembre.json' => $this->ripsSeptiembre()]];
+        $this->activarHistorial('2026-07');
+        $this->cerrarPeriodo('PROSTATA', '2026-07', $julio('2026-07-20 08:00'), arranque: true)->assertSuccessful();
+        $this->cerrarPeriodo('PROSTATA', '2026-08', $agosto)->assertSuccessful();
+        $lote = $this->ahDelMes($this->exportWorkbook($user, 'prostata', [...$agosto, ...$septiembre]), 'PROSTATA');
+        $comprobado = $this->ahDelMes($this->exportWorkbook($user, 'prostata', $septiembre), 'PROSTATA');
+
+        $this->cerrarPeriodo('PROSTATA', '2026-07', $julio('2026-07-21 08:00'), arranque: true)->assertSuccessful();
+        $incompleto = $this->ahDelMes($this->exportWorkbook($user, 'prostata', $septiembre), 'PROSTATA');
+        $this->cerrarPeriodo('PROSTATA', '2026-08', $agosto)->assertSuccessful();
+        $recerrado = $this->ahDelMes($this->exportWorkbook($user, 'prostata', $septiembre), 'PROSTATA');
+
+        $this->assertSame($lote, $comprobado);
+        $this->assertSame($comprobado['central'], $incompleto['central']);
+        $this->assertSame(round($comprobado['condicionado'] + PoliticaPaqueteHospitalario::VALOR_PAQUETE, 2), $incompleto['condicionado'], 'El bloque de la continuación queda condicionado.');
+        $this->assertSame($comprobado['costoA'], $incompleto['costoA']);
+        $this->assertSame($comprobado, $recerrado);
+    }
+
+    /**
+     * Riesgo C: R-B no acredita la cirugía de un tramo del día 1 con el corte 08 guardado en el cierre de la otra
+     * ruta: el reconstructor no une estancias de rutas distintas y el historial tampoco.
+     */
+    public function test_rb_does_not_accept_a_day_one_continuation_from_the_other_route_closure(): void
+    {
+        $user = User::factory()->create();
+        $this->createSurgicalNote('prostata', '602001', 7233560.0);
+        $this->activarHistorial();
+        $corte = $this->rips('FAC-AGO', [$this->usuario('100', 'F', ['hospitalizacion' => [[...$this->estanciaQuirurgica('602001', 'C53X')['hospitalizacion'][0],
+            'fechaInicioAtencion' => '2026-08-30 10:00', 'fechaEgreso' => '2026-08-31 23:59', 'condicionDestinoUsuarioEgreso' => '08']]])]);
+        $continuacion = $this->estanciaQuirurgica();
+        $continuacion['hospitalizacion'][0]['fechaInicioAtencion'] = '2026-09-01 00:00';
+        $continuacion['hospitalizacion'][0]['fechaEgreso'] = '2026-09-01 16:00';
+        $continuacion['procedimientos'][0]['fechaInicioAtencion'] = '2026-09-01 10:00';
+        $files = ['septiembre.json' => $this->ripsQuirurgico($continuacion)];
+        $this->cerrarPeriodo('CERVIX', '2026-08', ['agosto.json' => $corte], arranque: true)->assertSuccessful();
+        $this->assertCount(1, app(HistorialHospitalario::class)->vigente('CERVIX', '2026-08')->abiertas());
+
+        $this->assertSame(
+            $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', false),
+            $this->rbEconomia($user, 'prostata', $files, [['602001', 'AP', 7233560.0]], 'C61X', true)
+        );
+    }
+
+    private function activarHistorial(string $arranque = '2026-08'): void
+    {
+        config(['programas.la-maria.historial_hospitalario' => ['modo' => 'ACTIVO', 'secreto' => str_repeat('s', 40), 'arranque' => $arranque]]);
+    }
+
+    /**
+     * @param  array<string, string>  $files
+     */
+    private function cerrarPeriodo(string $ruta, string $periodo, array $files, bool $arranque = false, bool $aplicar = true): PendingCommand
+    {
+        $directorio = storage_path('framework/testing/historial-'.Str::uuid());
+        File::ensureDirectoryExists($directorio);
+        $rutas = [];
+
+        foreach ($files as $nombre => $contenido) {
+            File::put($rutas[] = $directorio.DIRECTORY_SEPARATOR.$nombre, $contenido);
+        }
+
+        $this->beforeApplicationDestroyed(static fn () => File::deleteDirectory($directorio));
+
+        return $this->artisan('la-maria:cerrar-periodo', array_filter([
+            'ruta' => $ruta, 'periodo' => $periodo, '--archivo' => $rutas,
+            '--factura' => array_map(static fn (string $contenido): string => (string) json_decode($contenido, true)['numFactura'], array_values($files)),
+            '--motivo' => 'Facturas completas del período (prueba)', '--arranque' => $arranque, '--aplicar' => $aplicar,
+        ], static fn (mixed $valor): bool => $valor !== false));
+    }
+
+    /**
+     * Agosto: dos estancias abiertas al cierre (corte 08); la del documento 100 continúa en septiembre.
+     */
+    private function ripsAgosto(string $diagnostico = 'C61X', string $sexo = 'M'): string
+    {
+        return $this->rips('FAC-AGO', [
+            $this->usuario('100', $sexo, ['hospitalizacion' => [$this->registroAh('2026-08-20 08:00', '2026-08-31 23:59', '08', 'AUT-A', $diagnostico)]]),
+            $this->usuario('101', $sexo, ['hospitalizacion' => [$this->registroAh('2026-08-25 10:00', '2026-08-31 23:59', '08', 'AUT-B', $diagnostico)]]),
+        ]);
+    }
+
+    /**
+     * Septiembre: continuación del documento 100 (estancia completa de 21 días) y una estancia nueva abierta al cierre.
+     */
+    private function ripsSeptiembre(string $diagnostico = 'C61X', string $sexo = 'M'): string
+    {
+        return $this->rips('FAC-SEP', [
+            $this->usuario('100', $sexo, ['hospitalizacion' => [$this->registroAh('2026-09-01 00:00', '2026-09-10 08:00', '01', 'AUT-A', $diagnostico)]]),
+            $this->usuario('102', $sexo, ['hospitalizacion' => [$this->registroAh('2026-09-28 08:00', '2026-09-30 23:59', '08', 'AUT-C', $diagnostico)]]),
+        ]);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function registroAh(string $ingreso, string $egreso, string $destino, string $autorizacion, string $diagnostico): array
+    {
+        return [
+            'codPrestador' => '9000000102', 'viaIngresoServicioSalud' => '01', 'fechaInicioAtencion' => $ingreso, 'fechaEgreso' => $egreso,
+            'codDiagnosticoPrincipal' => $diagnostico, 'condicionDestinoUsuarioEgreso' => $destino, 'numAutorizacion' => $autorizacion, 'consecutivo' => 1,
+        ];
+    }
+
+    /**
+     * @return array{central: float, condicionado: float, costoA: float}
+     */
+    private function ahDelMes(Spreadsheet $workbook, string $ruta, string $mes = '2026-09'): array
+    {
+        $filas = $this->internalComparisonRows($workbook)[$ruta][$mes];
+
+        return [
+            'central' => round((float) ($filas['AH']['ESTIMACION ADMINISTRATIVA CENTRAL'] ?? 0), 2),
+            'condicionado' => round((float) ($filas['AH']['COMPONENTE CONDICIONADO'] ?? 0), 2),
+            'costoA' => round((float) $filas['TOTAL']['COSTO A'], 2),
+        ];
     }
 
     public function test_emergency_under_24_hours_is_charged_with_its_urgency_consult_tariff(): void
@@ -1471,14 +2021,14 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->createReferenceCatalogs();
 
         $this->from(route('la-maria.prostata'))->actingAs($user)->post(route('la-maria.prostata.export'), [
-            'archivos' => [UploadedFile::fake()->createWithContent('FEHM632724.json', $this->routeJson('FAC-1', 'C61X', '2026-08-10 08:00', 'consultas'))],
+            'archivos' => [UploadedFile::fake()->createWithContent('PRUEBA001.json', $this->routeJson('FAC-1', 'C61X', '2026-08-10 08:00', 'consultas'))],
             'archivos_declarados' => json_encode([
-                ['nombre' => 'FEHM632724.json', 'tamano' => strlen($this->routeJson('FAC-1', 'C61X', '2026-08-10 08:00', 'consultas'))],
-                ['nombre' => 'FEHM632903.json', 'tamano' => 4191714],
-                ['nombre' => 'FEHM633817.json', 'tamano' => 7105045],
+                ['nombre' => 'PRUEBA001.json', 'tamano' => strlen($this->routeJson('FAC-1', 'C61X', '2026-08-10 08:00', 'consultas'))],
+                ['nombre' => 'PRUEBA002.json', 'tamano' => 4191714],
+                ['nombre' => 'PRUEBA003.json', 'tamano' => 7105045],
             ]),
         ])->assertRedirectToRoute('la-maria.prostata')
-            ->assertSessionHasErrors(['archivos' => 'Se seleccionaron 3 archivos pero el servidor recibió 1. No llegaron: FEHM632903.json, FEHM633817.json. No se generó el reporte para evitar un consolidado incompleto; vuelve a cargarlos.']);
+            ->assertSessionHasErrors(['archivos' => 'Se seleccionaron 3 archivos pero el servidor recibió 1. No llegaron: PRUEBA002.json, PRUEBA003.json. No se generó el reporte para evitar un consolidado incompleto; vuelve a cargarlos.']);
 
         $this->assertDatabaseCount('programa_ejecuciones', 0);
     }
@@ -1588,7 +2138,7 @@ class SeguimientoRutaControllerTest extends TestCase
 
         $consolidated = $this->exportWorkbook($user, 'consolidado', $files, declare: true);
         $costs = collect($this->sessionRows('consolidado', 'costos', ResumenEconomico::HEADERS))->keyBy('RUTA');
-        $this->assertSame(['SEGUIMIENTO MENSUAL', 'CATALOGOS APLICADOS', 'CONTROL DE CARGUE'], $consolidated->getSheetNames());
+        $this->assertSame(['SEGUIMIENTO MENSUAL', 'PUENTE ECONOMICO', 'CATALOGOS APLICADOS', 'CONTROL DE CARGUE', 'CONCILIACION ADMIN', 'DETALLE POR CODIGO', 'QUIMIOTERAPIA', 'PENDIENTES ADMIN', 'FUENTES Y CONTROL'], $consolidated->getSheetNames());
         $this->assertSame(['PROSTATA', 'CERVIX'], $costs->keys()->all());
         $this->assertSame(['PROSTATA', 'CERVIX'], array_keys($this->internalComparisonRows($consolidated)));
 
@@ -1708,7 +2258,7 @@ class SeguimientoRutaControllerTest extends TestCase
             foreach ($workbook->getSheetByName($sheet)->toArray(null, true, false, false) as $row) {
                 foreach ($row as $cell) {
                     $this->assertStringNotContainsString('9988776655', (string) $cell, 'Documento RIPS en '.$sheet);
-                    $this->assertStringNotContainsString('70975586', (string) $cell, 'Documento administrativo en '.$sheet);
+                    $this->assertStringNotContainsString('9000000103', (string) $cell, 'Documento administrativo en '.$sheet);
                 }
             }
         }
@@ -1738,7 +2288,7 @@ class SeguimientoRutaControllerTest extends TestCase
                 'consultas' => [$this->consulta('890201', 'C61X', '2026-09-10 08:00')],
                 'otrosServicios' => [$this->otroServicio('DM00114', 'C61X', '2026-09-12 09:00', 2)],
                 'urgencias' => [[
-                    'codPrestador' => '050010608601', 'fechaInicioAtencion' => '2026-09-10 07:00', 'causaMotivoAtencion' => '38',
+                    'codPrestador' => '9000000102', 'fechaInicioAtencion' => '2026-09-10 07:00', 'causaMotivoAtencion' => '38',
                     'codDiagnosticoPrincipal' => 'C61X', 'codDiagnosticoPrincipalE' => 'C61X', 'condicionDestinoUsuarioEgreso' => '01',
                     'fechaEgreso' => '2026-09-10 18:00', 'consecutivo' => 3,
                 ]],
@@ -1755,7 +2305,7 @@ class SeguimientoRutaControllerTest extends TestCase
         $comparison = $this->internalComparisonRows($workbook)['PROSTATA']['2026-09'];
 
         $this->assertSame([], array_values(array_intersect(self::HOJAS_RETIRADAS, $workbook->getSheetNames())));
-        $this->assertSame('CONTROL DE CARGUE', $workbook->getSheetNames()[array_key_last($workbook->getSheetNames())]);
+        $this->assertSame(['CONTROL DE CARGUE', 'CONCILIACION ADMIN', 'DETALLE POR CODIGO', 'QUIMIOTERAPIA', 'PENDIENTES ADMIN', 'FUENTES Y CONTROL'], array_slice($workbook->getSheetNames(), -6));
         $this->assertSame(['MES', 'PACIENTES', 'SERVICIOS', 'VALOR TOTAL MES'], $this->headers($sheet));
         $this->assertSame([['MES' => '2026-09', 'PACIENTES' => 1, 'SERVICIOS' => 3, 'VALOR TOTAL MES' => 5000]], $this->records($sheet));
         $this->assertSame('FF4472C4', $sheet->getCell('A1')->getStyle()->getFill()->getStartColor()->getARGB());
@@ -1764,9 +2314,11 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->assertSame(0.0, (float) $comparison['AU']['ESTIMACION ADMINISTRATIVA CENTRAL']);
         $this->assertSame(5000.0, (float) $comparison['AU']['IMPORTES INFORMATIVOS NO ADITIVOS']);
         $this->assertSame('AU — Urgencias (sin cobro propio; no aditivo)', (string) $sheet->getCell('A9')->getValue());
-        $this->assertSame(1, (int) $sheet->getCell('B9')->getValue());
-        $this->assertSame(0.0, (float) $sheet->getCell('D9')->getValue());
-        $this->assertSame(5000.0, (float) $sheet->getCell('D12')->getValue());
+        $this->assertSame(0.0, (float) $sheet->getCell('B9')->getValue());
+        $this->assertSame(5000.0, (float) $sheet->getCell('B12')->getValue());
+        $this->assertSame('TIPO RIPS / SERVICIO', (string) $sheet->getCell('A5')->getValue());
+        $this->assertSame('VALOR ADMINISTRATIVO', (string) $sheet->getCell('B5')->getValue());
+        $this->assertSame(14, $sheet->getHighestRow());
         $this->assertSame(4000000000.0, ValorizacionAdministrativa::REFERENCIAS_GERENCIALES['PROSTATA']);
     }
 
@@ -1821,14 +2373,12 @@ class SeguimientoRutaControllerTest extends TestCase
             File::delete([$sinMes, $conMes]);
         }
 
-        // Sin informe del mes: el total es el cálculo autónomo y así lo declara.
+        // La procedencia breve no introduce una segunda conciliación visible.
         $this->assertSame('FUENTE DEL TOTAL', $autonomo[0][0]);
-        $this->assertStringStartsWith('CÁLCULO AUTÓNOMO', (string) $autonomo[0][1]);
+        $this->assertStringStartsWith('Cálculo autónomo', (string) $autonomo[0][1]);
         $this->assertNotContains('VALOR AUTÓNOMO (SIN INFORME DEL MES)', array_column($autonomo, 0));
-        // Con informe del mes: la fuente cambia de forma explícita y se muestran el valor autónomo y el ajuste.
-        $this->assertStringStartsWith('CÁLCULO CON INFORME DEL MES — CONCILIACIÓN PARCIAL: informe administrativo de 2026-09', (string) $conciliado[0][1]);
-        $this->assertSame(['VALOR AUTÓNOMO (SIN INFORME DEL MES)', 'AJUSTE RESPALDADO POR LA CONCILIACIÓN DEL MES'], [$conciliado[1][0], $conciliado[2][0]]);
-        $this->assertSame(0.0, (float) $conciliado[2][1]);
+        $this->assertSame($autonomo[0], $conciliado[0]);
+        $this->assertNotContains('VALOR AUTÓNOMO (SIN INFORME DEL MES)', array_column($conciliado, 0));
     }
 
     public function test_missing_administrative_source_stops_the_report_with_a_clear_error(): void
@@ -1881,14 +2431,14 @@ class SeguimientoRutaControllerTest extends TestCase
         CatalogoReferenciaItem::create([
             'catalogo_referencia_id' => CatalogoReferencia::query()->where('tipo', 'DISPENSACION_PROSTATA')->firstOrFail()->id,
             'codigo' => '20085509-2', 'ruta' => 'PROSTATA', 'categoria' => 'DISPENSACION_ADMINISTRATIVA', 'descripcion' => 'Medicamento dispensado',
-            'tarifa_referencia' => 250, 'metadatos' => ['documento_paciente' => '5544332211', 'fecha_dispensacion' => '2026-08-05'],
+            'tarifa_referencia' => 250, 'metadatos' => ['documento_paciente' => '9000000002', 'fecha_dispensacion' => '2026-08-05'],
         ]);
         $cervix = CatalogoReferencia::create(['programa_slug' => LaMariaPrograma::SLUG, 'tipo' => 'DISPENSACION_CERVIX', 'version' => '2026-01',
             'archivo_origen' => 'dispensacion-cervix.xlsx', 'activo' => true]);
         CatalogoReferenciaItem::create([
             'catalogo_referencia_id' => $cervix->id, 'codigo' => '19979158-2', 'ruta' => 'CERVIX', 'categoria' => 'DISPENSACION_ADMINISTRATIVA',
             'descripcion' => 'Medicamento dispensado', 'tarifa_referencia' => 1000,
-            'metadatos' => ['documento_paciente' => '1122334455', 'fecha_dispensacion' => '2026-10-06'],
+            'metadatos' => ['documento_paciente' => '9000000003', 'fecha_dispensacion' => '2026-10-06'],
         ]);
         $traslados = [['T34004', 'AT', 300000], ['T34004', 'AT', 300000], ['T34004', 'AT', 300000]];
         // RN-14 en Cérvix: 992511 con clase pembrolizumab (distintiva) y clase carboplatino/paclitaxel.
@@ -1902,7 +2452,7 @@ class SeguimientoRutaControllerTest extends TestCase
                 'codigo' => $cum, 'categoria' => 'CUM', 'descripcion' => $principio, 'metadatos' => ['atc' => 'L01', 'principio_activo' => $principio]]);
         }
         CatalogoReferenciaItem::create(['catalogo_referencia_id' => $cervix->id, 'codigo' => 'CUM-CARB', 'ruta' => 'CERVIX', 'categoria' => 'DISPENSACION_ADMINISTRATIVA',
-            'descripcion' => 'Medicamento dispensado', 'tarifa_referencia' => 100, 'metadatos' => ['documento_paciente' => '7766554433', 'fecha_dispensacion' => '2026-09-05']]);
+            'descripcion' => 'Medicamento dispensado', 'tarifa_referencia' => 100, 'metadatos' => ['documento_paciente' => '9000000004', 'fecha_dispensacion' => '2026-09-05']]);
         $medicamento = fn (string $cum, string $nombre, int $consecutivo, string $fecha, string $diagnostico): array => [
             ...$this->medicamento($cum, $nombre, 2, $consecutivo), 'fechaDispensAdmon' => $fecha, 'codDiagnosticoPrincipal' => $diagnostico,
         ];
@@ -1914,7 +2464,7 @@ class SeguimientoRutaControllerTest extends TestCase
                 'medicamentos' => [$medicamento('19979158-2', 'SODIO CLORURO', 4, '2026-10-10 09:00', 'C61X'),
                     $medicamento('20085509-2', 'APREPITANT', 5, '2026-10-11 09:00', 'C61X')],
             ]),
-            $this->usuario('1122334455', 'F', [
+            $this->usuario('9000000003', 'F', [
                 'procedimientos' => [[...$this->procedimiento('992511', '2026-10-13 08:00', 7), 'codDiagnosticoPrincipal' => 'C53X']],
                 'otrosServicios' => [$traslado('C53X', '2026-10-13 09:00')],
                 'medicamentos' => [$medicamento('19979158-2', 'SODIO CLORURO', 6, '2026-10-14 09:00', 'C53X'),
@@ -1937,7 +2487,7 @@ class SeguimientoRutaControllerTest extends TestCase
             $workbook = $workbooks[$ruta];
             $comparison = $this->internalComparisonRows($workbook)[$codigo]['2026-10'];
 
-            $this->assertSame('CONTROL DE CARGUE', $workbook->getSheetNames()[array_key_last($workbook->getSheetNames())]);
+            $this->assertSame(['CONTROL DE CARGUE', 'CONCILIACION ADMIN', 'DETALLE POR CODIGO', 'QUIMIOTERAPIA', 'PENDIENTES ADMIN', 'FUENTES Y CONTROL'], array_slice($workbook->getSheetNames(), -6));
             $this->assertNull($workbook->getSheetByName('COBERTURA AM RN14'));
             $this->assertSame(900000.0, (float) $comparison['AT']['ESTIMACION ADMINISTRATIVA CENTRAL']);
             $this->assertSame($centralAm, (float) $comparison['AM']['ESTIMACION ADMINISTRATIVA CENTRAL']);
@@ -2054,7 +2604,7 @@ class SeguimientoRutaControllerTest extends TestCase
         foreach ($fechas as $fecha) {
             foreach ($servicios as $servicio) {
                 [$codigo, $tipo, $valor] = $servicio;
-                $writer->addRow(OpenSpoutRow::fromValues(['', '70975586', $codigo, 'Servicio '.$codigo, $diagnostico, $fecha, 'Grupo', $tipo, $servicio[3] ?? '', $valor]));
+                $writer->addRow(OpenSpoutRow::fromValues(['', '9000000103', $codigo, 'Servicio '.$codigo, $diagnostico, $fecha, 'Grupo', $tipo, $servicio[3] ?? '', $valor]));
             }
         }
 
@@ -2234,7 +2784,7 @@ class SeguimientoRutaControllerTest extends TestCase
             flags: JSON_THROW_ON_ERROR
         );
         $payload['usuarios'][0]['servicios']['hospitalizacion'] = [[
-            'codPrestador' => '050010608601',
+            'codPrestador' => '9000000102',
             'viaIngresoServicioSalud' => '01',
             'fechaInicioAtencion' => '2026-10-01',
             'fechaEgreso' => '2026-10-31',
@@ -2310,7 +2860,7 @@ class SeguimientoRutaControllerTest extends TestCase
         string $factura = 'FAC-HX'
     ): string {
         $servicios['hospitalizacion'] = [[
-            'codPrestador' => '050010608601',
+            'codPrestador' => '9000000102',
             'viaIngresoServicioSalud' => '01',
             'fechaInicioAtencion' => $ingreso,
             'fechaEgreso' => $egreso,
@@ -2328,12 +2878,90 @@ class SeguimientoRutaControllerTest extends TestCase
     private function procedimiento(string $codigo, string $fecha, int $consecutivo, string $tipo = 'procedimientos'): array
     {
         return [
-            'codPrestador' => '050010608601',
+            'codPrestador' => '9000000102',
             'fechaInicioAtencion' => $fecha,
             $tipo === 'consultas' ? 'codConsulta' : 'codProcedimiento' => $codigo,
             'codDiagnosticoPrincipal' => 'C61X',
             'vrServicio' => 0,
             'consecutivo' => $consecutivo,
+        ];
+    }
+
+    /**
+     * Catálogos de referencia y una cirugía de la nota de la ruta, clasificada como procedimiento quirúrgico.
+     */
+    private function createSurgicalNote(string $ejecucion, string $codigo, float $tarifa): void
+    {
+        $this->createReferenceCatalogs();
+        $ruta = strtoupper($ejecucion);
+        CatalogoReferenciaItem::create([
+            'catalogo_referencia_id' => CatalogoReferencia::query()->where('tipo', 'NOTA_'.$ruta)->firstOrFail()->id,
+            'codigo' => $codigo,
+            'ruta' => $ruta,
+            'categoria' => 'SERVICIO_TECNICO',
+            'descripcion' => 'CIRUGIA '.$codigo,
+            'tarifa_referencia' => $tarifa,
+            'metadatos' => ['servicio' => 'Procedimientos quirurgicos'],
+        ]);
+    }
+
+    /**
+     * Estancia de 19 horas que ingresa a piso desde sala de cirugía, con la cirugía dentro del tramo AH,
+     * la misma autorización y servicio de cirugía urológica (215).
+     *
+     * @return array<string, list<array<string, mixed>>>
+     */
+    private function estanciaQuirurgica(string $codigo = '602001', string $diagnostico = 'C61X'): array
+    {
+        return [
+            'hospitalizacion' => [[
+                'codPrestador' => '9000000102', 'viaIngresoServicioSalud' => '05', 'fechaInicioAtencion' => '2026-09-10 18:00',
+                'fechaEgreso' => '2026-09-11 13:00', 'codDiagnosticoPrincipal' => $diagnostico, 'condicionDestinoUsuarioEgreso' => '01',
+                'numAutorizacion' => 'RTUP', 'consecutivo' => 1,
+            ]],
+            'procedimientos' => [[
+                ...$this->procedimiento($codigo, '2026-09-11 09:00', 2), 'codDiagnosticoPrincipal' => $diagnostico, 'grupoServicios' => '04',
+                'codServicio' => '215', 'viaIngresoServicioSalud' => '05', 'modalidadGrupoServicioTecSal' => '01', 'numAutorizacion' => 'RTUP',
+            ]],
+        ];
+    }
+
+    /**
+     * @param  array<string, list<array<string, mixed>>>  $servicios
+     */
+    private function ripsQuirurgico(array $servicios, string $diagnostico = 'C61X', string $sexo = 'M', string $factura = 'FAC-SEP'): string
+    {
+        return $this->rips($factura, [$this->usuario($diagnostico === 'C53X' ? '200' : '100', $sexo, $servicios)]);
+    }
+
+    /**
+     * Resultado económico de septiembre con R-B apagada o encendida, con un historial administrativo propio.
+     *
+     * @param  array<string, string>  $files
+     * @param  list<array{0: string, 1: string, 2: float}>  $historial
+     * @return array{central: float, condicionado: float, combinado: float, costoA: float, cirugiaPendiente: bool}
+     */
+    private function rbEconomia(User $user, string $ejecucion, array $files, array $historial, string $diagnostico, bool $rb): array
+    {
+        config(['programas.la-maria.excepcion_cirugia_estancia_corta' => $rb]);
+        $informe = $this->administrativeReport($historial, $diagnostico);
+
+        try {
+            $workbook = $this->exportWorkbook($user, $ejecucion, $files, informes: ['INFORME '.strtoupper($ejecucion).'.xlsx' => $informe]);
+        } finally {
+            File::delete($informe);
+        }
+
+        $total = $this->internalComparisonRows($workbook)[strtoupper($ejecucion)]['2026-09']['TOTAL'];
+        $revision = $workbook->getSheetByName('CASOS A REVISAR');
+
+        return [
+            'central' => round((float) $total['ESTIMACION ADMINISTRATIVA CENTRAL'], 2),
+            'condicionado' => round((float) $total['COMPONENTE CONDICIONADO'], 2),
+            'combinado' => round((float) $total['ESTIMACION CON CONDICIONADOS'], 2),
+            'costoA' => round((float) $total['COSTO A'], 2),
+            'cirugiaPendiente' => collect($revision === null ? [] : $this->records($revision))
+                ->contains(static fn (array $fila): bool => str_contains((string) ($fila['MOTIVO'] ?? ''), 'INDEPENDENCIA ECONOMICA SIN ACREDITAR')),
         ];
     }
 
@@ -2485,6 +3113,52 @@ class SeguimientoRutaControllerTest extends TestCase
         $this->assertSame($months($together), [...$months($first), ...$months($second)]);
     }
 
+    /**
+     * Corte 08 de agosto, su continuación de septiembre y bloques que la estimación reconoce en septiembre.
+     *
+     * @return array<string, array{0: string, 1: string, 2: int, 3: int}>
+     */
+    public static function continuacionesDeCorte(): array
+    {
+        return [
+            'estancia de 10 días' => ['2026-08-24 18:00', '2026-09-03 15:00', 1, 0],
+            'estancia de 41 días: solo el cruce de 25 días' => ['2026-08-20 08:00', '2026-09-30 10:00', 2, 1],
+        ];
+    }
+
+    /**
+     * Decisión aprobada (27/10/2026): con el mes anterior en el mismo lote, la estimación
+     * RN-16 no abre un bloque nuevo para la continuación de un corte 08; suma solo los
+     * bloques que la estancia completa alcanza. El costo A conserva el paquete de cada
+     * mes (decisión del 14/10/2026) y septiembre solo, sin agosto, no cambia.
+     */
+    #[DataProvider('continuacionesDeCorte')]
+    public function test_estimate_joins_a_cut_continuation_with_its_previous_month_in_the_same_batch(string $ingreso, string $egreso, int $paquetesLote, int $bloquesEstimados): void
+    {
+        $user = User::factory()->create();
+        $this->createReferenceCatalogs();
+        $agosto = $this->hospitalRips([], $ingreso, '2026-08-31 17:00', '08', 'FAC-AGO');
+        $septiembre = $this->hospitalRips([], '2026-09-01 00:00', $egreso, '01', 'FAC-SEP');
+        $estimacion = fn (Spreadsheet $workbook): array => collect($this->internalComparisonRows($workbook)['PROSTATA'] ?? [])
+            ->map(static fn (array $tipos): float => round((float) ($tipos['AH']['ESTIMACION ADMINISTRATIVA CENTRAL'] ?? 0), 2))->all();
+        $costoActivo = fn (Spreadsheet $workbook): array => collect($this->monthlyRowsWithInternalEconomics($workbook))
+            ->mapWithKeys(static fn (array $row): array => [(string) $row['MES'] => (float) $row['COSTO ACTIVO (A + CONDICIONADO)']])->all();
+
+        $together = $this->exportWorkbook($user, 'prostata', ['agosto.json' => $agosto, 'septiembre.json' => $septiembre]);
+        $alone = $this->exportWorkbook($user, 'prostata', ['septiembre.json' => $septiembre]);
+
+        $this->assertSame([
+            '2026-08' => PoliticaPaqueteHospitalario::VALOR_PAQUETE,
+            '2026-09' => round($bloquesEstimados * PoliticaPaqueteHospitalario::VALOR_PAQUETE, 2),
+        ], $estimacion($together));
+        $this->assertSame([
+            '2026-08' => PoliticaPaqueteHospitalario::VALOR_PAQUETE,
+            '2026-09' => round($paquetesLote * PoliticaPaqueteHospitalario::VALOR_PAQUETE, 2),
+        ], $costoActivo($together), 'El costo A y el libro POR_LOTE no cambian.');
+        $this->assertSame(['2026-09' => round($paquetesLote * PoliticaPaqueteHospitalario::VALOR_PAQUETE, 2)], $estimacion($alone),
+            'Sin agosto en el lote la continuidad no es verificable: conserva sus bloques.');
+    }
+
     private function summaryTotal(Spreadsheet $workbook, string $column): float
     {
         return (float) collect($this->monthlyRowsWithInternalEconomics($workbook))
@@ -2519,7 +3193,7 @@ class SeguimientoRutaControllerTest extends TestCase
     private function rips(string $factura, array $usuarios): string
     {
         return json_encode([
-            'numDocumentoIdObligado' => '890905177',
+            'numDocumentoIdObligado' => '9000000101',
             'numFactura' => $factura,
             'tipoNota' => null,
             'numNota' => null,
@@ -2549,7 +3223,7 @@ class SeguimientoRutaControllerTest extends TestCase
     private function consulta(string $codigo, string $diagnostico, ?string $fecha, int $consecutivo = 1): array
     {
         return array_filter([
-            'codPrestador' => '050010608601',
+            'codPrestador' => '9000000102',
             'fechaInicioAtencion' => $fecha,
             'codConsulta' => $codigo,
             'codDiagnosticoPrincipal' => $diagnostico,
@@ -2564,7 +3238,7 @@ class SeguimientoRutaControllerTest extends TestCase
     private function otroServicio(string $codigo, string $diagnostico, string $fecha, int $consecutivo = 1): array
     {
         return [
-            'codPrestador' => '050010608601',
+            'codPrestador' => '9000000102',
             'fechaSuministroTecnologia' => $fecha,
             'codTecnologiaSalud' => $codigo,
             'nomTecnologiaSalud' => 'Otro servicio',
@@ -2581,7 +3255,7 @@ class SeguimientoRutaControllerTest extends TestCase
     private function medicamento(string $codigo, string $nombre, int $cantidad, int $consecutivo): array
     {
         return [
-            'codPrestador' => '050010608601',
+            'codPrestador' => '9000000102',
             'fechaDispensAdmon' => '2026-07-10 09:00',
             'codDiagnosticoPrincipal' => 'C61X',
             'codTecnologiaSalud' => $codigo,
@@ -2601,7 +3275,7 @@ class SeguimientoRutaControllerTest extends TestCase
     ): string {
         $servicio = match ($tipoServicio) {
             'consultas' => [
-                'codPrestador' => '050010608601',
+                'codPrestador' => '9000000102',
                 'codConsulta' => '890201',
                 'finalidadTecnologiaSalud' => '11',
                 'causaMotivoAtencion' => '38',
@@ -2609,7 +3283,7 @@ class SeguimientoRutaControllerTest extends TestCase
                 'fechaInicioAtencion' => $fechaAtencion,
             ],
             'procedimientos' => [
-                'codPrestador' => '050010608601',
+                'codPrestador' => '9000000102',
                 'codProcedimiento' => '881201',
                 'finalidadTecnologiaSalud' => '11',
                 'causaMotivoAtencion' => '38',
@@ -2617,7 +3291,7 @@ class SeguimientoRutaControllerTest extends TestCase
                 'fechaInicioAtencion' => $fechaAtencion,
             ],
             'otrosServicios' => [
-                'codPrestador' => '050010608601',
+                'codPrestador' => '9000000102',
                 'codTecnologiaSalud' => 'OS-001',
                 'finalidadTecnologiaSalud' => '11',
                 'causaMotivoAtencion' => '38',

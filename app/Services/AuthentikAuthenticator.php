@@ -3,12 +3,13 @@
 namespace App\Services;
 
 use App\Models\User;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use RuntimeException;
 
 class AuthentikAuthenticator
 {
+    public function __construct(private ActivityLogger $activityLogger) {}
+
     public function isConfigured(): bool
     {
         $clientId = config('services.authentik.client_id');
@@ -78,42 +79,51 @@ class AuthentikAuthenticator
     }
 
     /**
-     * Authentik never creates a local user automatically. An administrator must
-     * already have created and activated the matching local account.
+     * Identifica al usuario solo por el subject OIDC verificado que SIRUTA guardó
+     * al aprovisionar o vincular la cuenta. El correo nunca vincula ni reemplaza
+     * identidades, el inicio de sesión no crea usuarios y el rol sale de SIRUTA,
+     * nunca de los claims.
      *
      * @param  array<string, mixed>  $claims
      */
     public function activeUserForClaims(array $claims): ?User
     {
-        $subject = is_string($claims['sub'] ?? null) ? $claims['sub'] : '';
-        $email = is_string($claims['email'] ?? null) ? $claims['email'] : '';
+        $subject = is_string($claims['sub'] ?? null) ? trim($claims['sub']) : '';
 
-        if ($subject === '' || filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+        if ($subject === '') {
+            $this->logRejectedLogin('sin_subject');
+
             return null;
         }
 
-        return DB::transaction(function () use ($subject, $email): ?User {
-            $user = User::query()
-                ->where('authentik_subject', $subject)
-                ->lockForUpdate()
-                ->first();
+        $user = User::query()->where('authentik_subject', $subject)->first();
 
-            if ($user === null) {
-                $user = User::query()
-                    ->whereRaw('LOWER(email) = ?', [strtolower($email)])
-                    ->lockForUpdate()
-                    ->first();
+        if ($user === null) {
+            $this->logRejectedLogin('subject_no_vinculado');
 
-                if ($user === null) {
-                    return null;
-                }
+            return null;
+        }
 
-                $user->authentik_subject = $subject;
-                $user->save();
-            }
+        if (! $user->active || ! $user->authentik_status->allowsLogin()) {
+            $this->logRejectedLogin('usuario_no_autorizado', $user);
 
-            return $user->active ? $user : null;
-        });
+            return null;
+        }
+
+        if ($user->authentik_first_login_at === null) {
+            $user->authentik_first_login_at = now();
+            $user->save();
+        }
+
+        return $user;
+    }
+
+    private function logRejectedLogin(string $reason, ?User $user = null): void
+    {
+        $this->activityLogger->log('login_authentik_rejected', 'Authentik autenticó una cuenta sin acceso a SIRUTA.', [
+            'reason' => $reason,
+            'target_user_id' => $user?->id,
+        ]);
     }
 
     private function codeChallenge(string $codeVerifier): string

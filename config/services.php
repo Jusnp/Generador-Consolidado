@@ -47,6 +47,16 @@ return [
         'scopes' => env('AUTHENTIK_SCOPES', 'openid profile email'),
         'api_base_url' => rtrim((string) env('AUTHENTIK_BASE_URL', ''), '/').'/api/v3',
         'api_token' => env('AUTHENTIK_API_TOKEN'),
+
+        // Modo "Subject mode" del proveedor OIDC de SIRUTA en Authentik:
+        // hashed_user_id (uid), user_id, user_uuid o user_username.
+        'subject_mode' => env('AUTHENTIK_SUBJECT_MODE', 'hashed_user_id'),
+
+        // UUID del grupo exclusivo de SIRUTA al que se agregan las cuentas que SIRUTA crea (opcional).
+        'access_group' => env('AUTHENTIK_ACCESS_GROUP'),
+
+        // Ruta organizativa de las cuentas que SIRUTA crea en Authentik.
+        'user_path' => env('AUTHENTIK_USER_PATH', 'users/siruta'),
     ],
 
 ];

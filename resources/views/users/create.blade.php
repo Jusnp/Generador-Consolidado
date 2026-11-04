@@ -1195,7 +1195,7 @@
                 </h2>
 
                 <p>
-                    Registra una nueva cuenta y define sus permisos de acceso.
+                    Registra la cuenta en SIRUTA y en Authentik, y define sus permisos en SIRUTA.
                 </p>
 
             </div>
@@ -1273,11 +1273,45 @@
 
                         <div class="field">
 
-                            <label for="email">
+                            <label for="cedula">
 
-                                Correo electrónico
+                                Número de cédula
                                 <span class="required">*</span>
 
+                            </label>
+
+                            <input
+                                type="text"
+                                id="cedula"
+                                name="cedula"
+                                value="{{ old('cedula') }}"
+                                placeholder="Solo números, sin puntos"
+                                inputmode="numeric"
+                                pattern="[0-9]{5,15}"
+                                autocomplete="off"
+                                required
+                            >
+
+                            <div class="help">
+                                Será el usuario para ingresar en Authentik. No se puede cambiar después de crear la cuenta.
+                            </div>
+
+                            @error('cedula')
+
+                                <div class="error">
+                                    {{ $message }}
+                                </div>
+
+                            @enderror
+
+                        </div>
+
+
+
+                        <div class="field">
+
+                            <label for="email">
+                                Correo electrónico
                             </label>
 
                             <input
@@ -1287,8 +1321,11 @@
                                 value="{{ old('email') }}"
                                 placeholder="usuario@correo.com"
                                 autocomplete="email"
-                                required
                             >
+
+                            <div class="help">
+                                Opcional. No se usa para iniciar sesión ni para vincular la cuenta.
+                            </div>
 
                             @error('email')
 
@@ -1357,74 +1394,15 @@
 
 
                             <h3>
-                                Contraseña
+                                Cuenta en Authentik
                             </h3>
 
 
                             <p>
-                                Define la contraseña inicial de esta cuenta.
+                                Al guardar, SIRUTA crea la cuenta en Authentik con la cédula como usuario.
+                                La persona define su propia contraseña con un enlace de activación temporal
+                                que generas desde la lista de usuarios. El rol solo aplica dentro de SIRUTA.
                             </p>
-
-
-                            <div class="password-grid">
-
-
-                                <div class="field">
-
-                                    <label for="password">
-
-                                        Contraseña
-                                        <span class="required">*</span>
-
-                                    </label>
-
-                                    <input
-                                        type="password"
-                                        id="password"
-                                        name="password"
-                                        placeholder="Mínimo 8 caracteres"
-                                        autocomplete="new-password"
-                                        required
-                                    >
-
-                                    <div class="help">
-                                        Debe contener al menos 8 caracteres.
-                                    </div>
-
-                                    @error('password')
-
-                                        <div class="error">
-                                            {{ $message }}
-                                        </div>
-
-                                    @enderror
-
-                                </div>
-
-
-
-                                <div class="field">
-
-                                    <label for="password_confirmation">
-
-                                        Confirmar contraseña
-                                        <span class="required">*</span>
-
-                                    </label>
-
-                                    <input
-                                        type="password"
-                                        id="password_confirmation"
-                                        name="password_confirmation"
-                                        placeholder="Repite la contraseña"
-                                        autocomplete="new-password"
-                                        required
-                                    >
-
-                                </div>
-
-
-                            </div>
 
 
                         </div>

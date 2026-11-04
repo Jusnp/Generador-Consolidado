@@ -112,6 +112,9 @@ class ReferenciaRutaMatcher
      */
     private const IUM_LONGITUD_FAMILIA = 10;
 
+    /** IUM que requieren correspondencia comercial exacta antes de aplicar una tarifa. */
+    private const IUM_PROSTATA_SIN_EQUIVALENCIA_ACREDITADA = ['1E1033301000101', '1A1060601000101'];
+
     private PoliticaDispensacion $politicaDispensacion;
 
     /**
@@ -122,7 +125,8 @@ class ReferenciaRutaMatcher
     /**
      * @param  Collection<int, CatalogoReferencia>|null  $catalogos
      */
-    public function __construct(?Collection $catalogos = null, ?string $rutaEjecucion = null, ?PoliticaDispensacion $politicaDispensacion = null)
+    public function __construct(?Collection $catalogos = null, ?string $rutaEjecucion = null, ?PoliticaDispensacion $politicaDispensacion = null,
+        private bool $exigirIumAcreditado = false)
     {
         $this->politicaDispensacion = $politicaDispensacion ?? PoliticaDispensacion::configurada();
 
@@ -219,6 +223,8 @@ class ReferenciaRutaMatcher
                 }
             }
         }
+
+        $this->restoreTechnicalCupsLeadingZero();
 
         if (app()->bound('db')) {
             ReferenciaManual::query()
@@ -903,6 +909,18 @@ class ReferenciaRutaMatcher
             $reference = $byIum[0];
         }
 
+        if ($this->exigirIumAcreditado && $route === LaMariaPrograma::RUTA_PROSTATA
+            && in_array($code, self::IUM_PROSTATA_SIN_EQUIVALENCIA_ACREDITADA, true)) {
+            return $result(
+                $reference === null ? 'AMBIGUO' : 'MUESTRA_MEDICA',
+                $reference === null ? FormaCruce::SinCruce->value : FormaCruce::IumExacto->value,
+                null,
+                [],
+                'CORRESPONDENCIA COMERCIAL EXACTA NO ACREDITADA PARA IUM '.$code.'; DISPENSACION DEL MISMO PERIODO NO DEMUESTRA EQUIVALENCIA DEL CODIGO.',
+                $reference === null ? [] : [$reference],
+            );
+        }
+
         $principios = $this->principioCandidates((string) ($record['nombreServicio'] ?? ''));
 
         if ($reference !== null) {
@@ -1557,6 +1575,49 @@ class ReferenciaRutaMatcher
             'tarifaReferencia' => $rate,
             'metadatos' => $item->metadatos ?? [],
         ];
+    }
+
+    /**
+     * Un CUPS tiene seis caracteres. Si la nota técnica se cargó desde una celda
+     * numérica, el código pierde el cero inicial (053101 → 53101) y deja de
+     * cruzar con el RIPS. Solo se restablece cuando el código oficial de seis
+     * dígitos (Anexo 2) existe y describe el mismo procedimiento; la clave
+     * original se conserva y el código de la fuente queda en los metadatos.
+     */
+    private function restoreTechnicalCupsLeadingZero(): void
+    {
+        $restored = function (array $entry): ?array {
+            $code = (string) ($entry['codigo'] ?? '');
+
+            if (preg_match('/^\d{5}$/', $code) !== 1 || ! in_array($entry['catalogoTipo'] ?? '', [
+                CatalogoReferenciaImporter::TYPE_NOTA_CERVIX,
+                CatalogoReferenciaImporter::TYPE_NOTA_PROSTATA,
+            ], true)) {
+                return null;
+            }
+
+            $official = $this->officialCodes['ANEXO_2']['0'.$code] ?? null;
+
+            if ($official === null || $this->normaliseText((string) $official['descripcion']) !== $this->normaliseText((string) $entry['descripcion'])) {
+                return null;
+            }
+
+            return [...$entry, 'codigo' => '0'.$code, 'metadatos' => [...$entry['metadatos'], 'codigo_fuente' => $code]];
+        };
+
+        foreach ($this->technicalReferences as $index => $entry) {
+            $this->technicalReferences[$index] = $restored($entry) ?? $entry;
+        }
+
+        foreach ($this->technicalCodes as $route => $entries) {
+            foreach ($entries as $entry) {
+                $entry = $restored($entry);
+
+                if ($entry !== null && ! isset($this->technicalCodes[$route][$entry['codigo']])) {
+                    $this->technicalCodes[$route][$entry['codigo']] = $entry;
+                }
+            }
+        }
     }
 
     /**

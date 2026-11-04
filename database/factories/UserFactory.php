@@ -2,6 +2,7 @@
 
 namespace Database\Factories;
 
+use App\Models\AuthentikStatus;
 use App\Models\User;
 use Illuminate\Database\Eloquent\Factories\Factory;
 use Illuminate\Support\Facades\Hash;
@@ -40,6 +41,33 @@ class UserFactory extends Factory
     {
         return $this->state(fn (array $attributes) => [
             'email_verified_at' => null,
+        ]);
+    }
+
+    /**
+     * Usuario con cuenta creada por SIRUTA en Authentik.
+     */
+    public function provisionedInAuthentik(): static
+    {
+        return $this->state(fn (array $attributes) => [
+            'cedula' => fake()->unique()->numerify('##########'),
+            'authentik_subject' => hash('sha256', Str::random(32)),
+            'authentik_pk' => fake()->unique()->numberBetween(1000, 999999),
+            'authentik_uuid' => (string) Str::uuid(),
+            'authentik_status' => AuthentikStatus::Provisioned,
+            'authentik_provisioning_key' => (string) Str::uuid(),
+            'authentik_provisioned_at' => now(),
+        ]);
+    }
+
+    /**
+     * Usuario vinculado a una cuenta preexistente de Authentik.
+     */
+    public function linkedToAuthentik(): static
+    {
+        return $this->state(fn (array $attributes) => [
+            'authentik_subject' => hash('sha256', Str::random(32)),
+            'authentik_status' => AuthentikStatus::Linked,
         ]);
     }
 }

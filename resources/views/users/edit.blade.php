@@ -1310,7 +1310,10 @@
                         </div>
 
                         <div class="summary-email">
-                            {{ $user->email }}
+                            {{ $user->cedula ? 'Cédula '.$user->cedula : 'Sin cédula registrada' }}
+                            @if ($user->email)
+                                · {{ $user->email }}
+                            @endif
                         </div>
 
                     </div>
@@ -1392,11 +1395,54 @@
 
                         <div class="field">
 
+                            <label for="cedula">
+
+                                Número de cédula
+                                @if ($user->cedula !== null)
+                                    <span class="required">*</span>
+                                @endif
+
+                            </label>
+
+
+                            <input
+                                type="text"
+                                id="cedula"
+                                name="cedula"
+                                value="{{ old('cedula', $user->cedula) }}"
+                                inputmode="numeric"
+                                pattern="[0-9]{5,15}"
+                                autocomplete="off"
+                                @if (! $user->canChangeCedula()) readonly @endif
+                                @if ($user->cedula !== null) required @endif
+                            >
+
+
+                            <div class="help">
+                                @if ($user->canChangeCedula())
+                                    Usuario para ingresar en Authentik. Solo números, sin puntos.
+                                @else
+                                    No se puede cambiar: ya identifica la cuenta de Authentik.
+                                @endif
+                            </div>
+
+
+                            @error('cedula')
+
+                                <div class="error">
+                                    {{ $message }}
+                                </div>
+
+                            @enderror
+
+                        </div>
+
+
+
+                        <div class="field">
+
                             <label for="email">
-
                                 Correo electrónico
-                                <span class="required">*</span>
-
                             </label>
 
 
@@ -1405,8 +1451,12 @@
                                 id="email"
                                 name="email"
                                 value="{{ old('email', $user->email) }}"
-                                required
                             >
+
+
+                            <div class="help">
+                                Opcional. Solo se actualiza en SIRUTA; no cambia la cuenta de Authentik.
+                            </div>
 
 
                             @error('email')
@@ -1455,7 +1505,7 @@
 
 
                             <div class="help">
-                                Puedes cambiar los permisos de esta cuenta.
+                                El rol solo aplica dentro de SIRUTA; no cambia permisos en Authentik.
                             </div>
 
 
@@ -1475,65 +1525,17 @@
 
 
                             <h3>
-                                Cambiar contraseña
+                                Cuenta en Authentik: {{ $user->authentik_status->label() }}
                             </h3>
 
 
                             <p>
-                                Déjala en blanco si quieres conservar la contraseña actual.
+                                Authentik es compartido con otras aplicaciones: estos cambios solo se guardan en SIRUTA.
+                                La contraseña se define en Authentik con el enlace de activación, nunca desde aquí.
+                                @if ($user->authentik_sync_error)
+                                    <br>{{ $user->authentik_sync_error }}
+                                @endif
                             </p>
-
-
-                            <div class="password-grid">
-
-
-                                <div class="field">
-
-                                    <label for="password">
-                                        Nueva contraseña
-                                    </label>
-
-
-                                    <input
-                                        type="password"
-                                        id="password"
-                                        name="password"
-                                        placeholder="Mínimo 8 caracteres"
-                                        autocomplete="new-password"
-                                    >
-
-
-                                    @error('password')
-
-                                        <div class="error">
-                                            {{ $message }}
-                                        </div>
-
-                                    @enderror
-
-                                </div>
-
-
-
-                                <div class="field">
-
-                                    <label for="password_confirmation">
-                                        Confirmar nueva contraseña
-                                    </label>
-
-
-                                    <input
-                                        type="password"
-                                        id="password_confirmation"
-                                        name="password_confirmation"
-                                        placeholder="Repite la nueva contraseña"
-                                        autocomplete="new-password"
-                                    >
-
-                                </div>
-
-
-                            </div>
 
 
                         </div>

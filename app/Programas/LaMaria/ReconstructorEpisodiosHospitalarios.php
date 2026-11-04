@@ -49,6 +49,21 @@ class ReconstructorEpisodiosHospitalarios
 
     public const ESTADO_CONTINUIDAD_NO_CONFIRMADA = 'CONTINUIDAD_NO_CONFIRMADA';
 
+    /** Continuación de un corte 08 del mes anterior unida en el mismo lote (estimación RN-16). */
+    public const CONTINUACION_UNIDA = 'CONTINUACION_UNIDA_CON_MES_ANTERIOR';
+
+    /** Estancia que inicia el día 1 a las 00:00 sin corte 08 previo en los RIPS del mes anterior cargado. */
+    public const INICIO_SIN_CORTE_PREVIO = 'INICIO_DIA_1_SIN_CORTE_08_PREVIO';
+
+    /** Estancia que inicia el día 1 a las 00:00 sin el mes anterior en el lote. */
+    public const INICIO_SIN_MES_ANTERIOR = 'INICIO_DIA_1_SIN_MES_ANTERIOR_EN_EL_LOTE';
+
+    /** Historial hospitalario: estancia del día 1 a las 00:00 sin antecedente del mes anterior (bloques condicionados). */
+    public const INICIO_SIN_ANTECEDENTE = 'INICIO_DIA_1_SIN_ANTECEDENTE_HOSPITALARIO';
+
+    /** Historial hospitalario: continuación unida a un antecedente incompleto o a una estancia pendiente de soporte (bloques condicionados). */
+    public const CONTINUACION_NO_COMPROBADA = 'CONTINUACION_CON_ANTECEDENTE_NO_COMPROBADO';
+
     public const TIPO_HOSPITALIZACION = 'HOSPITALIZACION';
 
     public const TIPO_URGENCIA = 'URGENCIA';

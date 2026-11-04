@@ -6,7 +6,9 @@ use App\Http\Controllers\CatalogoReferenciaController;
 use App\Http\Controllers\JsonExcelController;
 use App\Http\Controllers\ProgramaController;
 use App\Http\Controllers\SeguimientoRutaController;
+use App\Http\Controllers\UserAuthentikController;
 use App\Http\Controllers\UserController;
+use App\Http\Middleware\EnsureUserIsActive;
 use Illuminate\Support\Facades\Route;
 
 Route::redirect('/', '/login');
@@ -28,7 +30,7 @@ Route::get('/auth/authentik/redirect', [AuthController::class, 'redirectToAuthen
 Route::get('/auth/authentik/callback', [AuthController::class, 'authentikCallback'])
     ->name('authentik.callback');
 
-Route::middleware('auth')->group(function () {
+Route::middleware(['auth', EnsureUserIsActive::class])->group(function () {
     Route::get('/programas/{programa}', [ProgramaController::class, 'show'])
         ->name('programas.show');
 
@@ -152,12 +154,36 @@ Route::middleware('auth')->group(function () {
         | Gestión de usuarios
         */
 
-        Route::resource('users', UserController::class);
+        Route::resource('users', UserController::class)->except(['show']);
 
         Route::patch(
             '/users/{user}/toggle-active',
             [UserController::class, 'toggleActive']
         )->name('users.toggle-active');
+
+        /*
+        | Identidad en Authentik (compartido con otras aplicaciones)
+        */
+
+        Route::post(
+            '/users/{user}/authentik/provision',
+            [UserAuthentikController::class, 'provision']
+        )->name('users.authentik.provision');
+
+        Route::post(
+            '/users/{user}/authentik/link',
+            [UserAuthentikController::class, 'link']
+        )->name('users.authentik.link');
+
+        Route::post(
+            '/users/{user}/authentik/unlink',
+            [UserAuthentikController::class, 'unlink']
+        )->name('users.authentik.unlink');
+
+        Route::post(
+            '/users/{user}/authentik/activation-link',
+            [UserAuthentikController::class, 'activationLink']
+        )->middleware('throttle:10,1')->name('users.authentik.activation-link');
 
         /*
         | Registro de actividad

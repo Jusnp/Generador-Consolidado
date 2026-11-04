@@ -3,14 +3,19 @@
 namespace App\Services;
 
 use App\Programas\LaMaria\AlmacenContinuidadHospitalaria;
+use App\Programas\LaMaria\AntecedenteHospitalario;
+use App\Programas\LaMaria\CierreHospitalarioPeriodo;
 use App\Programas\LaMaria\ClaseCosto;
 use App\Programas\LaMaria\CondicionArchivo;
 use App\Programas\LaMaria\DecisionPaqueteHospitalario;
+use App\Programas\LaMaria\EstadoAntecedenteHospitalario;
 use App\Programas\LaMaria\EstadoClinico;
 use App\Programas\LaMaria\EstadoDuplicidad;
+use App\Programas\LaMaria\EstadoEstanciaHospitalaria;
 use App\Programas\LaMaria\EstadoTarifario;
 use App\Programas\LaMaria\FormaCruce;
 use App\Programas\LaMaria\FuenteTarifa;
+use App\Programas\LaMaria\HistorialHospitalario;
 use App\Programas\LaMaria\LibroPaquetesHospitalarios;
 use App\Programas\LaMaria\OrigenRuta;
 use App\Programas\LaMaria\PoliticaPaqueteHospitalario;
@@ -36,12 +41,33 @@ class SeguimientoRutaClassifier
     private array $paquetesSumadosPorSegmento = [];
 
     /**
+     * Contexto RIPS de las estancias del lote para acreditar la cirugía de una
+     * estancia corta: vía de ingreso de cada registro AH, urgencias AU por
+     * paciente y primeros segmentos de las continuaciones unidas a su corte 08.
+     *
+     * @var array{vias: array<string, string>, urgencias: array<string, list<array{inicio: string, fin: string}>>, continuaciones: array<string, true>|null}
+     */
+    private array $contextoEstancias = ['vias' => [], 'urgencias' => [], 'continuaciones' => null];
+
+    /**
      * Libro de paquetes persistente (modo PERSISTENTE): segmentos ya conocidos,
      * inicio del libro por ruta y si la carga es una corrección autorizada.
      *
      * @var array{almacen: AlmacenContinuidadHospitalaria, inicioPorRuta: array<string, string>, esCorreccion: bool}|null
      */
     private ?array $libroPersistente = null;
+
+    /**
+     * Historial hospitalario versionado (programas.la-maria.historial_hospitalario.modo = ACTIVO):
+     * la estimación RN-16 de cada mes usa el cierre del mes anterior, calculado en la misma carga
+     * o guardado. Guarda la traza de antecedentes usados y los cierres provisionales de la carga.
+     *
+     * @var array{historial: HistorialHospitalario, cierre: CierreHospitalarioPeriodo, traza: list<array<string, mixed>>, cierres: array<string, array<string, AntecedenteHospitalario>>, origen: array{clave: string, lista: list<array{factura: string, archivo: string, sha256: string}>}|null, comprobados: array<string, AntecedenteHospitalario|null>}|null
+     */
+    private ?array $historialHospitalario = null;
+
+    /** @var list<array<string, mixed>> Archivos de la última reconstrucción hospitalaria. */
+    private array $archivosHospitalarios = [];
 
     /**
      * Modo PERSISTENTE: la reconstrucción de episodios usa también los segmentos
@@ -55,6 +81,25 @@ class SeguimientoRutaClassifier
     {
         $this->libroPersistente = ['almacen' => $almacen, 'inicioPorRuta' => $inicioPorRuta, 'esCorreccion' => $esCorreccion];
         $this->hospitalEpisodes['key'] = null;
+    }
+
+    /**
+     * Activa el historial hospitalario versionado en la estimación (solo POR_LOTE).
+     */
+    public function usarHistorialHospitalario(HistorialHospitalario $historial, CierreHospitalarioPeriodo $cierre): void
+    {
+        $this->historialHospitalario = ['historial' => $historial, 'cierre' => $cierre, 'traza' => [], 'cierres' => [], 'origen' => null, 'comprobados' => []];
+        $this->contextoEstancias['continuaciones'] = null;
+    }
+
+    /**
+     * Antecedente usado y estado del cierre de cada ruta y período de la carga.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function trazaHistorialHospitalario(): array
+    {
+        return $this->historialHospitalario['traza'] ?? [];
     }
 
     public function __construct(
@@ -619,6 +664,12 @@ class SeguimientoRutaClassifier
         }
 
         $segmentos = [];
+        $contexto = ['vias' => [], 'urgencias' => [], 'continuaciones' => null];
+        $this->archivosHospitalarios = $files;
+
+        if ($this->historialHospitalario !== null) {
+            $this->historialHospitalario['comprobados'] = [];
+        }
 
         foreach ($files as $file) {
             $factura = $file['factura'] ?? $this->scalarFromJsonFile($file['path'], '/numFactura');
@@ -633,6 +684,15 @@ class SeguimientoRutaClassifier
                 $tipo = $this->stringValue($usuario['tipoDocumentoIdentificacion'] ?? null);
                 $documento = $this->stringValue($usuario['numDocumentoIdentificacion'] ?? null);
                 $consultasUrgencia = [];
+
+                foreach ($usuario['servicios']['urgencias'] ?? [] as $urgencia) {
+                    if (is_array($urgencia)) {
+                        $contexto['urgencias'][strtoupper($tipo).'|'.$documento][] = [
+                            'inicio' => $this->firstStringValue($urgencia, ['fechaInicioAtencion']),
+                            'fin' => $this->firstStringValue($urgencia, ['fechaEgreso']),
+                        ];
+                    }
+                }
 
                 foreach ($usuario['servicios']['consultas'] ?? [] as $consulta) {
                     $codigo = is_array($consulta) ? $this->serviceCode('consultas', $consulta) : '';
@@ -652,6 +712,7 @@ class SeguimientoRutaClassifier
                     }
 
                     $segmento = $this->hospitalizationSegment($hospitalizacion, $file['fileName'].'|'.$position.'|'.$indice);
+                    $contexto['vias'][$segmento['clave']] = $this->stringValue($hospitalizacion['viaIngresoServicioSalud'] ?? null);
                     $segmentos[] = [
                         ...$segmento,
                         'paciente' => $tipo === '' || $documento === ''
@@ -720,12 +781,107 @@ class SeguimientoRutaClassifier
             }
         }
 
+        $this->contextoEstancias = $contexto;
+
         return $this->hospitalEpisodes = [
             'key' => $key,
             'episodios' => $episodios,
             'porSegmento' => $porSegmento,
             'segmentos' => array_column($segmentos, null, 'clave'),
         ];
+    }
+
+    /**
+     * RN-16 en la estimación económica. En POR_LOTE cada mes reconstruye sus
+     * estancias por separado (decisión del 14/10/2026), de modo que la
+     * continuación de un corte 08 abre un bloque nuevo aunque la estancia no
+     * haya superado 25 días. Con el mes anterior en el mismo lote, la estancia
+     * se une con las reglas del reconstructor (misma autorización, fechas
+     * contiguas, único candidato) y el mes de la continuación suma solo los
+     * bloques que la estancia completa alcanza al cierre del mes, menos los ya
+     * reconocidos antes. El primer mes, el libro y el costo A no cambian.
+     *
+     * Una estancia que inicia el día 1 a las 00:00 sin corte 08 previo unido
+     * conserva sus bloques y se informa como continuidad no verificable.
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     * @param  array<int, array<string, mixed>>  $profiles
+     * @return list<array{ruta: string, mes: string, documento: string, inicio: string, fin: string, bloquesLote: int, bloquesEstancia: int, ajuste: int, motivo: string}>
+     */
+    public function continuidadesEntreMeses(array $files, array $profiles = []): array
+    {
+        if ($this->libroPersistente !== null) {
+            return [];
+        }
+
+        if ($this->historialHospitalario !== null) {
+            return $this->continuidadesConHistorial($files, $profiles);
+        }
+
+        $hospital = $this->hospitalEpisodesForFiles($files, $profiles);
+        $segmentos = $hospital['segmentos'];
+        $mesesCargados = array_flip(array_map(fn (array $segmento): string => $this->reportingMonth((string) $segmento['inicio']), $segmentos));
+
+        foreach ($profiles as $profile) {
+            $mesesCargados[(string) ($profile['mesAtencion'] ?? '')] = true;
+        }
+
+        $continuidades = [];
+        $continuaciones = [];
+        $registro = static fn (array $segmento, string $mes, string $inicio, string $fin, int $lote, int $estancia, string $motivo): array => [
+            'ruta' => (string) ($segmento['ruta'] ?? ''), 'mes' => $mes, 'documento' => (string) ($segmento['documento'] ?? ''),
+            'inicio' => $inicio, 'fin' => $fin, 'bloquesLote' => $lote, 'bloquesEstancia' => $estancia, 'ajuste' => $estancia - $lote, 'motivo' => $motivo,
+        ];
+
+        foreach ((new ReconstructorEpisodiosHospitalarios($this->politicaPaquete))->reconstruir(array_values($segmentos)) as $estancia) {
+            $porMes = [];
+
+            foreach ($estancia['segmentosOrdenados'] as $ordenado) {
+                $porMes[$this->reportingMonth($ordenado['inicio'])][] = $ordenado;
+            }
+
+            if (count($porMes) < 2 || $estancia['excluido']) {
+                continue;
+            }
+
+            ksort($porMes);
+            $reconocidos = null;
+
+            foreach ($porMes as $mes => $ordenados) {
+                $episodiosLote = array_unique(array_map(static fn (array $ordenado): int => $hospital['porSegmento'][$ordenado['clave']], $ordenados));
+                $bloquesLote = array_sum(array_map(static fn (int $indice): int => (int) $hospital['episodios'][$indice]['paquetes'], $episodiosLote));
+
+                // El primer mes conserva lo que reconoció su lote; los siguientes, lo que añade la estancia completa.
+                if ($reconocidos === null) {
+                    $reconocidos = $bloquesLote;
+
+                    continue;
+                }
+
+                $conocidos = $this->politicaPaquete->paquetesPorEstancia((string) $estancia['inicio'], $ordenados[array_key_last($ordenados)]['fin']) ?? 0;
+                $bloquesEstancia = max(0, $conocidos - $reconocidos);
+                $reconocidos += $bloquesEstancia;
+                $continuaciones[$ordenados[0]['clave']] = true;
+                $continuidades[] = $registro($segmentos[$ordenados[0]['clave']], (string) $mes, (string) $estancia['inicio'],
+                    $ordenados[array_key_last($ordenados)]['fin'], $bloquesLote, $bloquesEstancia, ReconstructorEpisodiosHospitalarios::CONTINUACION_UNIDA);
+            }
+        }
+
+        foreach ($hospital['episodios'] as $episodio) {
+            $clave = $episodio['segmentosOrdenados'][0]['clave'] ?? '';
+            $inicio = (string) $episodio['inicio'];
+
+            if ($clave === '' || isset($continuaciones[$clave]) || $episodio['excluido'] || substr($inicio, 8, 8) !== '01 00:00') {
+                continue;
+            }
+
+            $mes = $this->reportingMonth($inicio);
+            $anterior = date('Y-m', strtotime($mes.'-01 -1 month'));
+            $continuidades[] = $registro($segmentos[$clave], $mes, $inicio, (string) $episodio['fin'], (int) $episodio['paquetes'], (int) $episodio['paquetes'],
+                isset($mesesCargados[$anterior]) ? ReconstructorEpisodiosHospitalarios::INICIO_SIN_CORTE_PREVIO : ReconstructorEpisodiosHospitalarios::INICIO_SIN_MES_ANTERIOR);
+        }
+
+        return $continuidades;
     }
 
     /**
@@ -1237,7 +1393,7 @@ class SeguimientoRutaClassifier
         if ($episodio !== null && ! $isHospitalization && ! $isNotAssignable
             && $episodio['estado'] !== ReconstructorEpisodiosHospitalarios::ESTADO_SIN_FECHAS) {
             $tratamiento = $episodio['tipo'] === ReconstructorEpisodiosHospitalarios::TIPO_URGENCIA
-                ? $this->urgencyTreatment($record, $episodio, $tarifaUrgencia)
+                ? $this->urgencyTreatment($record, $episodio, $tarifaUrgencia, $reference, $duplicidad, (string) $profile['ruta'])
                 : $this->politicaPaquete->clasificar(
                     (string) $record['tipoServicio'],
                     (string) $record['codigo'],
@@ -1338,13 +1494,15 @@ class SeguimientoRutaClassifier
      * Estancia de menos de 24 horas: se trata como urgencia al valor pactado.
      * Solo hay tarifa si el episodio tiene una única consulta de urgencias con
      * tarifa en la ruta; esa consulta es el cobro y lo demás queda incluido.
-     * Sin esa tarifa nada del episodio suma como costo contractual.
+     * Sin esa tarifa nada del episodio suma como costo contractual, salvo la
+     * cirugía acreditada del episodio cuando R-B está autorizada.
      *
      * @param  array<string, mixed>  $record
      * @param  array<string, mixed>  $episodio
+     * @param  array<string, mixed>  $reference
      * @return array{decision: DecisionPaqueteHospitalario, categoria: string, fuente: string}
      */
-    private function urgencyTreatment(array $record, array $episodio, ?float $tarifaUrgencia): array
+    private function urgencyTreatment(array $record, array $episodio, ?float $tarifaUrgencia, array $reference = [], string $duplicidad = '', string $ruta = ''): array
     {
         $consulta = $episodio['consultaUrgencia'];
         $isUrgencyConsult = $consulta !== null
@@ -1365,12 +1523,345 @@ class SeguimientoRutaClassifier
                 'categoria' => 'INCLUIDO EN LA URGENCIA',
                 'fuente' => 'URGENCIA',
             ],
-            default => [
+            default => $this->cirugiaDelEpisodio($record, $episodio, $reference, $duplicidad, $ruta) ?? [
                 'decision' => DecisionPaqueteHospitalario::UrgenciaTarifaPendiente,
                 'categoria' => 'URGENCIA SIN TARIFA DEFINIDA',
                 'fuente' => 'URGENCIA',
             ],
         };
+    }
+
+    /**
+     * R-B (programas.la-maria.excepcion_cirugia_estancia_corta, desactivada por
+     * defecto): la cirugía de una estancia de menos de 24 horas recibe el
+     * tratamiento de la política hospitalaria —excepción cobrable por fuera, como
+     * en una estancia de 24 horas o más— solo si el RIPS acredita que pertenece
+     * al episodio. Exige procedimiento quirúrgico de la nota con su tarifa,
+     * autorización del registro AH que la contiene, ingreso AH desde sala de
+     * cirugía (vía 05), servicio quirúrgico habilitado (2xx), ninguna AU que la
+     * contenga, episodio sin paquete, línea sin duplicidad y, si la estancia
+     * inicia el día 1 a las 00:00, su continuación unida al corte 08 anterior.
+     * Sin esa evidencia la cirugía sigue pendiente con la urgencia.
+     *
+     * @param  array<string, mixed>  $record
+     * @param  array<string, mixed>  $episodio
+     * @param  array<string, mixed>  $reference
+     * @return array{decision: DecisionPaqueteHospitalario, categoria: string, fuente: string}|null
+     */
+    private function cirugiaDelEpisodio(array $record, array $episodio, array $reference, string $duplicidad, string $ruta = ''): ?array
+    {
+        if (! (bool) config('programas.la-maria.excepcion_cirugia_estancia_corta', false)
+            || $record['tipoServicio'] !== 'procedimientos'
+            || (string) ($record['grupoServicios'] ?? '') !== '04'
+            || $reference === []) {
+            return null;
+        }
+
+        $segmento = $this->hospitalEpisodes['segmentos'][(string) ($record['segmentoHospitalario'] ?? '')] ?? null;
+        $autorizacion = mb_strtoupper(trim((string) ($record['autorizacion'] ?? '')));
+        $politica = $this->politicaPaquete->clasificar(
+            'procedimientos',
+            (string) $record['codigo'],
+            (string) ($reference['descripcionOficial'] ?: $reference['nombreNotaTecnica']),
+            (string) $reference['atc'],
+            (string) $reference['servicioNotaTecnica'],
+            (string) $reference['agrupadorNotaTecnica']
+        );
+        $acreditada = $segmento !== null
+            && $politica['decision'] === DecisionPaqueteHospitalario::CobrablePorFuera
+            && $politica['categoria'] === 'PROCEDIMIENTO QUIRURGICO'
+            && $reference['fuenteTarifa'] === FuenteTarifa::NotaTecnica->value
+            && $reference['estadoTarifario'] === EstadoTarifario::ConTarifa->value
+            && $autorizacion !== ''
+            && $autorizacion === mb_strtoupper(trim((string) $segmento['autorizacion']))
+            && ($this->contextoEstancias['vias'][$segmento['clave']] ?? '') === '05'
+            && preg_match('/^2\d{2}$/', (string) ($record['codServicio'] ?? '')) === 1
+            && (int) $episodio['paquetes'] === 0
+            && $duplicidad === EstadoDuplicidad::Ninguno->value
+            && ! $this->urgenciaContiene((string) $segmento['paciente'], (string) $record['fechaAtencion'])
+            && $this->continuacionVerificada($episodio, $ruta);
+
+        return $acreditada ? $politica : null;
+    }
+
+    private function urgenciaContiene(string $paciente, string $fecha): bool
+    {
+        foreach ($this->contextoEstancias['urgencias'][$paciente] ?? [] as $urgencia) {
+            if ($fecha !== '' && $urgencia['inicio'] !== '' && $urgencia['inicio'] <= $fecha
+                && $fecha <= ($urgencia['fin'] !== '' ? $urgencia['fin'] : $urgencia['inicio'])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Una estancia que inicia el día 1 a las 00:00 es la continuación de un corte
+     * 08: solo es verificable si se une a ese corte del mes anterior, en el lote
+     * (POR_LOTE) o en el libro persistente, donde el episodio ya incluye el mes
+     * anterior y no inicia el día 1.
+     *
+     * @param  array<string, mixed>  $episodio
+     */
+    private function continuacionVerificada(array $episodio, string $ruta = ''): bool
+    {
+        if (substr((string) $episodio['inicio'], 8, 8) !== '01 00:00') {
+            return true;
+        }
+
+        if ($this->contextoEstancias['continuaciones'] === null) {
+            $continuaciones = [];
+
+            if ($this->libroPersistente === null) {
+                foreach ((new ReconstructorEpisodiosHospitalarios($this->politicaPaquete))->reconstruir(array_values($this->hospitalEpisodes['segmentos'])) as $estancia) {
+                    $primerosPorMes = [];
+
+                    foreach ($estancia['segmentosOrdenados'] as $ordenado) {
+                        $primerosPorMes[$this->reportingMonth($ordenado['inicio'])] ??= $ordenado['clave'];
+                    }
+
+                    ksort($primerosPorMes);
+
+                    foreach ($estancia['excluido'] ? [] : array_slice($primerosPorMes, 1) as $clave) {
+                        $continuaciones[$clave] = true;
+                    }
+                }
+            }
+
+            $this->contextoEstancias['continuaciones'] = $continuaciones;
+        }
+
+        return isset($this->contextoEstancias['continuaciones'][$episodio['segmentosOrdenados'][0]['clave'] ?? ''])
+            || $this->continuacionEnHistorial($episodio, $ruta);
+    }
+
+    /**
+     * Con el historial activo, el tramo del día 1 también es verificable si continúa una estancia verificada
+     * del cierre comprobado del mes anterior con las mismas reglas que la estimación (CierreHospitalarioPeriodo):
+     * misma ruta (la del caso evaluado o la del segmento), paciente con tipo y número de documento, autorización,
+     * prestador y corte 08 del día anterior, un solo candidato y un solo tramo de la carga que lo reclama. Solo
+     * si la ruta no se conoce se busca en los cierres de las dos rutas.
+     *
+     * @param  array<string, mixed>  $episodio
+     */
+    private function continuacionEnHistorial(array $episodio, string $ruta = ''): bool
+    {
+        $primero = $this->hospitalEpisodes['segmentos'][$episodio['segmentosOrdenados'][0]['clave'] ?? ''] ?? null;
+
+        if ($this->historialHospitalario === null || $primero === null) {
+            return false;
+        }
+
+        $cierre = $this->historialHospitalario['cierre'];
+        $inicio = (string) $episodio['inicio'];
+        $ruta = $ruta !== '' ? $ruta : (string) ($primero['ruta'] ?? '');
+        $candidatas = [];
+
+        foreach ($ruta !== '' ? [$ruta] : [RutaCalculo::Prostata->value, RutaCalculo::Cervix->value] as $rutaAntecedente) {
+            foreach ($this->antecedenteComprobado($rutaAntecedente, CierreHospitalarioPeriodo::mesAnterior($this->reportingMonth($inicio)))?->abiertas() ?? [] as $previa) {
+                if ($cierre->continua($previa, $primero, $inicio)) {
+                    $candidatas[] = $previa;
+                }
+            }
+        }
+
+        if (count($candidatas) !== 1 || ! EstadoEstanciaHospitalaria::from((string) $candidatas[0]['estado'])->verificada()) {
+            return false;
+        }
+
+        $reclamos = array_filter($this->hospitalEpisodes['episodios'], fn (array $otro): bool => ! $otro['excluido'] && $cierre->continua(
+            $candidatas[0], $this->hospitalEpisodes['segmentos'][$otro['segmentosOrdenados'][0]['clave'] ?? ''] ?? [], (string) $otro['inicio']));
+
+        return count($reclamos) === 1;
+    }
+
+    /**
+     * Cierre guardado vigente de la ruta y el período, solo si está comprobado frente a los archivos de la carga.
+     */
+    private function antecedenteComprobado(string $ruta, string $periodo): ?AntecedenteHospitalario
+    {
+        $clave = $ruta.'|'.$periodo;
+
+        if (! array_key_exists($clave, $this->historialHospitalario['comprobados'])) {
+            ['historial' => $historial, 'cierre' => $cierre] = $this->historialHospitalario;
+            $antecedente = $historial->vigente($ruta, $periodo);
+            $this->historialHospitalario['comprobados'][$clave] = $antecedente !== null
+                && $cierre->estadoAntecedente($antecedente, $historial, $this->origenArchivos($this->archivosHospitalarios)) === EstadoAntecedenteHospitalario::Comprobado
+                    ? $antecedente : null;
+        }
+
+        return $this->historialHospitalario['comprobados'][$clave];
+    }
+
+    /**
+     * RN-16 con historial: cada ruta procesa sus meses en orden cronológico. El antecedente de un mes es el
+     * cierre del mes anterior calculado en esta carga cuando la carga trae sus facturas (todas las del cierre
+     * guardado, si lo hay) o, si no, el cierre vigente guardado. El resultado no depende del orden de los
+     * archivos ni de cargar juntos los meses anteriores, y cada cierre solo toma como origen las facturas de su
+     * propio período.
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     * @param  array<int, array<string, mixed>>  $profiles
+     * @return list<array<string, mixed>>
+     */
+    private function continuidadesConHistorial(array $files, array $profiles): array
+    {
+        ['historial' => $historial, 'cierre' => $cierre] = $this->historialHospitalario;
+        ['episodios' => $porRuta, 'segmentos' => $segmentos] = $this->episodiosPorRutaYMes($files, $profiles);
+        $origen = $this->origenArchivos($files);
+        $periodos = $this->periodosDeFacturas($files, $profiles);
+        $continuidades = [];
+        $this->historialHospitalario['traza'] = [];
+        $this->historialHospitalario['cierres'] = [];
+
+        foreach ($porRuta as $ruta => $meses) {
+            $calculados = [];
+
+            foreach ($meses as $mes => $episodios) {
+                $anterior = CierreHospitalarioPeriodo::mesAnterior($mes);
+                $antecedente = $this->antecedenteDeLaCarga($calculados[$anterior] ?? null, $historial->vigente($ruta, $anterior));
+                $estado = $cierre->estadoAntecedente($antecedente, $historial, $origen);
+                $origenDelMes = array_values(array_filter($origen, static fn (array $archivo): bool => ($periodos[$archivo['factura']] ?? '') === $mes));
+                $resultado = $cierre->procesar($ruta, $mes, $episodios, $segmentos, $antecedente, $estado, $origenDelMes);
+                array_push($continuidades, ...$resultado['continuidades']);
+                $calculados[$mes] = $calculado = $resultado['cierre'];
+                $guardado = $historial->vigente($ruta, $mes);
+                $this->historialHospitalario['cierres'][$ruta][$mes] = $calculado;
+                $this->historialHospitalario['traza'][] = [
+                    'ruta' => $ruta, 'periodo' => $mes,
+                    'antecedente' => $antecedente === null ? 'NINGUNO' : ($antecedente->version === 0 ? 'CALCULADO EN LA CARGA ' : '').$antecedente->etiqueta(),
+                    'estadoAntecedente' => $estado->value,
+                    'cierreDelPeriodo' => match (true) {
+                        $origenDelMes === [] => 'SIN FACTURAS DEL PERIODO EN LA CARGA: no se usa como antecedente',
+                        $guardado !== null && $guardado->hashContenido() === $calculado->hashContenido() && $guardado->hashOrigen() === $calculado->hashOrigen() => 'CERRADO '.$guardado->etiqueta().' · '.$guardado->completitudLegible(),
+                        default => 'PROVISIONAL: sin cierre definitivo igual guardado',
+                    },
+                    'hashCierre' => $calculado->hashContenido(),
+                    'hashOrigen' => $calculado->hashOrigen(),
+                ];
+            }
+        }
+
+        return $continuidades;
+    }
+
+    /**
+     * Un mes calculado en la carga solo es antecedente si la carga trae facturas de ese período y todas las del
+     * cierre guardado; un mes parcial, o presente solo por estancias facturadas después, nunca reemplaza al guardado.
+     */
+    private function antecedenteDeLaCarga(?AntecedenteHospitalario $calculado, ?AntecedenteHospitalario $guardado): ?AntecedenteHospitalario
+    {
+        if ($calculado === null || $calculado->origen === []) {
+            return $guardado;
+        }
+
+        return $guardado === null || array_diff(array_column($guardado->origen, 'factura'), array_column($calculado->origen, 'factura')) === []
+            ? $calculado
+            : $guardado;
+    }
+
+    /**
+     * Período de cada factura de la carga: el último mes con atenciones o egresos hospitalarios. Una factura
+     * mensual puede traer estancias que iniciaron antes, nunca atenciones posteriores a su período.
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     * @param  array<int, array<string, mixed>>  $profiles
+     * @return array<string, string>
+     */
+    public function periodosDeFacturas(array $files, array $profiles): array
+    {
+        $periodos = [];
+
+        foreach ($profiles as $profile) {
+            $mes = (string) ($profile['mesAtencion'] ?? '');
+
+            foreach (preg_match('/^\d{4}-\d{2}$/', $mes) === 1 ? (array) ($profile['facturas'] ?? []) : [] as $factura) {
+                $periodos[(string) $factura] = max($periodos[(string) $factura] ?? '', $mes);
+            }
+        }
+
+        foreach ($this->hospitalEpisodesForFiles($files, $profiles)['segmentos'] as $segmento) {
+            $mes = $this->reportingMonth((string) $segmento['fin']);
+
+            if ($mes !== '') {
+                $periodos[(string) $segmento['factura']] = max($periodos[(string) $segmento['factura']] ?? '', $mes);
+            }
+        }
+
+        return $periodos;
+    }
+
+    /**
+     * Episodios hospitalarios por ruta y mes (incluye los meses cargados sin estancias) y sus segmentos. El tramo
+     * que inicia el día 1 a las 00:00 pertenece al mes en que inicia (continúa el cierre del mes anterior); los
+     * demás, al mes en que termina su evidencia (en el que egresan o quedan abiertos con corte 08), aunque la
+     * estancia haya iniciado antes.
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     * @param  array<int, array<string, mixed>>  $profiles
+     * @return array{episodios: array<string, array<string, list<array<string, mixed>>>>, segmentos: array<string, array<string, mixed>>}
+     */
+    public function episodiosPorRutaYMes(array $files, array $profiles): array
+    {
+        $hospital = $this->hospitalEpisodesForFiles($files, $profiles);
+        $porRuta = [];
+
+        foreach ($profiles as $profile) {
+            $ruta = (string) ($profile['ruta'] ?? '');
+
+            if (in_array($ruta, [RutaCalculo::Prostata->value, RutaCalculo::Cervix->value], true) && (string) ($profile['mesAtencion'] ?? '') !== '') {
+                $porRuta[$ruta][(string) $profile['mesAtencion']] ??= [];
+            }
+        }
+
+        foreach ($hospital['episodios'] as $episodio) {
+            $primero = $hospital['segmentos'][$episodio['segmentosOrdenados'][0]['clave'] ?? ''] ?? null;
+            $ruta = (string) ($primero['ruta'] ?? '');
+
+            if ($primero !== null && ! $episodio['excluido'] && $ruta !== '') {
+                $inicio = (string) $episodio['inicio'];
+                $fin = $this->reportingMonth((string) $episodio['fin']);
+                $porRuta[$ruta][substr($inicio, 8, 8) === '01 00:00' || $fin === '' ? $this->reportingMonth($inicio) : $fin][] = $episodio;
+            }
+        }
+
+        foreach ($porRuta as &$meses) {
+            ksort($meses);
+        }
+
+        unset($meses);
+        ksort($porRuta);
+
+        return ['episodios' => $porRuta, 'segmentos' => $hospital['segmentos']];
+    }
+
+    /**
+     * Factura y sha256 de cada JSON de la carga, en orden de factura.
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     * @return list<array{factura: string, archivo: string, sha256: string}>
+     */
+    public function origenArchivos(array $files): array
+    {
+        $clave = md5((string) json_encode(array_column($files, 'path')));
+
+        if (($this->historialHospitalario['origen']['clave'] ?? null) === $clave) {
+            return $this->historialHospitalario['origen']['lista'];
+        }
+
+        $origen = array_map(fn (array $file): array => [
+            'factura' => (string) ($file['factura'] ?? $this->scalarFromJsonFile($file['path'], '/numFactura')),
+            'archivo' => (string) ($file['fileName'] ?? basename((string) $file['path'])),
+            'sha256' => (string) hash_file('sha256', $file['path']),
+        ], array_values($files));
+        usort($origen, static fn (array $a, array $b): int => strcmp($a['factura'].$a['archivo'], $b['factura'].$b['archivo']));
+
+        if ($this->historialHospitalario !== null) {
+            $this->historialHospitalario['origen'] = ['clave' => $clave, 'lista' => $origen];
+        }
+
+        return $origen;
     }
 
     /**

@@ -536,6 +536,15 @@ class CatalogoReferenciaController extends Controller
 
         $message = "Tarifario contractual actualizado: {$result['processed']} filas procesadas.";
 
+        // Una celda tarifaria vacía no borra la tarifa vigente; los códigos sin tarifa válida se informan sin inventar valores.
+        if ($result['rates_kept'] !== []) {
+            $message .= ' Se conservó la tarifa vigente de '.implode(', ', $result['rates_kept']).' porque el archivo no trae un valor válido.';
+        }
+
+        if ($result['rates_missing'] !== []) {
+            $message .= ' Sin tarifa válida: '.implode(', ', $result['rates_missing']).'.';
+        }
+
         if ($request->expectsJson()) {
             return response()->json(['message' => $message]);
         }

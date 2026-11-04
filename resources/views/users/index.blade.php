@@ -551,6 +551,146 @@
             filter: brightness(1.08);
         }
 
+        .authentik-button {
+            border: 1px solid rgba(22, 163, 74, .30);
+            background: rgba(22, 163, 74, .08);
+            color: var(--green);
+        }
+
+        .link-button {
+            border: 1px solid rgba(124, 58, 237, .30);
+            background: rgba(124, 58, 237, .08);
+            color: var(--purple);
+        }
+
+        /* =====================================================
+           AUTHENTIK
+        ====================================================== */
+
+        .cedula {
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+            font-weight: 700;
+        }
+
+        .authentik-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+
+            padding: 7px 11px;
+
+            border-radius: 20px;
+
+            font-size: 12px;
+            font-weight: 800;
+            white-space: nowrap;
+        }
+
+        .authentik-provisioned {
+            background: rgba(22, 163, 74, .12);
+            color: var(--green);
+        }
+
+        .authentik-linked {
+            background: rgba(59, 130, 246, .10);
+            color: var(--blue);
+        }
+
+        .authentik-pending,
+        .authentik-unlinked {
+            background: rgba(143, 169, 194, .14);
+            color: var(--muted);
+        }
+
+        .authentik-conflict,
+        .authentik-failed {
+            background: rgba(239, 68, 68, .10);
+            color: var(--red);
+        }
+
+        .authentik-detail {
+            margin-top: 7px;
+            max-width: 320px;
+
+            color: var(--muted);
+
+            font-size: 12px;
+            line-height: 1.45;
+        }
+
+        .sync-problem {
+            color: var(--red);
+        }
+
+        .activation-panel {
+            margin: 20px 24px 0;
+            padding: 16px 18px;
+
+            border: 1px solid rgba(124, 58, 237, .35);
+            border-radius: 10px;
+
+            background: rgba(124, 58, 237, .07);
+        }
+
+        .activation-panel h3 {
+            margin: 0 0 6px;
+            font-size: 15px;
+        }
+
+        .activation-panel p {
+            margin: 0 0 12px;
+
+            color: var(--muted);
+
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        .activation-row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .activation-row input,
+        .modal input {
+            flex: 1;
+            min-width: 0;
+            min-height: 40px;
+
+            padding: 0 12px;
+
+            border: 1px solid var(--border);
+            border-radius: 8px;
+
+            background: var(--card-2);
+            color: var(--text);
+
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+            font-size: 13px;
+        }
+
+        .modal input {
+            width: 100%;
+            margin-top: 14px;
+        }
+
+        .modal-confirm {
+            min-height: 42px;
+
+            padding: 0 16px;
+
+            border: 0;
+            border-radius: 8px;
+
+            background: var(--purple);
+            color: white;
+
+            font-family: inherit;
+            font-weight: 800;
+
+            cursor: pointer;
+        }
+
         /* =====================================================
            MODAL
         ====================================================== */
@@ -785,7 +925,7 @@
                 </h1>
 
                 <p>
-                    Gestión de cuentas y permisos del sistema
+                    Cuentas de SIRUTA, permisos y acceso con Authentik
                 </p>
 
             </div>
@@ -915,6 +1055,55 @@
             @endif
 
 
+            @if (! $authentikConfigured)
+
+                <div class="message message-error">
+                    El aprovisionamiento en Authentik no está configurado: no se pueden crear ni vincular usuarios.
+                </div>
+
+            @endif
+
+
+            @isset($activationLink)
+
+                <div class="activation-panel">
+
+                    <h3>
+                        Enlace de activación para {{ $activationUser->name }}
+                    </h3>
+
+                    <p>
+                        Se muestra una sola vez y vence en poco tiempo. Quien lo abra podrá definir la contraseña
+                        de la cuenta {{ $activationUser->cedula }} en Authentik: entrégalo solo a esa persona, en
+                        persona o por un canal seguro. Después, la persona ingresa a SIRUTA con su cédula y esa contraseña.
+                    </p>
+
+                    <div class="activation-row">
+
+                        <input
+                            type="text"
+                            id="activationLink"
+                            value="{{ $activationLink }}"
+                            readonly
+                            autocomplete="off"
+                            aria-label="Enlace de activación"
+                        >
+
+                        <button
+                            type="button"
+                            class="action-button link-button"
+                            onclick="copyActivationLink()"
+                        >
+                            Copiar
+                        </button>
+
+                    </div>
+
+                </div>
+
+            @endisset
+
+
 
             <div class="table-wrapper">
 
@@ -929,7 +1118,7 @@
                             </th>
 
                             <th>
-                                Correo
+                                Cédula
                             </th>
 
                             <th>
@@ -937,7 +1126,11 @@
                             </th>
 
                             <th>
-                                Estado
+                                Estado en SIRUTA
+                            </th>
+
+                            <th>
+                                Authentik
                             </th>
 
                             <th>
@@ -961,14 +1154,32 @@
                                         {{ $user->name }}
                                     </div>
 
+                                    @if ($user->email)
+
+                                        <div class="email">
+                                            {{ $user->email }}
+                                        </div>
+
+                                    @endif
+
                                 </td>
 
 
                                 <td>
 
-                                    <div class="email">
-                                        {{ $user->email }}
-                                    </div>
+                                    @if ($user->cedula)
+
+                                        <span class="cedula">
+                                            {{ $user->cedula }}
+                                        </span>
+
+                                    @else
+
+                                        <span class="email">
+                                            Sin cédula
+                                        </span>
+
+                                    @endif
 
                                 </td>
 
@@ -1021,6 +1232,41 @@
 
                                 <td>
 
+                                    <span class="authentik-status authentik-{{ $user->authentik_status->value }}">
+                                        {{ $user->authentik_status->label() }}
+                                    </span>
+
+                                    @if ($user->authentik_sync_error)
+
+                                        <div class="authentik-detail sync-problem">
+                                            {{ $user->authentik_sync_error }}
+                                        </div>
+
+                                    @elseif ($user->canReceiveActivationLink())
+
+                                        <div class="authentik-detail">
+                                            Pendiente de activación: aún no ha ingresado a SIRUTA.
+                                        </div>
+
+                                    @elseif ($user->authentik_first_login_at)
+
+                                        <div class="authentik-detail">
+                                            Primer ingreso: {{ $user->authentik_first_login_at->format('Y-m-d H:i') }}
+                                        </div>
+
+                                    @elseif ($user->authentik_status === \App\Models\AuthentikStatus::Unlinked)
+
+                                        <div class="authentik-detail">
+                                            No puede ingresar hasta aprovisionar o vincular su cuenta.
+                                        </div>
+
+                                    @endif
+
+                                </td>
+
+
+                                <td>
+
                                     <div class="actions">
 
 
@@ -1030,6 +1276,82 @@
                                         >
                                             ✏ Editar
                                         </a>
+
+
+                                        @if ($authentikConfigured && $user->canRetryAuthentikProvisioning())
+
+                                            <form
+                                                method="POST"
+                                                action="{{ route('users.authentik.provision', $user) }}"
+                                            >
+
+                                                @csrf
+
+                                                <button
+                                                    type="submit"
+                                                    class="action-button authentik-button"
+                                                >
+                                                    {{ $user->authentik_status === \App\Models\AuthentikStatus::Unlinked ? 'Aprovisionar en Authentik' : 'Reintentar aprovisionamiento' }}
+                                                </button>
+
+                                            </form>
+
+                                        @endif
+
+
+                                        @if ($authentikConfigured && $user->canReceiveActivationLink())
+
+                                            <form
+                                                method="POST"
+                                                action="{{ route('users.authentik.activation-link', $user) }}"
+                                            >
+
+                                                @csrf
+
+                                                <button
+                                                    type="submit"
+                                                    class="action-button link-button"
+                                                >
+                                                    Enlace de activación
+                                                </button>
+
+                                            </form>
+
+                                        @endif
+
+
+                                        @if ($authentikConfigured
+                                            && $user->authentik_status === \App\Models\AuthentikStatus::Conflict
+                                            && $user->canLinkExistingAuthentikAccount())
+
+                                            <button
+                                                type="button"
+                                                class="action-button link-button"
+                                                onclick="openLinkModal(
+                                                    '{{ route('users.authentik.link', $user) }}',
+                                                    @js($user->name)
+                                                )"
+                                            >
+                                                Vincular cuenta existente
+                                            </button>
+
+                                        @endif
+
+
+                                        @if ($user->id !== auth()->id() && $user->canUnlinkAuthentikAccount())
+
+                                            <button
+                                                type="button"
+                                                class="action-button toggle-button"
+                                                onclick="openUnlinkModal(
+                                                    '{{ route('users.authentik.unlink', $user) }}',
+                                                    @js($user->name)
+                                                )"
+                                            >
+                                                Desvincular Authentik
+                                            </button>
+
+                                        @endif
 
 
                                         @if ($user->id !== auth()->id())
@@ -1053,16 +1375,20 @@
                                             </form>
 
 
-                                            <button
-                                                type="button"
-                                                class="action-button delete-button"
-                                                onclick="openDeleteModal(
-                                                    '{{ route('users.destroy', $user) }}',
-                                                    @js($user->name)
-                                                )"
-                                            >
-                                                🗑 Eliminar
-                                            </button>
+                                            @if ($user->canBeDeleted())
+
+                                                <button
+                                                    type="button"
+                                                    class="action-button delete-button"
+                                                    onclick="openDeleteModal(
+                                                        '{{ route('users.destroy', $user) }}',
+                                                        @js($user->name)
+                                                    )"
+                                                >
+                                                    🗑 Eliminar
+                                                </button>
+
+                                            @endif
 
                                         @endif
 
@@ -1078,7 +1404,7 @@
                             <tr>
 
                                 <td
-                                    colspan="5"
+                                    colspan="6"
                                     style="text-align:center; padding:40px;"
                                 >
                                     No hay usuarios registrados.
@@ -1172,6 +1498,139 @@
 
 
 
+<!-- =========================================================
+     MODAL DE VINCULACIÓN ADMINISTRATIVA
+========================================================== -->
+
+<div
+    id="linkModal"
+    class="modal-overlay"
+>
+
+    <div class="modal">
+
+
+        <div class="modal-icon">
+            🔗
+        </div>
+
+
+        <h3>
+            ¿Vincular cuenta existente?
+        </h3>
+
+
+        <p id="linkMessage">
+            La cédula ya existe en Authentik en una cuenta que SIRUTA no creó.
+        </p>
+
+
+        <form
+            id="linkForm"
+            method="POST"
+        >
+
+            @csrf
+
+            <input
+                type="text"
+                name="cedula_confirmation"
+                placeholder="Escribe la cédula para confirmar"
+                inputmode="numeric"
+                autocomplete="off"
+                required
+            >
+
+            <div class="modal-actions">
+
+                <button
+                    type="button"
+                    class="modal-cancel"
+                    onclick="closeModal('linkModal')"
+                >
+                    Cancelar
+                </button>
+
+                <button
+                    type="submit"
+                    class="modal-confirm"
+                >
+                    Vincular sin modificarla
+                </button>
+
+            </div>
+
+        </form>
+
+
+    </div>
+
+</div>
+
+
+
+<!-- =========================================================
+     MODAL DE DESVINCULACIÓN
+========================================================== -->
+
+<div
+    id="unlinkModal"
+    class="modal-overlay"
+>
+
+    <div class="modal">
+
+
+        <div class="modal-icon">
+            ⛓
+        </div>
+
+
+        <h3>
+            ¿Desvincular de Authentik?
+        </h3>
+
+
+        <p id="unlinkMessage">
+            El usuario no podrá ingresar a SIRUTA hasta volver a vincularlo.
+        </p>
+
+
+        <div class="modal-actions">
+
+            <button
+                type="button"
+                class="modal-cancel"
+                onclick="closeModal('unlinkModal')"
+            >
+                Cancelar
+            </button>
+
+            <form
+                id="unlinkForm"
+                method="POST"
+            >
+
+                @csrf
+
+                <button
+                    type="submit"
+                    class="modal-delete"
+                >
+                    Sí, desvincular
+                </button>
+
+            </form>
+
+        </div>
+
+
+    </div>
+
+</div>
+
+
+
 <script src="{{ asset('js/theme.js') }}"></script>
 
 
@@ -1202,28 +1661,83 @@
 
     function closeDeleteModal() {
 
+        closeModal('deleteModal');
+
+    }
+
+
+    function closeModal(id) {
+
         document
-            .getElementById('deleteModal')
+            .getElementById(id)
             .classList.remove('show');
 
     }
 
 
-    document
-        .getElementById('deleteModal')
-        .addEventListener('click', function (event) {
+    function openLinkModal(action, name) {
 
-            if (event.target === this) {
-                closeDeleteModal();
-            }
+        document.getElementById('linkForm').action = action;
 
-        });
+        document.getElementById('linkMessage').textContent =
+            'La cédula de "' +
+            name +
+            '" ya existe en Authentik en una cuenta que SIRUTA no creó. ' +
+            'Vincúlala solo si confirmaste que pertenece a esta persona: ' +
+            'SIRUTA no cambia su contraseña, datos ni estado en Authentik.';
+
+        document.getElementById('linkModal').classList.add('show');
+
+    }
+
+
+    function openUnlinkModal(action, name) {
+
+        document.getElementById('unlinkForm').action = action;
+
+        document.getElementById('unlinkMessage').textContent =
+            '"' +
+            name +
+            '" no podrá ingresar a SIRUTA hasta volver a vincularlo. ' +
+            'Su cuenta de Authentik no se modifica.';
+
+        document.getElementById('unlinkModal').classList.add('show');
+
+    }
+
+
+    function copyActivationLink() {
+
+        const input = document.getElementById('activationLink');
+
+        input.select();
+
+        if (navigator.clipboard) {
+            navigator.clipboard.writeText(input.value);
+        }
+
+    }
+
+
+    ['deleteModal', 'linkModal', 'unlinkModal'].forEach(function (id) {
+
+        document
+            .getElementById(id)
+            .addEventListener('click', function (event) {
+
+                if (event.target === this) {
+                    closeModal(id);
+                }
+
+            });
+
+    });
 
 
     document.addEventListener('keydown', function (event) {
 
         if (event.key === 'Escape') {
-            closeDeleteModal();
+            ['deleteModal', 'linkModal', 'unlinkModal'].forEach(closeModal);
         }
 
     });

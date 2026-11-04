@@ -586,6 +586,38 @@
                             🗑️ Usuario eliminado
                             @break
 
+                        @case('login_authentik')
+                            🔐 Login con Authentik
+                            @break
+
+                        @case('login_authentik_rejected')
+                            🚫 Acceso Authentik rechazado
+                            @break
+
+                        @case('authentik_user_provisioned')
+                            🪪 Aprovisionado en Authentik
+                            @break
+
+                        @case('authentik_provisioning_conflict')
+                            ⚠️ Conflicto en Authentik
+                            @break
+
+                        @case('authentik_provisioning_failed')
+                            ❌ Error de Authentik
+                            @break
+
+                        @case('authentik_identity_linked')
+                            🔗 Cuenta Authentik vinculada
+                            @break
+
+                        @case('authentik_identity_unlinked')
+                            ⛓ Cuenta Authentik desvinculada
+                            @break
+
+                        @case('authentik_activation_link_generated')
+                            ✉️ Enlace de activación
+                            @break
+
                         @default
                             {{ $activityLog->action }}
 

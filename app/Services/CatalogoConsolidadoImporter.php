@@ -40,7 +40,7 @@ class CatalogoConsolidadoImporter
     }
 
     /**
-     * @return array{import: CatalogoConsolidadoImport, processed: int, created: int, updated: int, ignored: int}
+     * @return array{import: CatalogoConsolidadoImport, processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}
      */
     public function import(
         UploadedFile $file,
@@ -110,57 +110,92 @@ class CatalogoConsolidadoImporter
     }
 
     /**
-     * @return array{processed: int, created: int, updated: int, ignored: int}
+     * @return array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}
      */
     private function importCups(string $path): array
     {
         $statistics = $this->emptyStatistics();
 
         $this->readWorkbook($path, function (string $sheetName, iterable $rows) use (&$statistics): void {
-            $header = null;
-
-            foreach ($rows as $row) {
-                $values = $this->rowValues($row);
-
-                if ($header === null) {
-                    $candidate = $this->headerMap($values);
-
-                    if ($this->hasColumn($candidate, ['CUPS', 'CODIGO'])
-                        && $this->hasColumn($candidate, ['TARIFA 2025', 'TARIFA UNITARIO', 'TARIFA'])) {
-                        $header = $candidate;
-                    }
-
-                    continue;
-                }
-
-                $code = $this->normaliseCode($this->at($values, $header, ['CUPS', 'CODIGO']));
-
-                if ($code === '') {
-                    $this->countIgnoredRow($values, $statistics);
-
-                    continue;
-                }
-
-                $record = CodigoCups::query()->firstOrNew(['codigo' => $code]);
-                $this->persist(
-                    $record,
-                    [
-                        'hoja' => $sheetName,
-                        'tipo_servicio' => $this->nullableString($this->at($values, $header, ['TIPO SERVICIO', 'SERVICIO'])),
-                        'descripcion' => $this->nullableString($this->at($values, $header, ['DESCRIPCION SERVICIO', 'DESCRIPCION'])),
-                        'tarifa_2025' => $this->numberValue($this->at($values, $header, ['TARIFA 2025', 'TARIFA UNITARIO', 'TARIFA'])),
-                    ],
-                    $statistics
-                );
-                $statistics['processed']++;
-            }
+            $statistics = $this->addStatistics($statistics, $this->importCupsSheet($sheetName, $this->sheetValues($rows)));
         });
 
         return $statistics;
     }
 
     /**
-     * @return array{processed: int, created: int, updated: int, ignored: int}
+     * Importa una hoja al tarifario CUPS. Es la misma regla para la carga web y para
+     * catalogo:importar-cups: una hoja sin tipo de servicio no se lee, aunque traiga código y tarifa.
+     * Una celda tarifaria vacía o no numérica nunca borra la tarifa vigente: se conservan la tarifa
+     * y la hoja de la que proviene, y el código se informa en rates_kept. Si el código no tiene
+     * ninguna tarifa válida, no se le asigna un valor y se informa en rates_missing.
+     *
+     * @param  iterable<int, array<int, mixed>>  $rows  Valores de cada fila, con las fórmulas ya calculadas.
+     * @return array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}
+     */
+    public function importCupsSheet(string $sheetName, iterable $rows): array
+    {
+        $statistics = $this->emptyStatistics();
+        $header = null;
+        /** @var array<string, string> $rateStates código => set|kept|missing según su última fila */
+        $rateStates = [];
+
+        foreach ($rows as $values) {
+            if ($header === null) {
+                $candidate = $this->headerMap($values);
+
+                // Solo la hoja que clasifica el tipo de servicio es tarifario CUPS: la de insumos del mismo
+                // archivo también trae CODIGO y TARIFA y sobrescribía códigos compartidos (T34004 transporte).
+                if ($this->hasColumn($candidate, ['CUPS', 'CODIGO'])
+                    && $this->hasColumn($candidate, ['TIPO SERVICIO', 'SERVICIO'])
+                    && $this->hasColumn($candidate, ['TARIFA 2025', 'TARIFA UNITARIO', 'TARIFA'])) {
+                    $header = $candidate;
+                }
+
+                continue;
+            }
+
+            $code = $this->normaliseCode($this->at($values, $header, ['CUPS', 'CODIGO']));
+
+            if ($code === '') {
+                $this->countIgnoredRow($values, $statistics);
+
+                continue;
+            }
+
+            $record = CodigoCups::query()->firstOrNew(['codigo' => $code]);
+            $rate = $this->numberValue($this->at($values, $header, ['TARIFA 2025', 'TARIFA UNITARIO', 'TARIFA']));
+            $attributes = [
+                'hoja' => $sheetName,
+                'tipo_servicio' => $this->nullableString($this->at($values, $header, ['TIPO SERVICIO', 'SERVICIO'])),
+                'descripcion' => $this->nullableString($this->at($values, $header, ['DESCRIPCION SERVICIO', 'DESCRIPCION'])),
+                'tarifa_2025' => $rate,
+            ];
+
+            if ($rate !== null) {
+                $rateStates[$code] = 'set';
+            } elseif ($record->exists && $record->tarifa_2025 !== null) {
+                unset($attributes['tarifa_2025'], $attributes['hoja']);
+                $rateStates[$code] = 'kept';
+            } else {
+                $rateStates[$code] = 'missing';
+            }
+
+            $this->persist($record, $attributes, $statistics);
+            $statistics['processed']++;
+        }
+
+        foreach ($rateStates as $code => $state) {
+            if ($state !== 'set') {
+                $statistics[$state === 'kept' ? 'rates_kept' : 'rates_missing'][] = (string) $code;
+            }
+        }
+
+        return $statistics;
+    }
+
+    /**
+     * @return array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}
      */
     private function importMedicines(string $path): array
     {
@@ -201,51 +236,64 @@ class CatalogoConsolidadoImporter
     }
 
     /**
-     * @return array{processed: int, created: int, updated: int, ignored: int}
+     * @return array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}
      */
     private function importSupplies(string $path): array
     {
         $statistics = $this->emptyStatistics();
 
         $this->readWorkbook($path, function (string $sheetName, iterable $rows) use (&$statistics): void {
-            $header = null;
-
-            foreach ($rows as $row) {
-                $values = $this->rowValues($row);
-
-                if ($header === null) {
-                    $candidate = $this->headerMap($values);
-
-                    if ($this->hasColumn($candidate, ['CODIGO'])
-                        && $this->hasColumn($candidate, ['TARIFA UNITARIO', 'TARIFA'])) {
-                        $header = $candidate;
-                    }
-
-                    continue;
-                }
-
-                $code = $this->normaliseCode($this->at($values, $header, ['CODIGO']));
-
-                if ($code === '') {
-                    $this->countIgnoredRow($values, $statistics);
-
-                    continue;
-                }
-
-                $record = CodigoInsumoNt::query()->firstOrNew(['codigo' => $code]);
-                $this->persist(
-                    $record,
-                    [
-                        'hoja' => $sheetName,
-                        'descripcion' => $this->nullableString($this->at($values, $header, ['DESCRIPCION'])),
-                        'nt' => $this->nullableString($this->at($values, $header, ['NT'])),
-                        'tarifa_unitario' => $this->numberValue($this->at($values, $header, ['TARIFA UNITARIO', 'TARIFA'])),
-                    ],
-                    $statistics
-                );
-                $statistics['processed']++;
-            }
+            $statistics = $this->addStatistics($statistics, $this->importSuppliesSheet($sheetName, $this->sheetValues($rows)));
         });
+
+        return $statistics;
+    }
+
+    /**
+     * Importa una hoja al tarifario de insumos (carga web y catalogo:importar-insumos-nt).
+     * Solo escribe codigo_insumos_nt: nunca modifica tarifas CUPS.
+     *
+     * @param  iterable<int, array<int, mixed>>  $rows  Valores de cada fila, con las fórmulas ya calculadas.
+     * @return array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}
+     */
+    public function importSuppliesSheet(string $sheetName, iterable $rows): array
+    {
+        $statistics = $this->emptyStatistics();
+        $header = null;
+
+        foreach ($rows as $values) {
+            if ($header === null) {
+                $candidate = $this->headerMap($values);
+
+                if ($this->hasColumn($candidate, ['CODIGO'])
+                    && $this->hasColumn($candidate, ['TARIFA UNITARIO', 'TARIFA'])) {
+                    $header = $candidate;
+                }
+
+                continue;
+            }
+
+            $code = $this->normaliseCode($this->at($values, $header, ['CODIGO']));
+
+            if ($code === '') {
+                $this->countIgnoredRow($values, $statistics);
+
+                continue;
+            }
+
+            $record = CodigoInsumoNt::query()->firstOrNew(['codigo' => $code]);
+            $this->persist(
+                $record,
+                [
+                    'hoja' => $sheetName,
+                    'descripcion' => $this->nullableString($this->at($values, $header, ['DESCRIPCION'])),
+                    'nt' => $this->nullableString($this->at($values, $header, ['NT'])),
+                    'tarifa_unitario' => $this->numberValue($this->at($values, $header, ['TARIFA UNITARIO', 'TARIFA'])),
+                ],
+                $statistics
+            );
+            $statistics['processed']++;
+        }
 
         return $statistics;
     }
@@ -253,7 +301,7 @@ class CatalogoConsolidadoImporter
     /**
      * @param  array<int, mixed>  $values
      * @param  array<string, int>  $header
-     * @param  array{processed: int, created: int, updated: int, ignored: int}  $statistics
+     * @param  array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}  $statistics
      */
     private function importMedicineMappingRow(array $values, array $header, array &$statistics, string $sheetName): void
     {
@@ -298,7 +346,7 @@ class CatalogoConsolidadoImporter
     /**
      * @param  array<int, mixed>  $values
      * @param  array<string, int>  $header
-     * @param  array{processed: int, created: int, updated: int, ignored: int}  $statistics
+     * @param  array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}  $statistics
      */
     private function importMedicineNtRow(array $values, array $header, array &$statistics, string $sheetName): void
     {
@@ -325,7 +373,7 @@ class CatalogoConsolidadoImporter
     }
 
     /**
-     * @param  array{processed: int, created: int, updated: int, ignored: int}  $statistics
+     * @param  array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}  $statistics
      */
     private function persist(Model $record, array $attributes, array &$statistics): void
     {
@@ -360,6 +408,33 @@ class CatalogoConsolidadoImporter
         } finally {
             $reader->close();
         }
+    }
+
+    /**
+     * @param  iterable<int, Row>  $rows
+     * @return \Generator<int, array<int, mixed>>
+     */
+    private function sheetValues(iterable $rows): \Generator
+    {
+        foreach ($rows as $row) {
+            yield $this->rowValues($row);
+        }
+    }
+
+    /**
+     * @param  array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}  $statistics
+     * @param  array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}  $sheetStatistics
+     * @return array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}
+     */
+    private function addStatistics(array $statistics, array $sheetStatistics): array
+    {
+        foreach ($sheetStatistics as $key => $value) {
+            $statistics[$key] = is_array($value)
+                ? array_values(array_unique([...$statistics[$key], ...$value]))
+                : $statistics[$key] + $value;
+        }
+
+        return $statistics;
     }
 
     /**
@@ -432,7 +507,7 @@ class CatalogoConsolidadoImporter
 
     /**
      * @param  array<int, mixed>  $values
-     * @param  array{processed: int, created: int, updated: int, ignored: int}  $statistics
+     * @param  array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}  $statistics
      */
     private function countIgnoredRow(array $values, array &$statistics): void
     {
@@ -446,7 +521,7 @@ class CatalogoConsolidadoImporter
     }
 
     /**
-     * @return array{processed: int, created: int, updated: int, ignored: int}
+     * @return array{processed: int, created: int, updated: int, ignored: int, rates_kept: list<string>, rates_missing: list<string>}
      */
     private function emptyStatistics(): array
     {
@@ -455,6 +530,8 @@ class CatalogoConsolidadoImporter
             'created' => 0,
             'updated' => 0,
             'ignored' => 0,
+            'rates_kept' => [],
+            'rates_missing' => [],
         ];
     }
 

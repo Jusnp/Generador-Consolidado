@@ -937,6 +937,16 @@
         }
 
 
+        .input-help {
+
+            margin: 8px 0 0;
+
+            font-size: 12px;
+
+            color: var(--muted);
+        }
+
+
         /* =========================================================
            ALERTAS
         ========================================================= */
@@ -1582,9 +1592,14 @@
                             id="valor_administrativo"
                             name="valor_administrativo"
                             class="admin-input"
-                            value="{{ old('valor_administrativo', '3705644708') }}"
-                            required
+                            value="{{ old('valor_administrativo') }}"
+                            inputmode="decimal"
+                            placeholder="COSTO MES del período (sin puntos de miles)"
                         >
+
+                        <p class="input-help">
+                            Costo de referencia del mes cargado. Si se deja vacío, el RESUMEN indica «SIN REFERENCIA» en lugar de un porcentaje de ejecución.
+                        </p>
 
                     </div>
 
