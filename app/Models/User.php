@@ -30,6 +30,7 @@ class User extends Authenticatable
      * recargados (el control de usuario activo los evalúa en cada petición).
      */
     protected $attributes = [
+        'role' => 'user',
         'active' => true,
         'authentik_status' => 'unlinked',
     ];

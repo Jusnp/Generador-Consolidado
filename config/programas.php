@@ -9,18 +9,23 @@ use App\Programas\LaMaria\LaMariaProstataPipeline;
  *
  * La selección ocurre solo desde el menú lateral. La María aparece como un solo
  * programa; dentro el usuario elige la ejecución (Próstata o Cérvix).
+ *
+ * «roles» define quién puede usar cada programa (se valida en el servidor); sin
+ * la clave, el programa es solo para administradores.
  */
 return [
     'autoinmunes' => [
         'nombre' => 'Autoinmunes',
         'descripcion' => 'Consolidado RIPS de los regímenes subsidiado y contributivo.',
         'pipeline' => AutoinmunesPipeline::class,
+        'roles' => ['admin', 'user'],
     ],
     'la-maria' => [
         'nombre' => 'La María',
         'descripcion' => 'Seguimiento mensual de las rutas de próstata (C61) y cérvix (C53).',
         'pipeline' => null,
         'hub' => true,
+        'roles' => ['admin', 'user'],
         // Precio de dispensación administrativa sin tarifa contractual: FASE_1
         // (vigente, suma) o CONDICIONADA (se reporta sin sumar). Cambiarlo requiere aprobación.
         'politica_dispensacion' => env('LA_MARIA_POLITICA_DISPENSACION', 'FASE_1'),

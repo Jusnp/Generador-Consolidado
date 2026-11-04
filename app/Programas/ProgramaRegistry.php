@@ -2,6 +2,7 @@
 
 namespace App\Programas;
 
+use App\Models\User;
 use App\Programas\Contracts\ProgramaPipeline;
 use InvalidArgumentException;
 use RuntimeException;
@@ -9,7 +10,7 @@ use RuntimeException;
 class ProgramaRegistry
 {
     /**
-     * @return array<string, array{slug: string, nombre: string, descripcion: string, habilitado: bool, ruta: string|null, hub: bool, ejecuciones: list<array{slug: string, nombre: string, descripcion: string, ruta: string}>, pipeline: ProgramaPipeline|null}>
+     * @return array<string, array{slug: string, nombre: string, descripcion: string, habilitado: bool, ruta: string|null, hub: bool, ejecuciones: list<array{slug: string, nombre: string, descripcion: string, ruta: string}>, pipeline: ProgramaPipeline|null, roles: list<string>}>
      */
     public function all(): array
     {
@@ -23,7 +24,7 @@ class ProgramaRegistry
     }
 
     /**
-     * @return array{slug: string, nombre: string, descripcion: string, habilitado: bool, ruta: string|null, hub: bool, ejecuciones: list<array{slug: string, nombre: string, descripcion: string, ruta: string}>, pipeline: ProgramaPipeline|null}
+     * @return array{slug: string, nombre: string, descripcion: string, habilitado: bool, ruta: string|null, hub: bool, ejecuciones: list<array{slug: string, nombre: string, descripcion: string, ruta: string}>, pipeline: ProgramaPipeline|null, roles: list<string>}
      */
     public function get(string $slug): array
     {
@@ -41,13 +42,24 @@ class ProgramaRegistry
         return is_array(config('programas.'.$slug));
     }
 
+    /**
+     * Indica si el rol del usuario puede usar el programa. Los roles salen de la clave
+     * «roles» de config/programas.php; un programa sin ella es solo para administradores.
+     */
+    public function permiteAcceso(string $slug, User $user): bool
+    {
+        $config = config('programas.'.$slug);
+
+        return is_array($config) && in_array($user->role, $this->rolesOf($config), true);
+    }
+
     public function pipelineFor(string $slug): ?ProgramaPipeline
     {
         return $this->get($slug)['pipeline'];
     }
 
     /**
-     * @return list<array{slug: string, nombre: string, descripcion: string, habilitado: bool, ruta: string|null, hub: bool, ejecuciones: list<array{slug: string, nombre: string, descripcion: string, ruta: string}>, pipeline: ProgramaPipeline|null}>
+     * @return list<array{slug: string, nombre: string, descripcion: string, habilitado: bool, ruta: string|null, hub: bool, ejecuciones: list<array{slug: string, nombre: string, descripcion: string, ruta: string}>, pipeline: ProgramaPipeline|null, roles: list<string>}>
      */
     public function habilitados(): array
     {
@@ -85,7 +97,7 @@ class ProgramaRegistry
 
     /**
      * @param  array<string, mixed>  $config
-     * @return array{slug: string, nombre: string, descripcion: string, habilitado: bool, ruta: string|null, hub: bool, ejecuciones: list<array{slug: string, nombre: string, descripcion: string, ruta: string}>, pipeline: ProgramaPipeline|null}
+     * @return array{slug: string, nombre: string, descripcion: string, habilitado: bool, ruta: string|null, hub: bool, ejecuciones: list<array{slug: string, nombre: string, descripcion: string, ruta: string}>, pipeline: ProgramaPipeline|null, roles: list<string>}
      */
     private function hydrate(string $slug, array $config): array
     {
@@ -107,7 +119,17 @@ class ProgramaRegistry
             'hub' => $hub,
             'ejecuciones' => $ejecuciones,
             'pipeline' => $pipeline,
+            'roles' => $this->rolesOf($config),
         ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     * @return list<string>
+     */
+    private function rolesOf(array $config): array
+    {
+        return array_values(array_filter((array) ($config['roles'] ?? ['admin']), 'is_string'));
     }
 
     /**

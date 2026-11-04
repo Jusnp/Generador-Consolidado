@@ -42,7 +42,7 @@ class ProgramaNavigationTest extends TestCase
 
     public function test_pending_programa_renders_pending_view_without_sharing_other_pipelines(): void
     {
-        $user = User::factory()->create();
+        $user = User::factory()->create(['role' => 'admin']);
 
         $this->actingAs($user)
             ->get(route('programas.show', 'salud-mental'))
@@ -64,7 +64,7 @@ class ProgramaNavigationTest extends TestCase
 
     public function test_dashboard_menu_lists_single_la_maria_and_renamed_programas(): void
     {
-        $user = User::factory()->create();
+        $user = User::factory()->create(['role' => 'admin']);
 
         $this->actingAs($user)
             ->get(route('dashboard'))
@@ -84,7 +84,7 @@ class ProgramaNavigationTest extends TestCase
 
     public function test_side_menu_lists_only_autoinmunes_la_maria_and_salud_mental(): void
     {
-        $user = User::factory()->create();
+        $user = User::factory()->create(['role' => 'admin']);
 
         $this->actingAs($user)
             ->get(route('dashboard'))
@@ -104,7 +104,7 @@ class ProgramaNavigationTest extends TestCase
 
     public function test_nueva_eps_and_coosalud_are_pending_programas(): void
     {
-        $user = User::factory()->create();
+        $user = User::factory()->create(['role' => 'admin']);
 
         $this->actingAs($user)
             ->get(route('programas.show', 'nueva-eps'))

@@ -8,6 +8,7 @@ use App\Http\Controllers\ProgramaController;
 use App\Http\Controllers\SeguimientoRutaController;
 use App\Http\Controllers\UserAuthentikController;
 use App\Http\Controllers\UserController;
+use App\Http\Middleware\EnsureUserCanAccessPrograma;
 use App\Http\Middleware\EnsureUserIsActive;
 use Illuminate\Support\Facades\Route;
 
@@ -32,6 +33,7 @@ Route::get('/auth/authentik/callback', [AuthController::class, 'authentikCallbac
 
 Route::middleware(['auth', EnsureUserIsActive::class])->group(function () {
     Route::get('/programas/{programa}', [ProgramaController::class, 'show'])
+        ->middleware(EnsureUserCanAccessPrograma::class)
         ->name('programas.show');
 
     /*
@@ -59,34 +61,38 @@ Route::middleware(['auth', EnsureUserIsActive::class])->group(function () {
     |--------------------------------------------------------------------------
     */
 
-    Route::get('/json-excel', [JsonExcelController::class, 'index'])
-        ->name('json-excel');
+    Route::middleware(EnsureUserCanAccessPrograma::class.':autoinmunes')->group(function () {
+        Route::get('/json-excel', [JsonExcelController::class, 'index'])
+            ->name('json-excel');
 
-    Route::post('/json-excel/convert', [JsonExcelController::class, 'convert'])
-        ->name('json-excel.convert');
+        Route::post('/json-excel/convert', [JsonExcelController::class, 'convert'])
+            ->name('json-excel.convert');
+    });
 
-    Route::get('/la-maria', [ProgramaController::class, 'show'])
-        ->defaults('programa', 'la-maria')
-        ->name('la-maria');
+    Route::middleware(EnsureUserCanAccessPrograma::class.':la-maria')->group(function () {
+        Route::get('/la-maria', [ProgramaController::class, 'show'])
+            ->defaults('programa', 'la-maria')
+            ->name('la-maria');
 
-    Route::post('/la-maria/consolidado/export', [SeguimientoRutaController::class, 'exportConsolidated'])
-        ->name('la-maria.consolidado.export');
+        Route::post('/la-maria/consolidado/export', [SeguimientoRutaController::class, 'exportConsolidated'])
+            ->name('la-maria.consolidado.export');
 
-    Route::get('/la-maria/prostata', [SeguimientoRutaController::class, 'index'])
-        ->defaults('ejecucion', 'prostata')
-        ->name('la-maria.prostata');
+        Route::get('/la-maria/prostata', [SeguimientoRutaController::class, 'index'])
+            ->defaults('ejecucion', 'prostata')
+            ->name('la-maria.prostata');
 
-    Route::post('/la-maria/prostata/export', [SeguimientoRutaController::class, 'export'])
-        ->defaults('ejecucion', 'prostata')
-        ->name('la-maria.prostata.export');
+        Route::post('/la-maria/prostata/export', [SeguimientoRutaController::class, 'export'])
+            ->defaults('ejecucion', 'prostata')
+            ->name('la-maria.prostata.export');
 
-    Route::get('/la-maria/cervix', [SeguimientoRutaController::class, 'index'])
-        ->defaults('ejecucion', 'cervix')
-        ->name('la-maria.cervix');
+        Route::get('/la-maria/cervix', [SeguimientoRutaController::class, 'index'])
+            ->defaults('ejecucion', 'cervix')
+            ->name('la-maria.cervix');
 
-    Route::post('/la-maria/cervix/export', [SeguimientoRutaController::class, 'export'])
-        ->defaults('ejecucion', 'cervix')
-        ->name('la-maria.cervix.export');
+        Route::post('/la-maria/cervix/export', [SeguimientoRutaController::class, 'export'])
+            ->defaults('ejecucion', 'cervix')
+            ->name('la-maria.cervix.export');
+    });
 
     Route::redirect('/seguimiento-rutas', '/la-maria');
 

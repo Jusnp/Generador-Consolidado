@@ -107,6 +107,9 @@
         <nav aria-label="Navegación principal">
             <h2>Programas</h2>
             @foreach (collect(app(\App\Programas\ProgramaRegistry::class)->all())->only(['autoinmunes', 'la-maria', 'salud-mental']) as $slug => $definition)
+                @cannot('acceder-programa', $slug)
+                    @continue
+                @endcannot
                 @php
                     $isCurrent = request()->route('programa') === $slug
                         || ($definition['hub'] && request()->routeIs('la-maria', 'la-maria.*'))
